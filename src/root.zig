@@ -307,17 +307,6 @@ pub const Phage = struct {
 
         // Process completions to ensure the write is complete
         _ = try store.processCompletions();
-
-        // Update index
-        const entry = IndexEntry{
-            .offset = offset,
-            .len = @intCast(total_len),
-            .key_allocated = false,
-            .key = try store.allocator.dupe(u8, key),
-            .value = try store.allocator.dupe(u8, value),
-        };
-
-        try store.index.put(key, entry);
     }
 
     pub fn get(store: *Phage, key: []const u8, allocator: Allocator) ![]u8 {
