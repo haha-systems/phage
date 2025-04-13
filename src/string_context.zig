@@ -1,10 +1,12 @@
-///! Wyhash StringContext for HashMaps
 const std = @import("std");
 
+/// A context for hashing and comparing strings.
+/// This is used by the `IndexManager` to manage keys in a hash map.
 pub const StringContext = struct {
+    hash_seed: u64 = 0xdeadbeef,
+
     pub fn hash(self: @This(), s: []const u8) u64 {
-        _ = self;
-        return std.hash.Wyhash.hash(0, s);
+        return std.hash.Wyhash.hash(self.hash_seed, s);
     }
 
     pub fn eql(self: @This(), a: []const u8, b: []const u8) bool {

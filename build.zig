@@ -107,7 +107,10 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
+    lib_unit_tests.root_module.addImport("phage", lib_mod);
     exe_unit_tests.root_module.addImport("phage", lib_mod);
+    exe_unit_tests.addIncludePath(b.path("src"));
+    lib_unit_tests.addIncludePath(b.path("src"));
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 

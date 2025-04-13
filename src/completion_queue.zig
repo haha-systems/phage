@@ -21,7 +21,15 @@ pub const CompletionQueue = struct {
     pub fn complete(self: *CompletionQueue, cqe: std.os.linux.io_uring_cqe) ?PendingIO {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        // Check if the entry exists and handle the case where it doesn't
         const entry = self.entries.fetchRemove(cqe.user_data);
+        if (entry == null) {
+            // In SQPOLL mode, we might get completions for operations we've already processed
+            // or for operations that were registered with a different ID
+            return null;
+        }
+
         return entry.?.value;
     }
 

@@ -1,6 +1,6 @@
 const std = @import("std");
 
-// a simple mutex-protected stack
+/// AtomicStack provides a very simple mutex-protected stack structure.
 pub const AtomicStack = struct {
     mutex: std.Thread.Mutex,
     list: std.ArrayList([]u8),
