@@ -1,77 +1,43 @@
 const std = @import("std");
-const os = std.os;
-const linux = os.linux;
-const uring = linux.IoUring;
+const linux = @import("std").os.linux;
+const posix = @import("std").posix;
+const log = @import("std").log;
+
 const Allocator = std.mem.Allocator;
 const BufferPool = @import("buffer_pool.zig").BufferPool;
-const StringContext = @import("string_context.zig").StringContext;
-const Metrics = @import("metrics.zig").Metrics;
 const IndexManager = @import("index.zig").IndexManager;
-const IndexEntry = @import("index.zig").IndexEntry;
-const CompletionQueue = @import("completion_queue.zig").CompletionQueue;
-const PendingIO = @import("io.zig").PendingIO;
-const builtin = @import("builtin");
-
-// Configuration constants
-const BLOCK_SIZE = 512;
-const MAX_ENTRY_SIZE = std.heap.pageSize();
-const MAX_IN_FLIGHT: u16 = 1024;
-const BATCH_SIZE = 100;
-const BUFFER_POOL_SIZE = MAX_IN_FLIGHT * 2;
-const INDEX_SHARDS = 16;
-
-const log = std.log.scoped(.phage);
+const EntryHeader = @import("index.zig").EntryHeader;
+const Wal = @import("wal.zig").Wal;
+const IO = @import("io.zig").IO;
 
 pub const Phage = struct {
-    ring: uring,
-    fd: std.posix.fd_t,
-    fd_index: i32, // Index of the registered file descriptor
-    index: IndexManager,
-    file_size: std.atomic.Value(u64),
     allocator: Allocator,
-    pending_ops: std.atomic.Value(u32),
+    ring: linux.IoUring,
+    fd: posix.fd_t,
+    wal_fd: posix.fd_t,
+    file_size: std.atomic.Value(u64),
+    wal_file_size: std.atomic.Value(u64),
+    index: IndexManager,
     buffer_pool: BufferPool,
-    completion_queue: CompletionQueue,
-    metrics: Metrics,
+    pending_ops: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
-    const EntryHeader = extern struct {
-        key_len: u32 align(1),
-        val_len: u32 align(1),
+    const RING_ENTRIES: u32 = 128;
 
-        comptime {
-            if (@sizeOf(@This()) != 8) @compileError("invalid header size");
-        }
-    };
-
-    pub fn init(allocator: Allocator, path: []const u8, options: struct { use_sqpoll: bool = true }) !*Phage {
-        // Allow disabling SQPOLL mode via options
-        if (!options.use_sqpoll) {
-            log.debug("SQPOLL mode disabled by user request", .{});
-            return initStandard(allocator, path);
-        }
-
-        // Try to initialize with SQPOLL
-        return initWithSqpoll(allocator, path) catch |err| {
-            log.warn("SQPOLL initialization failed: {s}, falling back to standard mode", .{@errorName(err)});
-            return initStandard(allocator, path);
-        };
-    }
-
-    fn initStandard(allocator: Allocator, path: []const u8) !*Phage {
-        var store = try allocator.create(Phage);
-        errdefer allocator.destroy(store);
-
-        // Standard io_uring setup
-        var params = std.mem.zeroInit(linux.io_uring_params, .{
+    pub fn init(
+        allocator: Allocator,
+        file_path: []const u8,
+    ) !Phage {
+        var options = std.mem.zeroInit(linux.io_uring_params, .{
             .flags = linux.IORING_SETUP_COOP_TASKRUN |
                 linux.IORING_SETUP_SINGLE_ISSUER,
         });
 
-        store.ring = try uring.init_params(MAX_IN_FLIGHT, &params);
+        const ring = linux.IoUring.init_params(RING_ENTRIES, &options) catch |err| {
+            return err;
+        };
 
-        // Open the file
-        store.fd = try std.posix.open(
-            path,
+        const fd = try std.posix.open(
+            file_path,
             .{
                 .ACCMODE = .RDWR,
                 .CREAT = true,
@@ -80,624 +46,274 @@ pub const Phage = struct {
             std.posix.S.IRUSR | std.posix.S.IWUSR,
         );
 
-        // Try to register files
-        var fds = [_]std.posix.fd_t{store.fd};
-        if (store.ring.register_files(fds[0..])) |_| {
-            store.fd_index = 0;
-            log.debug("Successfully registered file descriptor with io_uring", .{});
-        } else |err| {
-            log.warn("Failed to register files with io_uring: {s}", .{@errorName(err)});
-            store.fd_index = -1;
-        }
+        const wal_path = std.fmt.allocPrint(allocator, "{s}.wal", .{file_path}) catch |err| {
+            return err;
+        };
+        defer allocator.free(wal_path);
 
-        // Initialize other fields
-        const stat_size = try std.posix.fstat(store.fd);
-        store.file_size = std.atomic.Value(u64).init(@intCast(stat_size.size));
-        store.allocator = allocator;
-        store.pending_ops = std.atomic.Value(u32).init(0);
-        store.buffer_pool = try BufferPool.init(allocator);
-        store.completion_queue = CompletionQueue.init();
-        store.index = try IndexManager.init(allocator);
-        store.metrics = Metrics.init();
+        const wal_fd = try std.posix.open(
+            wal_path,
+            .{
+                .ACCMODE = .RDWR,
+                .CREAT = true,
+                .CLOEXEC = true,
+            },
+            std.posix.S.IRUSR | std.posix.S.IWUSR,
+        );
 
-        try store.rebuildIndex();
+        // stat the data files to get their current size
+        const file_stat = try std.posix.fstat(fd);
+        const wal_file_stat = try std.posix.fstat(wal_fd);
 
-        log.debug("init complete in standard mode", .{});
+        const file_size = std.atomic.Value(u64).init(@intCast(file_stat.size));
+        const wal_file_size = std.atomic.Value(u64).init(@intCast(wal_file_stat.size));
+        const index = try IndexManager.init(allocator);
+        const buffer_pool = try BufferPool.init(allocator);
 
-        return store;
+        return Phage{
+            .allocator = allocator,
+            .ring = ring,
+            .fd = fd,
+            .wal_fd = wal_fd,
+            .file_size = file_size,
+            .wal_file_size = wal_file_size,
+            .index = index,
+            .buffer_pool = buffer_pool,
+        };
     }
 
-    fn initWithSqpoll(allocator: Allocator, path: []const u8) !*Phage {
-        var store = try allocator.create(Phage);
-        errdefer allocator.destroy(store);
+    pub fn deinit(self: *Phage) void {
+        self.ring.deinit();
+        posix.close(self.fd);
+        posix.close(self.wal_fd);
+        self.index.deinit(self.allocator);
+        self.buffer_pool.deinit(self.allocator);
+    }
 
-        // SQPOLL io_uring setup
-        var params = std.mem.zeroInit(linux.io_uring_params, .{
-            .flags = linux.IORING_SETUP_SQPOLL |
-                linux.IORING_SETUP_COOP_TASKRUN |
-                linux.IORING_SETUP_SINGLE_ISSUER,
-            .sq_thread_idle = 2000, // 2 seconds idle timeout
+    pub fn put(self: *Phage, key: []const u8, value: []const u8) !void {
+        // Step 1: Log to WAL
+        const wal_entry = try self.formatWalEntry(key, value);
+        // defer self.buffer_pool.release(wal_entry) catch unreachable;
+        defer self.allocator.free(wal_entry);
+
+        const wal_offset = self.wal_file_size.fetchAdd(wal_entry.len, .monotonic);
+
+        var ops_submitted = try self.writeToWal(wal_entry, wal_offset);
+        try waitForIO(self);
+        if (ops_submitted < 1) {
+            return error.WriteError;
+        }
+
+        // Step 2: Write to main file
+        const data_entry = try self.formatDataEntry(key, value);
+        defer self.allocator.free(data_entry);
+
+        const data_offset = self.file_size.fetchAdd(data_entry.len, .monotonic);
+        ops_submitted = try IO.writeToFile(&self.pending_ops, self.fd, &self.ring, &data_entry, data_offset);
+
+        try waitForIO(self);
+        if (ops_submitted < 1) {
+            return error.WriteError;
+        }
+
+        // Step 3: Update index
+        try self.index.put(self.allocator, key, .{
+            .offset = data_offset,
+            .len = data_entry.len,
+            .key_len = key.len,
+            .val_len = value.len,
         });
-
-        store.ring = try uring.init_params(MAX_IN_FLIGHT, &params);
-        log.debug("SQPOLL mode initialized successfully", .{});
-
-        // Open the file
-        store.fd = try std.posix.open(
-            path,
-            .{
-                .ACCMODE = .RDWR,
-                .CREAT = true,
-                .CLOEXEC = true,
-            },
-            std.posix.S.IRUSR | std.posix.S.IWUSR,
-        );
-
-        // Try to register files
-        var fds = [_]std.posix.fd_t{store.fd};
-        if (store.ring.register_files(fds[0..])) |_| {
-            store.fd_index = 0;
-            log.debug("Successfully registered file descriptor with io_uring", .{});
-        } else |err| {
-            log.warn("Failed to register files with io_uring: {s}", .{@errorName(err)});
-            store.fd_index = -1;
-        }
-
-        // Initialize other fields
-        const stat_size = try std.posix.fstat(store.fd);
-        store.file_size = std.atomic.Value(u64).init(@intCast(stat_size.size));
-        store.allocator = allocator;
-        store.pending_ops = std.atomic.Value(u32).init(0);
-        store.buffer_pool = try BufferPool.init(allocator);
-        store.completion_queue = CompletionQueue.init();
-        store.index = try IndexManager.init(allocator);
-        store.metrics = Metrics.init();
-
-        try store.rebuildIndex();
-
-        log.debug("init complete with SQPOLL: true", .{});
-
-        return store;
     }
 
-    pub fn deinit(store: *Phage) !void {
-        // always remember to flush your ring
-        const completed = try store.processCompletions();
+    pub fn get(self: *Phage, key: []const u8) ![]u8 {
+        const entry = self.index.get(key) orelse return error.KeyNotFound;
+        const buf = try self.allocator.alloc(u8, entry.len);
+        defer self.allocator.free(buf);
 
-        if (completed != 0) return error.IncompleteOps;
-
-        // Unregister files before closing, but only if they were registered
-        if (store.fd_index >= 0) {
-            store.ring.unregister_files() catch |err| {
-                log.warn("Failed to unregister files: {}", .{err});
-                // Continue with cleanup anyway
-            };
+        const ops_submitted = try IO.readFromFile(&self.pending_ops, self.fd, &self.ring, &buf, entry.offset);
+        if (ops_submitted < 1) {
+            return error.ReadError;
         }
 
-        // close io_uring and file descriptor first
-        store.ring.deinit();
-        _ = std.posix.close(store.fd);
+        // Wait for IO to complete
+        try waitForIO(self);
 
-        // cleanup index
-        store.index.deinit(store.allocator);
+        // validate and extract value
+        const key_start = @sizeOf(EntryHeader);
+        const stored_key = buf[key_start..][0..entry.key_len];
+        if (!std.mem.eql(u8, stored_key, key)) return error.KeyMismatch;
 
-        // cleanup buffer pool
-        store.buffer_pool.deinit(store.allocator);
+        const val_start = key_start + entry.key_len;
+        const value = buf[val_start..][0..entry.val_len];
 
-        // cleanup completion queue
-        store.completion_queue.deinit(store.allocator);
-
-        // finally free the store itself
-        store.allocator.destroy(store);
+        // caller now owns the value
+        return self.allocator.dupe(u8, value) catch |err| {
+            return err;
+        };
     }
 
-    /// Calculates the CRC32 of a buffer
-    inline fn caclulate_crc32(ptr: anytype, len: usize) u32 {
-        var crc: u32 = 0xffffffff;
-        for (ptr[0..len]) |byte| {
-            crc = std.hash.Crc32.update(byte);
-        }
-        return crc;
-    }
-
-    /// Prefetch function for L1 cache that handles both read and write operations
-    pub inline fn prefetch(ptr: anytype, is_write: bool) void {
-        // Take address of the pointer directly, which works for any type
-        const addr = @intFromPtr(&ptr);
-
-        switch (builtin.cpu.arch) {
-            .x86_64, .x86 => {
-                if (is_write) {
-                    // PREFETCHW for write operations (supported on some x86 CPUs)
-                    asm volatile ("prefetchw (%[addr])"
-                        :
-                        : [addr] "r" (addr),
-                        : "memory"
-                    );
-                } else {
-                    // PREFETCHT0 for read operations (L1 cache)
-                    asm volatile ("prefetcht0 (%[addr])"
-                        :
-                        : [addr] "r" (addr),
-                        : "memory"
-                    );
-                }
-            },
-            .aarch64, .arm => {
-                if (is_write) {
-                    // PSTL1KEEP for write operations (prestore to L1)
-                    asm volatile ("prfm pstl1keep, [%[addr]]"
-                        :
-                        : [addr] "r" (addr),
-                        : "memory"
-                    );
-                } else {
-                    // PLDL1KEEP for read operations (preload to L1)
-                    asm volatile ("prfm pldl1keep, [%[addr]]"
-                        :
-                        : [addr] "r" (addr),
-                        : "memory"
-                    );
-                }
-            },
-            else => {
-                // No explicit prefetch on other architectures
-                // This function becomes a no-op
-            },
+    fn waitForIO(self: *Phage) !void {
+        while (self.pending_ops.load(.acquire) > 0) {
+            // var cqe: linux.io_uring_cqe = undefined;
+            const cqe = try self.ring.copy_cqe();
+            if (cqe.res < 0) return error.IOUringError;
+            const completed = self.pending_ops.fetchSub(1, .monotonic);
+            if (completed == 0) {
+                // No more pending operations
+                break;
+            }
         }
     }
 
-    pub fn put(store: *Phage, key: []const u8, value: []const u8) !void {
-        // Validate inputs
-        if (key.len == 0 or key.len > MAX_ENTRY_SIZE - @sizeOf(EntryHeader)) {
-            return error.KeyTooLarge;
-        }
+    fn formatWalEntry(self: *Phage, key: []const u8, value: []const u8) ![]u8 {
+        // Calculate sizes
+        const header_size = @sizeOf(Wal.WalEntryHeader); // 32 bytes
+        const total_size = header_size + key.len;
 
-        if (value.len > MAX_ENTRY_SIZE - @sizeOf(EntryHeader) - key.len) {
+        // Allocate buffer
+        const buf = try self.allocator.alloc(u8, total_size);
+        errdefer self.allocator.free(buf);
+
+        // Create header
+        const offset = 0; // Will be set by caller (e.g., file_size)
+        const header = Wal.WalEntryHeader{
+            .op_type = .put,
+            .key_len = key.len,
+            .val_len = value.len,
+            .offset = offset, // Placeholder; updated by put
+            .checksum = Wal.calculateChecksum(.put, @intCast(key.len), @intCast(value.len), offset, key),
+            .padding = 0,
+        };
+
+        // Serialize header
+        @memcpy(buf[0..header_size], std.mem.asBytes(&header));
+
+        // Append key
+        @memcpy(buf[header_size..], key);
+
+        return buf;
+    }
+
+    fn formatDataEntry(self: *Phage, key: []const u8, value: []const u8) ![]u8 {
+        // Validate sizes to prevent overflow
+        if (key.len > std.math.maxInt(u32) or value.len > std.math.maxInt(u32)) {
             return error.ValueTooLarge;
         }
 
-        // Prepare header
+        // Calculate sizes
+        const header_size = @sizeOf(EntryHeader); // 8 bytes
+        const total_size = header_size + key.len + value.len;
+
+        // Allocate buffer
+        const buf = try self.allocator.alloc(u8, total_size);
+        errdefer self.allocator.free(buf);
+
+        // Create header
         const header = EntryHeader{
             .key_len = @intCast(key.len),
             .val_len = @intCast(value.len),
         };
 
-        const total_len = @sizeOf(EntryHeader) + key.len + value.len;
+        // Serialize header
+        @memcpy(buf[0..header_size], std.mem.asBytes(&header));
 
-        // Allocate buffer for the entry
-        const buf = try store.allocator.alloc(u8, total_len);
-        defer store.allocator.free(buf);
+        // Append key and value
+        @memcpy(buf[header_size .. header_size + key.len], key);
+        @memcpy(buf[header_size + key.len ..], value);
 
-        // Copy header and data to buffer
-        @memcpy(buf[0..@sizeOf(EntryHeader)], std.mem.asBytes(&header));
-        @memcpy(buf[@sizeOf(EntryHeader)..][0..key.len], key);
-        @memcpy(buf[@sizeOf(EntryHeader) + key.len ..][0..value.len], value);
+        return buf;
+    }
 
-        // Write to file
-        const offset = store.file_size.fetchAdd(total_len, .monotonic);
-
+    fn readFromWal(store: *Phage, buf: []u8, offset: usize) !usize {
         var sqe = try store.ring.get_sqe();
-        if (store.fd_index >= 0) {
-            // Use registered file descriptor with SQPOLL optimizations
-            sqe.prep_write(store.fd_index, buf, offset);
-            sqe.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_ASYNC;
-        } else {
-            // Use regular file descriptor
-            sqe.prep_write(store.fd, buf, offset);
-        }
+        sqe.prep_read(
+            store.wal_fd,
+            buf,
+            offset,
+        );
+        sqe.flags |= linux.IOSQE_ASYNC;
         sqe.user_data = @intFromPtr(buf.ptr);
-
-        // Track pending operation
-        const pending = PendingIO{
-            .id = sqe.user_data,
-            .buffer = buf,
-            .offset = offset,
-            .key = try store.allocator.dupe(u8, key),
-            .value = try store.allocator.dupe(u8, value),
-            .start_time = std.time.nanoTimestamp(),
-            .is_write = true,
-        };
-
-        try store.completion_queue.add(store.allocator, pending);
-        _ = store.pending_ops.fetchAdd(1, .monotonic);
-
-        // Submit and wait for completion
-        _ = try store.ring.submit_and_wait(1);
-
-        // Process completions to ensure the write is complete
-        _ = try store.processCompletions();
+        const submitted = try store.ring.submit();
+        const pending = try store.pending_ops.fetchAdd(1, .monotonic);
+        return submitted + pending;
     }
 
-    pub fn get(store: *Phage, key: []const u8, allocator: Allocator) ![]u8 {
-        const start_time = std.time.nanoTimestamp();
-
-        const entry = store.index.get(key) orelse return error.NotFound;
-
-        // Validate entry length before proceeding
-        if (entry.len == 0 or entry.len > MAX_ENTRY_SIZE * 2) {
-            log.err("Invalid entry length in index: {}", .{entry.len});
-            return error.InvalidIndexEntry;
-        }
-
-        log.debug("Reading entry at offset {} with length {}", .{ entry.offset, entry.len });
-
-        const buf = blk: {
-            var retries: u8 = 0;
-            while (retries < 3) : (retries += 1) {
-                if (store.buffer_pool.acquire()) |buf| {
-                    break :blk buf;
-                }
-                _ = try store.processCompletions();
-            }
-            return error.NoBufferAvailable;
-        };
-        defer store.buffer_pool.release(buf);
-
-        // Log buffer size for debugging
-        log.debug("Buffer size: {}", .{buf.len});
-
-        // Ensure buffer is large enough for the entry
-        if (buf.len < entry.len) {
-            log.err("Buffer too small for entry: needed {}, got {}", .{ entry.len, buf.len });
-            return error.BufferTooSmall;
-        }
-
+    fn writeToWal(store: *Phage, buf: []u8, offset: usize) !usize {
         var sqe = try store.ring.get_sqe();
-        if (store.fd_index >= 0) {
-            // Use registered file descriptor with SQPOLL optimizations
-            sqe.prep_read(store.fd_index, buf[0..entry.len], entry.offset);
-            sqe.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_ASYNC;
-        } else {
-            // Use regular file descriptor
-            sqe.prep_read(store.fd, buf[0..entry.len], entry.offset);
-        }
+        sqe.prep_write(
+            store.wal_fd,
+            buf,
+            offset,
+        );
+        sqe.flags |= linux.IOSQE_ASYNC;
         sqe.user_data = @intFromPtr(buf.ptr);
-
-        const pending = PendingIO{
-            .id = sqe.user_data,
-            .buffer = buf,
-            .offset = entry.offset,
-            .key = key,
-            .value = undefined,
-            .start_time = start_time,
-            .is_write = false,
-        };
-
-        try store.completion_queue.add(store.allocator, pending);
-        _ = store.pending_ops.fetchAdd(1, .monotonic);
-
-        _ = try store.ring.submit_and_wait(1); // Using 0 to leverage SQPOLL
-        _ = try store.processCompletions();
-
-        // Validate buffer before processing
-        if (buf.len < @sizeOf(EntryHeader)) {
-            log.err("Buffer too small for header", .{});
-            return error.BufferTooSmall;
-        }
-
-        // Use a safer approach to extract header values
-        var header: EntryHeader = undefined;
-        @memcpy(std.mem.asBytes(&header), buf[0..@sizeOf(EntryHeader)]);
-
-        // Log header values for debugging
-        log.debug("Header values: key_len={}, val_len={}", .{ header.key_len, header.val_len });
-
-        // Check for unreasonable values that might indicate corruption
-        if (header.key_len > 1024 * 1024 or header.val_len > 1024 * 1024) {
-            log.err("Suspiciously large header values: key_len={}, val_len={}", .{ header.key_len, header.val_len });
-            return error.CorruptHeader;
-        }
-
-        // Validate header values to ensure they are within buffer bounds
-        if (header.key_len > MAX_ENTRY_SIZE - @sizeOf(EntryHeader) or
-            header.val_len > MAX_ENTRY_SIZE - @sizeOf(EntryHeader) - header.key_len)
-        {
-            log.err("Invalid header values: key_len={}, val_len={}, buffer size={}", .{ header.key_len, header.val_len, buf.len });
-            return error.InvalidHeader;
-        }
-
-        const value_start = @sizeOf(EntryHeader) + header.key_len;
-
-        // Additional bounds check before accessing buffer
-        if (value_start >= buf.len) {
-            log.err("Value start position beyond buffer bounds: start={}, buffer size={}", .{ value_start, buf.len });
-            return error.BufferBoundsError;
-        }
-
-        if (value_start + header.val_len > buf.len) {
-            log.err("Buffer bounds error: start={}, len={}, buffer size={}", .{ value_start, header.val_len, buf.len });
-            return error.BufferBoundsError;
-        }
-
-        // Verify the key with bounds checking
-        const stored_key_len = @min(header.key_len, buf.len - @sizeOf(EntryHeader));
-        if (stored_key_len == 0) {
-            log.err("Invalid stored key length: {}", .{stored_key_len});
-            return error.InvalidKeyLength;
-        }
-
-        const stored_key = buf[@sizeOf(EntryHeader) .. @sizeOf(EntryHeader) + stored_key_len];
-
-        if (!std.mem.eql(u8, stored_key, key[0..@min(key.len, stored_key_len)])) {
-            log.err("Key mismatch: expected '{s}', got '{s}'", .{ key, stored_key });
-            return error.KeyMismatch;
-        }
-
-        // Copy the value with bounds checking
-        const value_copy = try allocator.alloc(u8, header.val_len);
-        errdefer allocator.free(value_copy);
-
-        // Extra safety check
-        if (value_start + header.val_len <= buf.len) {
-            @memcpy(value_copy, buf[value_start..][0..header.val_len]);
-        } else {
-            // This should never happen due to earlier checks, but just in case
-            allocator.free(value_copy);
-            log.err("Value extends beyond buffer bounds: start={}, len={}, buffer size={}", .{ value_start, header.val_len, buf.len });
-            return error.BufferBoundsError;
-        }
-
-        return value_copy;
-    }
-
-    pub fn putBatch(store: *Phage, keys: []const []const u8, values: []const []const u8) !void {
-        if (keys.len != values.len) return error.BatchSizeMismatch;
-
-        // Limit batch size to prevent overwhelming the io_uring
-        const batch_size = @min(keys.len, BATCH_SIZE);
-        if (keys.len > batch_size) {
-            log.debug("Limiting batch size from {} to {}", .{ keys.len, batch_size });
-        }
-
-        // Allocate an array to track pending operations in this batch.
-        var pending = try store.allocator.alloc(PendingIO, batch_size);
-        defer store.allocator.free(pending);
-
-        const start_time = std.time.nanoTimestamp();
-        var total_size: u64 = 0;
-
-        // First pass: Calculate the total batch size.
-        for (keys[0..batch_size], values[0..batch_size]) |key, value| {
-            const entry_size = @sizeOf(EntryHeader) + key.len + value.len;
-            const aligned_size = std.mem.alignForward(usize, entry_size, BLOCK_SIZE);
-            total_size += aligned_size;
-        }
-
-        // Reserve a contiguous offset range for the batch.
-        const batch_offset = store.file_size.fetchAdd(total_size, .monotonic);
-        var current_offset = batch_offset;
-
-        // Second pass: Prepare each write in the batch.
-        for (keys[0..batch_size], values[0..batch_size], 0..) |key, value, i| {
-            // Prefetch next key/value 4 iterations ahead
-            if (i + 4 < batch_size) {
-                prefetch(keys[i + 4], false);
-                prefetch(values[i + 4], false);
-            }
-
-            const header = EntryHeader{
-                .key_len = @intCast(key.len),
-                .val_len = @intCast(value.len),
-            };
-
-            // Acquire a buffer from the pool with retry logic.
-            const buf = blk: {
-                var retries: u8 = 0;
-                while (retries < 10) : (retries += 1) {
-                    if (store.buffer_pool.acquire()) |b| {
-                        break :blk b;
-                    }
-                    _ = try store.processCompletions();
-                    std.time.sleep(1 * std.time.ns_per_us);
-                }
-                return error.NoBufferAvailable;
-            };
-            errdefer store.buffer_pool.release(buf);
-
-            const total_len = @sizeOf(EntryHeader) + key.len + value.len;
-            const aligned_len = std.mem.alignForward(usize, total_len, BLOCK_SIZE);
-
-            // Copy header and data to buffer
-            @memcpy(buf[0..@sizeOf(EntryHeader)], std.mem.asBytes(&header));
-            @memcpy(buf[@sizeOf(EntryHeader)..][0..key.len], key);
-            @memcpy(buf[@sizeOf(EntryHeader) + key.len ..][0..value.len], value);
-
-            // Get an SQE and prepare the write
-            var sqe = try store.ring.get_sqe();
-            if (store.fd_index >= 0) {
-                // Use registered file descriptor with SQPOLL optimizations
-                sqe.prep_write(store.fd_index, buf, current_offset);
-                sqe.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_ASYNC;
-            } else {
-                // Use regular file descriptor
-                sqe.prep_write(store.fd, buf, current_offset);
-            }
-            sqe.user_data = @intFromPtr(buf.ptr);
-
-            // Record this pending operation.
-            pending[i] = .{
-                .id = sqe.user_data,
-                .buffer = buf,
-                .offset = current_offset,
-                .key = try store.allocator.dupe(u8, key),
-                .value = try store.allocator.dupe(u8, value),
-                .start_time = start_time,
-                .is_write = true,
-            };
-
-            // Add to the completion queue and increment pending_ops.
-            try store.completion_queue.add(store.allocator, pending[i]);
-            _ = store.pending_ops.fetchAdd(1, .monotonic);
-
-            current_offset += aligned_len;
-
-            // If we have a lot of entries, submit in smaller batches to avoid queue overflow
-            if (i % 16 == 15) {
-                log.debug("Submitting intermediate batch at entry {}", .{i});
-                _ = try store.ring.submit();
-                _ = try store.processCompletions();
-            }
-        }
-
-        // Submit the entire batch
-        _ = try store.ring.submit();
-
-        // Process completions until all pending ops from this batch are handled.
-        while (store.pending_ops.load(.acquire) > 0) {
-            _ = try store.processCompletions();
-        }
-    }
-
-    fn processCompletions(store: *Phage) !u32 {
-        var completed: u32 = 0;
-        var cqes: [MAX_IN_FLIGHT]linux.io_uring_cqe = undefined;
-        const count = try store.ring.copy_cqes(&cqes, 0);
-
-        if (count == 0) {
-            return 0;
-        }
-
-        for (cqes[0..count]) |cqe| {
-            completed += 1;
-
-            // Check if this is a tracked operation
-            const pending = store.completion_queue.complete(cqe);
-            if (pending == null) {
-                log.debug("Received completion for untracked operation: user_data={}", .{cqe.user_data});
-                continue;
-            }
-
-            // Check for IO errors
-            if (cqe.res < 0) {
-                log.err("IO operation failed with error code: {}", .{cqe.res});
-                continue;
-            }
-
-            // Release buffer and decrement pending ops
-            defer {
-                store.buffer_pool.release(pending.?.buffer);
-                _ = store.pending_ops.fetchSub(1, .monotonic);
-            }
-
-            // Record write latency
-            if (pending.?.is_write) {
-                const end_time = std.time.nanoTimestamp();
-                const latency = @as(u64, @intCast(end_time - pending.?.start_time));
-                store.metrics.recordWrite(latency);
-
-                // Update index for writes
-                if (pending.?.key.len > 0) {
-                    const entry = IndexEntry{
-                        .offset = pending.?.offset,
-                        .len = @intCast(cqe.res),
-                        .key = pending.?.key,
-                        .value = pending.?.value,
-                        .key_allocated = true,
-                    };
-
-                    store.index.put(pending.?.key, entry) catch |err| {
-                        log.err("Failed to update index: {s}", .{@errorName(err)});
-                    };
-                }
-            } else {
-                // Record read latency
-                const end_time = std.time.nanoTimestamp();
-                const latency = @as(u64, @intCast(end_time - pending.?.start_time));
-                store.metrics.recordRead(latency);
-            }
-        }
-
-        return completed;
-    }
-
-    fn rebuildIndex(store: *Phage) !void {
-        log.debug("rebuilding index", .{});
-
-        const stat = try std.posix.fstat(store.fd);
-        const file_size = @as(u64, @intCast(stat.size));
-        store.file_size.store(file_size, .monotonic);
-
-        var offset: u64 = 0;
-        const buf = try store.allocator.alloc(u8, MAX_ENTRY_SIZE);
-        defer store.allocator.free(buf);
-
-        while (offset < file_size) {
-            const bytes_read = try std.posix.pread(store.fd, buf, offset);
-            if (bytes_read < @sizeOf(EntryHeader)) {
-                break;
-            }
-
-            var header: EntryHeader = undefined;
-            @memcpy(std.mem.asBytes(&header), buf[0..@sizeOf(EntryHeader)]);
-
-            // Validate header
-            if (header.key_len > MAX_ENTRY_SIZE - @sizeOf(EntryHeader) or
-                header.val_len > MAX_ENTRY_SIZE - @sizeOf(EntryHeader) - header.key_len)
-            {
-                log.err("Invalid header at offset {}: key_len={}, val_len={}", .{ offset, header.key_len, header.val_len });
-                break;
-            }
-
-            const total_len = @sizeOf(EntryHeader) + header.key_len + header.val_len;
-            if (total_len > bytes_read) {
-                break;
-            }
-
-            // Extract key
-            const key_start = @sizeOf(EntryHeader);
-            const key = buf[key_start .. key_start + header.key_len];
-
-            // Extract value
-            const value_start = key_start + header.key_len;
-            const value = buf[value_start .. value_start + header.val_len];
-            if (value.len == 0) {
-                log.err("Empty value at offset {}", .{offset});
-                break;
-            }
-
-            // Add to index
-            const entry = IndexEntry{
-                .offset = offset,
-                .len = @intCast(total_len),
-                .key_allocated = false,
-                .key = key,
-                .value = value,
-            };
-
-            try store.index.put(key, entry);
-
-            offset += total_len;
-        }
-
-        log.debug("index rebuild complete", .{});
-    }
-
-    pub const Iterator = struct {
-        store: *Phage,
-        shard_idx: usize = 0,
-        inner_it: ?std.HashMapUnmanaged([]const u8, IndexEntry, StringContext, std.hash_map.default_max_load_percentage).Iterator = null,
-
-        pub fn next(self: *Iterator) ?struct { key: []const u8, entry: IndexEntry } {
-            while (true) {
-                if (self.inner_it) |*it| {
-                    if (it.next()) |entry| {
-                        return .{ .key = entry.key_ptr.*, .entry = entry.value_ptr.* };
-                    }
-                }
-
-                if (self.shard_idx >= self.store.index.shards.len) return null;
-
-                const shard = &self.store.index.shards[self.shard_idx];
-                shard.mutex.lock();
-                self.inner_it = shard.map.iterator();
-                shard.mutex.unlock();
-                self.shard_idx += 1;
-            }
-        }
-    };
-
-    pub fn iterator(store: *Phage) Iterator {
-        return .{ .store = store };
+        const submitted = try store.ring.submit();
+        const pending = store.pending_ops.fetchAdd(submitted, .monotonic);
+        return submitted + pending;
     }
 };
+
+test "init" {
+    const allocator = std.testing.allocator;
+    const file_path = "test.db";
+
+    var store = try Phage.init(allocator, file_path);
+    defer store.deinit();
+}
+
+test "formatWalEntry" {
+    const allocator = std.testing.allocator;
+    var store = try Phage.init(allocator, "test.db");
+    defer store.deinit();
+    const buf = try store.formatWalEntry("test_key", "test_value");
+    defer allocator.free(buf);
+    try std.testing.expectEqual(@sizeOf(Wal.WalEntryHeader) + 8, buf.len);
+    const header: *const Wal.WalEntryHeader = @ptrCast(@alignCast(buf.ptr));
+    try std.testing.expectEqual(Wal.WalOperation.put, header.op_type);
+    try std.testing.expectEqual(8, header.key_len);
+    try std.testing.expectEqual(10, header.val_len);
+
+    // cleanup test db
+    try testCleanup();
+}
+
+test "formatDataEntry" {
+    const allocator = std.testing.allocator;
+    var store = try Phage.init(allocator, "test.db");
+    defer store.deinit();
+    const buf = try store.formatDataEntry("test_key", "test_value");
+    defer allocator.free(buf);
+    try std.testing.expectEqual(@sizeOf(EntryHeader) + 8 + 10, buf.len);
+    const header: *const EntryHeader = @ptrCast(@alignCast(buf.ptr));
+    try std.testing.expectEqual(8, header.key_len);
+    try std.testing.expectEqual(10, header.val_len);
+
+    // cleanup test db
+    try testCleanup();
+}
+
+test "put and get key/value" {
+    const allocator = std.testing.allocator;
+    var store = try Phage.init(allocator, "test.db");
+    defer store.deinit();
+    errdefer testCleanup() catch unreachable;
+
+    try store.put("key1", "value1");
+    try store.put("key2", "value2");
+
+    const val1 = try store.get("key1");
+    defer allocator.free(val1);
+    try std.testing.expectEqualStrings("value1", val1);
+
+    const val2 = try store.get("key2");
+    defer allocator.free(val2);
+    try std.testing.expectEqualStrings("value2", val2);
+
+    // cleanup test db
+    try testCleanup();
+}
+
+fn testCleanup() !void {
+    try std.posix.unlink("test.db");
+    try std.posix.unlink("test.db.wal");
+}

@@ -1,9 +1,9 @@
 const std = @import("std");
 const AtomicStack = @import("atomic_stack.zig").AtomicStack;
 const Allocator = std.mem.Allocator;
-const prefetch = @import("root.zig").Phage.prefetch;
+const IO = @import("io.zig").IO;
 
-const BUFFER_POOL_SIZE = std.heap.pageSize();
+const BUFFER_POOL_SIZE = 1;
 const BLOCK_SIZE = std.heap.pageSize();
 const MAX_ENTRY_SIZE = std.heap.pageSize();
 
@@ -15,8 +15,9 @@ pub const BufferPool = struct {
     block_size: usize,
 
     pub fn init(allocator: Allocator) !BufferPool {
+        var mutex = std.Thread.Mutex{};
         var available = AtomicStack{
-            .mutex = std.Thread.Mutex{},
+            .mutex = &mutex,
             .list = std.ArrayList([]u8).init(allocator),
         };
 
@@ -37,13 +38,27 @@ pub const BufferPool = struct {
         };
     }
 
+    pub fn deinit(self: BufferPool, allocator: Allocator) void {
+        self.available.mutex.lock();
+        defer self.available.mutex.unlock();
+
+        // Free all pre-allocated buffers (even if still in use)
+        for (self.buffers) |buffer| {
+            allocator.free(buffer); // Free each buffer directly
+        }
+        allocator.free(self.buffers); // Free the array holding buffer pointers
+
+        // Clear the available list (no need to free items—they were in self.buffers)
+        self.available.list.deinit();
+    }
+
     pub fn acquire(self: *BufferPool) ?[]u8 {
         self.available.mutex.lock();
         defer self.available.mutex.unlock();
 
         if (self.available.list.pop()) |buffer| {
             if (self.available.list.items.len > 0) {
-                prefetch(self.available.list.items[0], false);
+                IO.prefetch(self.available.list.items[0], false);
             }
             return buffer;
         }
@@ -51,21 +66,22 @@ pub const BufferPool = struct {
         return null;
     }
 
-    pub fn release(self: *BufferPool, buffer: []u8) void {
-        self.available.mutex.lock();
-        defer self.available.mutex.unlock();
-        self.available.list.append(buffer) catch unreachable;
-    }
-
-    pub fn deinit(self: *BufferPool, allocator: Allocator) void {
+    pub fn release(self: *BufferPool, buffer: []u8) !void {
         self.available.mutex.lock();
         defer self.available.mutex.unlock();
 
-        self.available.list.deinit();
-
-        for (self.buffers) |buffer| {
-            allocator.free(buffer);
+        // Check if the buffer is already in the pool
+        for (self.available.list.items) |item| {
+            const eql = std.mem.eql(u8, item, buffer);
+            if (eql) {
+                return; // Buffer is already in the pool, no need to add it again
+            }
         }
-        allocator.free(self.buffers);
+
+        // Add the buffer back to the available list
+        try self.available.list.append(buffer);
+        if (self.available.list.items.len > 0) {
+            IO.prefetch(self.available.list.items[0], false);
+        }
     }
 };
