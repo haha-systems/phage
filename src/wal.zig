@@ -46,12 +46,18 @@ pub const Wal = struct {
     };
 
     pub const WalEntryHeader = packed struct {
+        // The operation type (put/delete)
         op_type: WalOperation,
+        // Length of the key
         key_len: usize,
+        // Length of the value
         val_len: usize,
+        // Offset in the main database file
         offset: usize,
+        // Checksum for integrity verification
         checksum: u32,
-        padding: u24, // Padding to ensure the size is 32 bytes
+        // Padding to ensure the size is 32 bytes
+        padding: u24,
 
         comptime {
             if (@sizeOf(@This()) != 32) @compileError("invalid header size");
@@ -92,14 +98,22 @@ pub const Wal = struct {
                 return error.ChecksumMismatch;
             }
 
-            if (header.op_type == .put) {
-                try store.index.put(store.allocator, key_buf, .{
-                    .offset = header.offset,
-                    .len = @sizeOf(EntryHeader) + header.key_len + header.val_len,
-                    .key_len = header.key_len,
-                    .val_len = header.val_len,
-                });
+            switch (header.op_type) {
+                .put => {
+                    // We may have provisional entries in the WAL that haven't been written to the main file
+                    // yet for whatever reason. If we find any, just skip them as we haven't guaranteed them yet.
+                    if (header.offset == 0) continue;
+
+                    try store.index.put(store.allocator, key_buf, .{
+                        .offset = header.offset,
+                        .len = @sizeOf(EntryHeader) + header.key_len + header.val_len,
+                        .key_len = header.key_len,
+                        .val_len = header.val_len,
+                    });
+                },
+                .delete => try store.index.delete(key_buf),
             }
+
             offset += @sizeOf(WalEntryHeader) + header.key_len;
         }
     }
@@ -122,7 +136,52 @@ pub const Wal = struct {
 
 // ---------------------------------------------------------------
 
-test "recoverWal" {
+test "recover" {
+    const allocator = std.testing.allocator;
+    const path = "test.db";
+
+    // Clean up any existing files
+    try testCleanup();
+
+    // Create a dummy Phage store
+    var store = try Phage.init(allocator, path);
+    defer store.deinit();
+
+    // Simulate a WAL entry
+    const key = "test_key";
+    const value = "test_value";
+    const offset = 0;
+    const checksum = Wal.calculateChecksum(.put, @intCast(key.len), @intCast(value.len), offset, key);
+
+    // Write the WAL entry to the file
+    const entry_header = Wal.WalEntryHeader{
+        .op_type = .put,
+        .key_len = @intCast(key.len),
+        .val_len = @intCast(value.len),
+        .offset = offset,
+        .checksum = checksum,
+        .padding = 0,
+    };
+
+    _ = try std.posix.pwrite(store.wal_fd, std.mem.asBytes(&entry_header), 0);
+    _ = try std.posix.pwrite(store.wal_fd, key, @sizeOf(Wal.WalEntryHeader));
+
+    // Recover the WAL
+    try Wal.recover(&store);
+
+    // check the index entry recovered from the wal
+    const index_entry = store.index.get(key);
+    try expectNotNull(index_entry);
+    const index_entry_value = index_entry.?;
+    try std.testing.expectEqual(index_entry_value.offset, offset);
+    try std.testing.expectEqual(index_entry_value.len, @sizeOf(EntryHeader) + key.len + value.len);
+    try std.testing.expectEqual(index_entry_value.key_len, key.len);
+    try std.testing.expectEqual(index_entry_value.val_len, value.len);
+
+    try testCleanup();
+}
+
+test "recover with provisional entries" {
     const allocator = std.testing.allocator;
     const path = "test.db";
 

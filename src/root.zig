@@ -90,21 +90,31 @@ pub const Phage = struct {
         self.buffer_pool.deinit(self.allocator);
     }
 
+    /// Writes a key-value pair to the database.
+    ///
+    /// This function performs the following steps:
+    /// 1. Writes a provisional entry to the Write-Ahead Log (WAL).
+    /// 2. Writes the key-value pair to the main database file.
+    /// 3. Updates the WAL entry with the offset of the key-value pair in the main file.
+    /// 4. Updates the index with the key and its offset in the main file.
+    ///
+    /// The key and value are duplicated, so the caller must ensure they are not
+    /// freed until the database is closed or the entry is deleted.
+    ///
     pub fn put(self: *Phage, key: []const u8, value: []const u8) !void {
-        // Step 1: Log to WAL
-        const wal_entry = try self.formatWalEntry(key, value);
-        // defer self.buffer_pool.release(wal_entry) catch unreachable;
-        defer self.allocator.free(wal_entry);
+        // Step 1: Write provisional entry to WAL, we'll get the offset later
+        const provisional_wal_entry = try self.formatWalEntry(.put, key, value, 0);
+        defer self.allocator.free(provisional_wal_entry);
 
-        const wal_offset = self.wal_file_size.fetchAdd(wal_entry.len, .monotonic);
+        const wal_offset = self.wal_file_size.fetchAdd(provisional_wal_entry.len, .monotonic);
 
-        var ops_submitted = try self.writeToWal(wal_entry, wal_offset);
+        var ops_submitted = try self.writeToWal(provisional_wal_entry, wal_offset);
         try waitForIO(self);
         if (ops_submitted < 1) {
             return error.WriteError;
         }
 
-        // Step 2: Write to main file
+        // Step 2: Write to main file to secure the offset
         const data_entry = try self.formatDataEntry(key, value);
         defer self.allocator.free(data_entry);
 
@@ -116,7 +126,16 @@ pub const Phage = struct {
             return error.WriteError;
         }
 
-        // Step 3: Update index
+        // Step 3: Update WAL entry with the offset
+        const final_wal_entry = try self.formatWalEntry(.put, key, value, data_offset);
+        defer self.allocator.free(final_wal_entry);
+        ops_submitted = try self.writeToWal(final_wal_entry, wal_offset);
+        try waitForIO(self);
+        if (ops_submitted < 1) {
+            return error.WriteError;
+        }
+
+        // Step 4: Finally, we update the index
         try self.index.put(self.allocator, key, .{
             .offset = data_offset,
             .len = data_entry.len,
@@ -125,6 +144,17 @@ pub const Phage = struct {
         });
     }
 
+    /// Reads a value from the database using the provided key.
+    ///
+    /// This function performs the following steps:
+    /// 1. Retrieves the entry from the index using the key.
+    /// 2. Allocates a buffer to read the entry from the main database file.
+    /// 3. Reads the entry from the main database file.
+    /// 4. Validates the key and extracts the value.
+    /// 5. Returns the value to the caller.
+    ///
+    /// The caller is responsible for freeing the returned value.
+    /// If the key is not found, an error is returned.
     pub fn get(self: *Phage, key: []const u8) ![]u8 {
         const entry = self.index.get(key) orelse return error.KeyNotFound;
         const buf = try self.allocator.alloc(u8, entry.len);
@@ -135,10 +165,8 @@ pub const Phage = struct {
             return error.ReadError;
         }
 
-        // Wait for IO to complete
         try waitForIO(self);
 
-        // validate and extract value
         const key_start = @sizeOf(EntryHeader);
         const stored_key = buf[key_start..][0..entry.key_len];
         if (!std.mem.eql(u8, stored_key, key)) return error.KeyMismatch;
@@ -146,12 +174,39 @@ pub const Phage = struct {
         const val_start = key_start + entry.key_len;
         const value = buf[val_start..][0..entry.val_len];
 
-        // caller now owns the value
+        // note: caller now owns the value
         return self.allocator.dupe(u8, value) catch |err| {
             return err;
         };
     }
 
+    /// Deletes a key-value pair from the database using the provided key.
+    ///
+    /// This function performs the following steps:
+    /// 1. Writes a delete entry to the Write-Ahead Log (WAL).
+    /// 2. Updates the index to remove the key.
+    /// 3. Returns true if the key was successfully deleted, false otherwise.
+    ///
+    /// The key is duplicated, so the caller must ensure it is not freed until the
+    /// database is closed or the entry is deleted.
+    ///
+    /// If the key is not found, an error is returned.
+    pub fn delete(self: *Phage, key: []const u8) !bool {
+        const wal_entry = try self.formatWalEntry(.delete, key, null, 0);
+        defer self.allocator.free(wal_entry);
+
+        const wal_offset = self.wal_file_size.fetchAdd(wal_entry.len, .monotonic);
+
+        const ops_submitted = try self.writeToWal(wal_entry, wal_offset);
+        try waitForIO(self);
+        if (ops_submitted < 1) {
+            return error.WriteError;
+        }
+
+        return try self.index.delete(self.allocator, key);
+    }
+
+    /// Waits for all pending I/O operations to complete.
     fn waitForIO(self: *Phage) !void {
         while (self.pending_ops.load(.acquire) > 0) {
             // var cqe: linux.io_uring_cqe = undefined;
@@ -165,7 +220,14 @@ pub const Phage = struct {
         }
     }
 
-    fn formatWalEntry(self: *Phage, key: []const u8, value: []const u8) ![]u8 {
+    /// Formats a WAL entry with the given operation, key, value, and offset.
+    /// Returns a buffer containing the serialized entry.
+    /// The caller is responsible for freeing the buffer.
+    /// The offset is used to store the location of the entry in the main database file.
+    /// The value is optional and should be null for delete operations.
+    ///
+    /// See `Wal.WalEntryHeader` for the format of the entry.
+    fn formatWalEntry(self: *Phage, op: Wal.WalOperation, key: []const u8, value: ?[]const u8, offset: usize) ![]u8 {
         // Calculate sizes
         const header_size = @sizeOf(Wal.WalEntryHeader); // 32 bytes
         const total_size = header_size + key.len;
@@ -174,14 +236,15 @@ pub const Phage = struct {
         const buf = try self.allocator.alloc(u8, total_size);
         errdefer self.allocator.free(buf);
 
+        const val_len = if (op == Wal.WalOperation.put) value.?.len else 0;
+
         // Create header
-        const offset = 0; // Will be set by caller (e.g., file_size)
         const header = Wal.WalEntryHeader{
-            .op_type = .put,
+            .op_type = op,
             .key_len = key.len,
-            .val_len = value.len,
-            .offset = offset, // Placeholder; updated by put
-            .checksum = Wal.calculateChecksum(.put, @intCast(key.len), @intCast(value.len), offset, key),
+            .val_len = val_len,
+            .offset = offset,
+            .checksum = Wal.calculateChecksum(op, @intCast(key.len), @intCast(val_len), offset, key),
             .padding = 0,
         };
 
@@ -194,6 +257,11 @@ pub const Phage = struct {
         return buf;
     }
 
+    /// Formats a data entry with the given key and value.
+    /// Returns a buffer containing the serialized entry.
+    /// The caller is responsible for freeing the buffer.
+    ///
+    /// See `EntryHeader` for the format of the entry.
     fn formatDataEntry(self: *Phage, key: []const u8, value: []const u8) ![]u8 {
         // Validate sizes to prevent overflow
         if (key.len > std.math.maxInt(u32) or value.len > std.math.maxInt(u32)) {
@@ -263,10 +331,13 @@ test "init" {
 
 test "formatWalEntry" {
     const allocator = std.testing.allocator;
+
     var store = try Phage.init(allocator, "test.db");
     defer store.deinit();
-    const buf = try store.formatWalEntry("test_key", "test_value");
+
+    const buf = try store.formatWalEntry(.put, "test_key", "test_value", 0);
     defer allocator.free(buf);
+
     try std.testing.expectEqual(@sizeOf(Wal.WalEntryHeader) + 8, buf.len);
     const header: *const Wal.WalEntryHeader = @ptrCast(@alignCast(buf.ptr));
     try std.testing.expectEqual(Wal.WalOperation.put, header.op_type);
@@ -279,10 +350,13 @@ test "formatWalEntry" {
 
 test "formatDataEntry" {
     const allocator = std.testing.allocator;
+
     var store = try Phage.init(allocator, "test.db");
     defer store.deinit();
+
     const buf = try store.formatDataEntry("test_key", "test_value");
     defer allocator.free(buf);
+
     try std.testing.expectEqual(@sizeOf(EntryHeader) + 8 + 10, buf.len);
     const header: *const EntryHeader = @ptrCast(@alignCast(buf.ptr));
     try std.testing.expectEqual(8, header.key_len);
@@ -308,6 +382,24 @@ test "put and get key/value" {
     const val2 = try store.get("key2");
     defer allocator.free(val2);
     try std.testing.expectEqualStrings("value2", val2);
+
+    // cleanup test db
+    try testCleanup();
+}
+
+test "delete key" {
+    const allocator = std.testing.allocator;
+    var store = try Phage.init(allocator, "test.db");
+    defer store.deinit();
+    errdefer testCleanup() catch unreachable;
+
+    try store.put("key1", "value1");
+    const deleted = try store.delete("key1");
+    try std.testing.expect(deleted);
+
+    // We expect a KeyNotFound error here
+    const result = store.get("key1");
+    try std.testing.expectError(error.KeyNotFound, result);
 
     // cleanup test db
     try testCleanup();

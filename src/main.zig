@@ -23,7 +23,8 @@ pub fn main() !void {
     const buffer = try allocator.alloc(u8, 1024);
     defer allocator.free(buffer);
 
-    try stdout.print("phage v0.1 :: type 'help' for commands, 'quit' to exit\n", .{});
+    try stdout.print("phage v0.1 :: type 'help' for commands, 'exit' to exit\n", .{});
+    try stdout.print("phage > ", .{});
 
     while (true) {
         const input = blk: {
@@ -82,17 +83,15 @@ fn executeCommand(store: *Phage, allocator: std.mem.Allocator, input: []const u8
         defer allocator.free(value);
         try writer.print("\"{s}\"\n", .{value});
     } else if (std.ascii.eqlIgnoreCase(cmd, "DELETE")) {
-        // not implemented yet
-        try writer.print("Error: DELETE command not implemented\n", .{});
+        const key = tokens.next() orelse return try writer.print("Error: Missing key\n", .{});
+        if (tokens.next() != null) return try writer.print("Error: Too many arguments\n", .{});
 
-        // const key = tokens.next() orelse return try writer.print("Error: Missing key\n", .{});
-        // if (tokens.next() != null) return try writer.print("Error: Too many arguments\n", .{});
+        _ = store.delete(key) catch |err| {
+            try writer.print("Error: Failed to delete key '{s}': {s}\n", .{ key, @errorName(err) });
+            return;
+        };
 
-        // store.delete(key) catch |err| {
-        //     try writer.print("Error: Failed to delete key '{s}': {s}\n", .{ key, @errorName(err) });
-        //     return;
-        // };
-        // try writer.print("OK\n", .{});
+        try writer.print("OK\n", .{});
     } else {
         try writer.print("Error: Unknown command '{s}'. Type HELP for commands.\n", .{cmd});
     }
