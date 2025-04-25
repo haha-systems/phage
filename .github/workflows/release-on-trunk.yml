@@ -33,19 +33,12 @@ jobs:
       - name: Create Release
         id: create_release
         uses: softprops/action-gh-release@v2
+        if: github.ref.type == 'tag'
         with:
           name: Release ${{ github.sha }}
           tag_name: trunk-${{ github.sha }}
           generate_release_notes: true
           token: ${{ secrets.CI_TOKEN }}
-        env:
-          CI_TOKEN: ${{ secrets.CI_TOKEN }}
-
-      - name: Upload binary to Release
-        uses: softprops/action-gh-release@v2
-        with:
           files: ${{ steps.find-binary.outputs.binary }}
-          tag_name: trunk-${{ github.sha }}
-          token: ${{ secrets.CI_TOKEN }}
         env:
           CI_TOKEN: ${{ secrets.CI_TOKEN }}
