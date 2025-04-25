@@ -62,7 +62,7 @@ fn executeCommand(store: *Phage, allocator: std.mem.Allocator, input: []const u8
         , .{});
     } else if (std.ascii.eqlIgnoreCase(cmd, "exit")) {
         std.posix.exit(0);
-    } else if (std.ascii.eqlIgnoreCase(cmd, "PUT")) {
+    } else if (std.ascii.eqlIgnoreCase(cmd, "put")) {
         const key = tokens.next() orelse return try writer.print("Error: Missing key\n", .{});
         const value = tokens.next() orelse return try writer.print("Error: Missing value\n", .{});
         if (tokens.next() != null) return try writer.print("Error: Too many arguments\n", .{});
@@ -72,7 +72,7 @@ fn executeCommand(store: *Phage, allocator: std.mem.Allocator, input: []const u8
             return;
         };
         try writer.print("OK\n", .{});
-    } else if (std.ascii.eqlIgnoreCase(cmd, "GET")) {
+    } else if (std.ascii.eqlIgnoreCase(cmd, "get")) {
         const key = tokens.next() orelse return try writer.print("Error: Missing key\n", .{});
         if (tokens.next() != null) return try writer.print("Error: Too many arguments\n", .{});
 
@@ -82,7 +82,7 @@ fn executeCommand(store: *Phage, allocator: std.mem.Allocator, input: []const u8
         };
         defer allocator.free(value);
         try writer.print("\"{s}\"\n", .{value});
-    } else if (std.ascii.eqlIgnoreCase(cmd, "DELETE")) {
+    } else if (std.ascii.eqlIgnoreCase(cmd, "delete")) {
         const key = tokens.next() orelse return try writer.print("Error: Missing key\n", .{});
         if (tokens.next() != null) return try writer.print("Error: Too many arguments\n", .{});
 
