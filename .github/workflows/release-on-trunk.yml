@@ -1,0 +1,45 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - trunk
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.14.0
+
+      - name: Build Zig app
+        run: |
+          zig build --release=safe
+          # Or, if you have a src/main.zig entrypoint:
+          # zig build-exe src/main.zig -O ReleaseSafe -fstrip
+
+      - name: Find built binary
+        id: find-binary
+        run: |
+          # Adjust the path if your binary goes elsewhere
+          BIN_PATH=$(find zig-out/bin -type f -executable | head -n 1)
+          echo "binary=$BIN_PATH" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.sha }}
+          tag_name: trunk-${{ github.sha }}
+          generate_release_notes: true
+
+      - name: Upload binary to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.find-binary.outputs.binary }}
+          tag_name: trunk-${{ github.sha }}
