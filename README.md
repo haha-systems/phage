@@ -1,8 +1,8 @@
-# Phage
+<p align="center">
+    <img src="docs/logo-ascii.png" width="300" />
+</p>
 
-<div style="text-align: center; padding: 30px 0">
-<img src="docs/logo-ascii.png" width="300"><img/>
-</div>
+# Phage
 
 Phage is a fast key/value store similar to Redis and Valkey, with these goals in mind:
 
@@ -46,7 +46,7 @@ Phage currently supports the following operations. You can interact directly wit
 
 - [x] **put (key, value)**: insert a new key/value entry into the database
 - [x] **get (key)**: retrieve a key/value entry by it's key name
-- [x] **delete (key)**: delete a key/value entry from the database
+- [x] **delete (key)**: delete a key/value entry` from the database
 - [x] **keys (pattern)**: return keys from the database matching a regex pattern
 - [x] **exit**: quits Demon
 
