@@ -56,6 +56,7 @@ fn executeCommand(store: *Phage, allocator: std.mem.Allocator, input: []const u8
             \\  PUT <key> <value> - Store a key-value pair
             \\  GET <key>         - Retrieve a value by key
             \\  DELETE <key>      - Delete a key-value pair
+            \\  KEYS <pattern>    - List keys matching a regex pattern
             \\  EXIT              - Quit the CLI
             \\  HELP              - Show this help
             \\
