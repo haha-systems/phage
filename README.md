@@ -2,7 +2,9 @@
     <img src="docs/logo-ascii.png" width="300" />
 </p>
 
+
 # Phage
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 Phage is a fast key/value store similar to Redis and Valkey, with these goals in mind:
 
@@ -70,3 +72,11 @@ Phage currently only has a single client; a terminal CLI for direct access to th
 - [] Queue patterns
 - [] Bus patterns
 - [] Vector storage
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Contributing
+
+If you want to contribute to make Phage better, I'm very open to pull/feature requests.

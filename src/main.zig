@@ -1,6 +1,6 @@
-//! By convention, main.zig is where your main function lives in the case that
-//! you are building an executable. If you are making a library, the convention
-//! is to delete this file and start with root.zig instead.
+// Copyright (c) 2025 Haha Systems Limited
+// Licensed under the MIT License. See LICENSE.md file in the project root.
+
 const std = @import("std");
 
 const lib = @import("root.zig");

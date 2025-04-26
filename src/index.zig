@@ -1,4 +1,5 @@
-// src/index.zig
+// Copyright (c) 2025 Haha Systems Limited
+// Licensed under the MIT License. See LICENSE.md file in the project root.
 
 const std = @import("std");
 const StringContext = @import("string_context.zig").StringContext;
