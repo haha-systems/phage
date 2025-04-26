@@ -1,7 +1,10 @@
 const std = @import("std");
 const linux = @import("std").os.linux;
 const posix = @import("std").posix;
-const log = @import("std").log;
+const log = @import("colored_logger").myLogFn;
+
+const Chameleon = @import("chameleon");
+const mvzr = @import("mvzr");
 
 const Allocator = std.mem.Allocator;
 const BufferPool = @import("buffer_pool.zig").BufferPool;
@@ -27,6 +30,8 @@ pub const Phage = struct {
         allocator: Allocator,
         file_path: []const u8,
     ) !Phage {
+        log(.debug, .phage, "Phage starting...", .{});
+
         var options = std.mem.zeroInit(linux.io_uring_params, .{
             .flags = linux.IORING_SETUP_COOP_TASKRUN |
                 linux.IORING_SETUP_SINGLE_ISSUER,
@@ -70,7 +75,7 @@ pub const Phage = struct {
         const index = try IndexManager.init(allocator);
         const buffer_pool = try BufferPool.init(allocator);
 
-        return Phage{
+        var store = Phage{
             .allocator = allocator,
             .ring = ring,
             .fd = fd,
@@ -80,6 +85,18 @@ pub const Phage = struct {
             .index = index,
             .buffer_pool = buffer_pool,
         };
+
+        // rebuild the index from the main file
+        log(.debug, .phage, "Rebuilding index...", .{});
+        try store.rebuildIndex();
+        log(.debug, .phage, "Index rebuilt.", .{});
+
+        // recover the WAL entries for consistency
+        log(.debug, .phage, "Checking WAL recovery entries...", .{});
+        try Wal.recover(@ptrCast(&store));
+        log(.debug, .phage, "WAL recovery completed.", .{});
+
+        return store;
     }
 
     pub fn deinit(self: *Phage) void {
@@ -206,6 +223,80 @@ pub const Phage = struct {
         return try self.index.delete(self.allocator, key);
     }
 
+    /// Rebuilds the index from the main database file.
+    pub fn rebuildIndex(self: *Phage) !void {
+        var offset: usize = 0;
+        const file_stat = try std.posix.fstat(self.fd);
+        const file_size = file_stat.size;
+
+        while (offset < file_size) {
+            var header_buf: [@sizeOf(EntryHeader)]u8 = undefined;
+            const header_read = try std.posix.pread(self.fd, &header_buf, offset);
+            if (header_read < @sizeOf(EntryHeader)) break;
+
+            const header: EntryHeader = @bitCast(header_buf);
+
+            // Read key
+            const key_buf = try self.allocator.alloc(u8, header.key_len);
+            defer self.allocator.free(key_buf);
+            const key_read = try std.posix.pread(self.fd, key_buf, offset + @sizeOf(EntryHeader));
+            if (key_read < header.key_len) break;
+
+            // Insert into index
+            try self.index.put(self.allocator, key_buf, .{
+                .offset = offset,
+                .len = @sizeOf(EntryHeader) + header.key_len + header.val_len,
+                .key_len = header.key_len,
+                .val_len = header.val_len,
+            });
+
+            offset += @sizeOf(EntryHeader) + header.key_len + header.val_len;
+        }
+    }
+
+    pub fn printKeys(self: *Phage, pattern: []const u8, writer: anytype) !void {
+        var c = Chameleon.initRuntime(.{
+            .allocator = self.allocator,
+            .detect_no_color = true,
+        });
+        defer c.deinit();
+
+        if (self.index.count() == 0) {
+            try writer.print("0 keys\n", .{});
+            return;
+        }
+
+        const regex = mvzr.compile(pattern);
+        if (regex == null) {
+            try writer.print("Invalid regex pattern: {s}\n", .{pattern});
+            return;
+        }
+
+        var selected_count: usize = 0;
+        for (self.index.shards) |*shard| {
+            var it = shard.map.keyIterator();
+            while (it.next()) |key| {
+                const match = regex.?.isMatch(key.*);
+                if (match) {
+                    const entry = shard.map.get(key.*) orelse continue;
+                    const k = try c.red().fmt("{s}", .{key.*});
+                    const v = try c.redBright().fmt("{s}", .{try self.get(key.*)});
+                    try writer.print("{s}: {s} ({d})\n", .{ k, v, entry.offset });
+                    selected_count += 1;
+                }
+            }
+        }
+
+        const count_str = std.fmt.allocPrint(self.allocator, "{d} of {d} keys", .{ selected_count, self.index.count() }) catch |err| {
+            return err;
+        };
+        errdefer self.allocator.free(count_str);
+        defer self.allocator.free(count_str);
+
+        try writer.print("[{s}]\n", .{count_str});
+    }
+
+    /// -----------------------------------------------------------------------------------------------
     /// Waits for all pending I/O operations to complete.
     fn waitForIO(self: *Phage) !void {
         while (self.pending_ops.load(.acquire) > 0) {

@@ -92,6 +92,24 @@ fn executeCommand(store: *Phage, allocator: std.mem.Allocator, input: []const u8
         };
 
         try writer.print("OK\n", .{});
+    } else if (std.ascii.eqlIgnoreCase(cmd, "keys")) {
+        var pattern = tokens.next() orelse {
+            try writer.print("Error: Missing pattern\n", .{});
+            return;
+        };
+
+        if (tokens.next() != null) {
+            try writer.print("Error: Too many arguments\n", .{});
+            return;
+        }
+
+        // TODO: allow for a single * character wildcard
+        const wildcard_pattern = std.mem.eql(u8, pattern, "*");
+        if (wildcard_pattern) {
+            pattern = ".*";
+        }
+
+        try store.printKeys(pattern, writer);
     } else {
         try writer.print("Error: Unknown command '{s}'. Type HELP for commands.\n", .{cmd});
     }

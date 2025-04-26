@@ -1,4 +1,7 @@
 const std = @import("std");
+
+const log = @import("colored_logger").myLogFn;
+
 const Phage = @import("root.zig").Phage;
 const IndexEntry = @import("index.zig").IndexEntry;
 const EntryHeader = @import("index.zig").EntryHeader;
@@ -70,6 +73,9 @@ pub const Wal = struct {
     };
 
     pub fn recover(store: *Phage) !void {
+        // If we enounter an error recovering the WAL, make sure we kill the store correctly
+        errdefer store.deinit();
+
         // check the wal file size again as it may have changed
         // since the last time we checked
         const wal_file_stat = try std.posix.fstat(store.wal_fd);
@@ -77,12 +83,14 @@ pub const Wal = struct {
 
         // check if the wal file is empty with the new size
         if (store.wal_file_size.load(.acquire) == 0) {
-            std.log.info("WAL file is empty, nothing to recover", .{});
+            log(.info, .phage, "WAL file is empty, nothing to recover", .{});
             return;
         }
 
         var offset: usize = 0;
         while (offset < store.wal_file_size.load(.acquire)) {
+            log(.debug, .phage, "Reading WAL entry at offset: {d}", .{offset});
+
             var header_buf: [@sizeOf(WalEntryHeader)]u8 = undefined;
             const header_read = try std.posix.pread(store.wal_fd, &header_buf, offset);
             if (header_read < @sizeOf(WalEntryHeader)) break;
@@ -94,15 +102,32 @@ pub const Wal = struct {
             const key_read = try std.posix.pread(store.wal_fd, key_buf, offset + @sizeOf(WalEntryHeader));
             if (key_read < header.key_len) break;
 
+            log(.debug, .phage, "Read WAL entry: {s}", .{key_buf});
+            log(.debug, .phage, "Header: {s}", .{header_buf});
+
             if (calculateChecksum(header.op_type, @intCast(header.key_len), @intCast(header.val_len), header.offset, key_buf) != header.checksum) {
+                log(.err, .phage, "Checksum mismatch for WAL entry at offset: {d}", .{offset});
+                log(.err, .phage, "Expected checksum: {d}, computed checksum: {d}", .{ header.checksum, calculateChecksum(header.op_type, @intCast(header.key_len), @intCast(header.val_len), header.offset, key_buf) });
+                log(.err, .phage, "Key: {s}", .{key_buf});
+                log(.err, .phage, "Header: {s}", .{header_buf});
                 return error.ChecksumMismatch;
             }
+
+            log(.debug, .phage, "Checksum verified for offset: {d}", .{offset});
+            log(.debug, .phage, "Key length: {d}, Value length: {d}", .{ header.key_len, header.val_len });
+            log(.debug, .phage, "Offset: {d}", .{header.offset});
+            log(.debug, .phage, "Operation: {}", .{header.op_type});
+            log(.debug, .phage, "Checksum: {d}", .{header.checksum});
 
             switch (header.op_type) {
                 .put => {
                     // We may have provisional entries in the WAL that haven't been written to the main file
                     // yet for whatever reason. If we find any, just skip them as we haven't guaranteed them yet.
-                    if (header.offset == 0) continue;
+                    if (header.offset == 0 and header.val_len == 0) {
+                        log(.info, .phage, "Skipping provisional entry for key: {s}", .{key_buf});
+                        offset += @sizeOf(WalEntryHeader) + header.key_len;
+                        continue;
+                    }
 
                     try store.index.put(store.allocator, key_buf, .{
                         .offset = header.offset,
@@ -111,11 +136,43 @@ pub const Wal = struct {
                         .val_len = header.val_len,
                     });
                 },
-                .delete => try store.index.delete(key_buf),
+                .delete => {
+                    const deleted = try store.index.delete(store.allocator, key_buf);
+                    if (deleted) {
+                        log(.info, .phage, "Deleted entry for key: {s}", .{key_buf});
+                    }
+                },
             }
 
             offset += @sizeOf(WalEntryHeader) + header.key_len;
         }
+
+        // Truncate the WAL file to remove processed entries
+        const truncate = std.os.linux.ftruncate(store.wal_fd, @intCast(0));
+
+        // Note: might need to use llseek for 32-bit systems
+        const seek = std.os.linux.lseek(store.wal_fd, 0, 0);
+
+        // Sync the WAL file to ensure data is written
+        const sync = std.os.linux.fsync(store.wal_fd);
+
+        if (truncate != 0) {
+            log(.err, .phage, "Failed to truncate WAL file: {d}", .{truncate});
+            return error.TruncateError;
+        }
+        if (seek != 0) {
+            log(.err, .phage, "Failed to seek WAL file: {d}", .{seek});
+            return error.SeekError;
+        }
+        if (sync != 0) {
+            log(.err, .phage, "Failed to sync WAL file: {d}", .{sync});
+            return error.SyncError;
+        }
+
+        log(.info, .phage, "Truncated WAL file to offset: {d}", .{seek});
+
+        // Make sure we reset the atomic file size to zero
+        store.wal_file_size.store(0, .release);
     }
 
     pub fn calculateChecksum(op_type: WalOperation, key_len: u32, val_len: u32, offset: u64, key: []const u8) u32 {

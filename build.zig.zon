@@ -24,7 +24,20 @@
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
-    .dependencies = .{},
+    .dependencies = .{
+        .colored_logger = .{
+            .url = "git+https://github.com/4zv4l/zig_colored_logger#175c78f8fadec1e9da23fdf5eacd02c99f6cb47e",
+            .hash = "colored_logger-0.0.0-AAAAAHZLAACqbnzDGVynwZVZoicJTofVAt16BWY_jNtv",
+        },
+        .chameleon = .{
+            .url = "git+https://github.com/tr1ckydev/chameleon#c9327827352354da246733e97535754ced64def8",
+            .hash = "12203173fa28bcd0fdeac9862d6d6ea59ae9bcac5d6054f97f556789d32e0b55d0a1",
+        },
+        .mvzr = .{
+            .url = "https://github.com/mnemnion/mvzr/archive/refs/tags/v0.3.4.tar.gz",
+            .hash = "mvzr-0.3.4-ZSOky2RnAQDtFSuVhbh2fP1s4PwRvTQ-DDw2lixvvA7T",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

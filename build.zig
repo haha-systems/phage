@@ -67,6 +67,14 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addImport("phage", lib_mod);
 
+    // Colored Logger
+    const colored_logger = b.dependency("colored_logger", .{ .project_name = exe.name });
+    const cham = b.dependency("chameleon", .{ .target = target, .optimize = optimize });
+    const mvzr = b.dependency("mvzr", .{ .target = target, .optimize = optimize });
+    exe.root_module.addImport("colored_logger", colored_logger.module("colored_logger"));
+    exe.root_module.addImport("chameleon", cham.module("chameleon"));
+    exe.root_module.addImport("mvzr", mvzr.module("mvzr"));
+
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
