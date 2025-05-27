@@ -185,6 +185,10 @@ pub const Phage = struct {
             .key_len = key.len,
             .val_len = value.len,
         });
+
+        // Step 4a: Truncate the WAL file now that the entry is complete
+        try std.posix.ftruncate(self.wal_fd, 0);
+        self.wal_file_size.store(0, .monotonic);
     }
 
     /// Reads a value from the database using the provided key.
@@ -447,6 +451,17 @@ pub const Phage = struct {
     }
 
     /// -----------------------------------------------------------------------------------------------
+    fn calculateWalWasteRatio(self: *Phage) f64 {
+        const wal_size = self.wal_file_size.load(.monotonic);
+        const main_file_size = self.file_size.load(.monotonic);
+        if (main_file_size == 0) return 0.0; // Avoid division by zero
+
+        // Calculate the ratio of WAL size to main file size (preserve precision)
+        const wal_size_f: f64 = @floatFromInt(wal_size);
+        const main_size_f: f64 = @floatFromInt(main_file_size);
+        return wal_size_f / main_size_f;
+    }
+
     /// Waits for all pending I/O operations to complete.
     fn waitForIO(self: *Phage) !void {
         while (self.pending_ops.load(.acquire) > 0) {
