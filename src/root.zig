@@ -33,6 +33,10 @@ pub const Phage = struct {
     pending_ops: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     server_fd: posix.fd_t = 0,
 
+    // Compaction-related fields
+    compaction_threshold: f64 = 0.5, // Trigger compaction at 50% waste
+    compaction_in_progress: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     const RING_ENTRIES: u32 = 128;
 
     pub fn init(
@@ -189,6 +193,11 @@ pub const Phage = struct {
         // Step 4a: Truncate the WAL file now that the entry is complete
         try std.posix.ftruncate(self.wal_fd, 0);
         self.wal_file_size.store(0, .monotonic);
+
+        // Step 4b: Check if compaction is needed (non-blocking)
+        self.checkAndScheduleCompaction() catch |err| {
+            std.log.warn("Failed to schedule compaction: {s}", .{@errorName(err)});
+        };
     }
 
     /// Reads a value from the database using the provided key.
@@ -451,6 +460,30 @@ pub const Phage = struct {
     }
 
     /// -----------------------------------------------------------------------------------------------
+    /// Calculate the waste ratio in the main database file.
+    /// Returns a value between 0.0 and 1.0 where 1.0 means 100% waste.
+    pub fn calculateMainFileWasteRatio(self: *Phage) f64 {
+        const file_size = self.file_size.load(.monotonic);
+        if (file_size == 0) return 0.0;
+
+        // Calculate total size of all reachable entries
+        var useful_size: usize = 0;
+        for (self.index.shards) |*shard| {
+            shard.mutex.lock();
+            defer shard.mutex.unlock();
+
+            var it = shard.map.valueIterator();
+            while (it.next()) |entry| {
+                useful_size += entry.len;
+            }
+        }
+
+        if (useful_size == 0) return 0.0;
+
+        const useful_ratio = @as(f64, @floatFromInt(useful_size)) / @as(f64, @floatFromInt(file_size));
+        return @max(0.0, 1.0 - useful_ratio); // Ensure non-negative result
+    }
+
     fn calculateWalWasteRatio(self: *Phage) f64 {
         const wal_size = self.wal_file_size.load(.monotonic);
         const main_file_size = self.file_size.load(.monotonic);
@@ -460,6 +493,109 @@ pub const Phage = struct {
         const wal_size_f: f64 = @floatFromInt(wal_size);
         const main_size_f: f64 = @floatFromInt(main_file_size);
         return wal_size_f / main_size_f;
+    }
+
+    /// Check if compaction is needed and schedule it if necessary.
+    /// This function is non-blocking and will not interfere with ongoing operations.
+    fn checkAndScheduleCompaction(self: *Phage) !void {
+        // Skip if compaction is already in progress
+        if (self.compaction_in_progress.load(.acquire)) {
+            return;
+        }
+
+        const waste_ratio = self.calculateMainFileWasteRatio();
+        if (waste_ratio >= self.compaction_threshold) {
+            std.log.info("Compaction triggered: waste ratio {d:.2}% >= threshold {d:.2}%", .{ waste_ratio * 100, self.compaction_threshold * 100 });
+
+            // Set compaction flag atomically
+            if (self.compaction_in_progress.cmpxchgWeak(false, true, .acquire, .acquire) == null) {
+                // We successfully set the flag, schedule background compaction
+                try self.performCompaction();
+                self.compaction_in_progress.store(false, .release);
+                std.log.info("Compaction completed successfully", .{});
+            }
+        }
+    }
+
+    /// Perform the actual compaction by rewriting the database file.
+    /// This function creates a new file with only reachable entries.
+    fn performCompaction(self: *Phage) !void {
+        const temp_path = try std.fmt.allocPrint(self.allocator, "{s}.compact.tmp", .{"phage_store"});
+        defer self.allocator.free(temp_path);
+
+        // Create temporary file for compacted data
+        const temp_fd = try std.posix.open(
+            temp_path,
+            .{
+                .ACCMODE = .RDWR,
+                .CREAT = true,
+                .TRUNC = true,
+                .CLOEXEC = true,
+            },
+            std.posix.S.IRUSR | std.posix.S.IWUSR,
+        );
+        defer std.posix.close(temp_fd);
+
+        var new_offset: usize = 0;
+        var entries_compacted: usize = 0;
+
+        // Iterate through all entries in the index and write them to the new file
+        for (self.index.shards) |*shard| {
+            shard.mutex.lock();
+            defer shard.mutex.unlock();
+
+            var it = shard.map.iterator();
+            while (it.next()) |entry| {
+                const index_entry = entry.value_ptr.*;
+
+                // Read the entry from the current file
+                const entry_buf = try self.allocator.alloc(u8, index_entry.len);
+                defer self.allocator.free(entry_buf);
+
+                const bytes_read = try std.posix.pread(self.fd, entry_buf, index_entry.offset);
+                if (bytes_read != index_entry.len) {
+                    return error.CorruptedEntry;
+                }
+
+                // Write to the new file
+                const bytes_written = try std.posix.pwrite(temp_fd, entry_buf, new_offset);
+                if (bytes_written != entry_buf.len) {
+                    return error.WriteError;
+                }
+
+                // Update the index entry with the new offset
+                entry.value_ptr.*.offset = new_offset;
+                new_offset += entry_buf.len;
+                entries_compacted += 1;
+            }
+        }
+
+        // Atomically replace the old file with the new one
+        try self.atomicFileSwap(temp_path, "phage_store");
+
+        // Update file size
+        self.file_size.store(new_offset, .monotonic);
+
+        std.log.info("Compaction completed: compacted {d} entries, new file size: {d} bytes", .{ entries_compacted, new_offset });
+    }
+
+    /// Atomically swap the temporary compacted file with the main database file.
+    fn atomicFileSwap(self: *Phage, temp_path: []const u8, target_path: []const u8) !void {
+        // Close the current file descriptor
+        std.posix.close(self.fd);
+
+        // Rename temp file to target (atomic on most filesystems)
+        try std.posix.rename(temp_path, target_path);
+
+        // Reopen the file
+        self.fd = try std.posix.open(
+            target_path,
+            .{
+                .ACCMODE = .RDWR,
+                .CLOEXEC = true,
+            },
+            0,
+        );
     }
 
     /// Waits for all pending I/O operations to complete.
