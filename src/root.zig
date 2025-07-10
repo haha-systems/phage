@@ -32,8 +32,8 @@ pub const Phage = struct {
     buffer_pool: data_structures.BufferPool,
     pending_ops: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     server_fd: posix.fd_t = 0,
-
-    // Compaction-related fields
+    store_path: []const u8 = "phage_store", // Default path for the main database file
+    wal_path: []const u8 = "phage_store.wal", // Default path for the Write-Ahead Log (WAL)
     compaction_threshold: f64 = 0.5, // Trigger compaction at 50% waste
     compaction_in_progress: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
@@ -72,6 +72,10 @@ pub const Phage = struct {
             },
             std.posix.S.IRUSR | std.posix.S.IWUSR,
         );
+        if (fd < 0) {
+            std.log.err("Failed to open database file: {s}", .{file_path});
+            return error.FileOpenError;
+        }
 
         const wal_path = std.fmt.allocPrint(allocator, "{s}.wal", .{file_path}) catch |err| {
             return err;
@@ -87,6 +91,10 @@ pub const Phage = struct {
             },
             std.posix.S.IRUSR | std.posix.S.IWUSR,
         );
+        if (wal_fd < 0) {
+            std.log.err("Failed to open WAL file: {s}", .{wal_path});
+            return error.FileOpenError;
+        }
 
         // stat the data files to get their current size
         const file_stat = try std.posix.fstat(fd);
@@ -107,6 +115,10 @@ pub const Phage = struct {
             .index = index_manager,
             .buffer_pool = buffer_pool,
             .server_fd = 0,
+            .store_path = file_path,
+            .wal_path = wal_path,
+            .compaction_threshold = 0.5, // Default compaction threshold
+            .compaction_in_progress = std.atomic.Value(bool).init(false),
         };
 
         errdefer store.deinit();
@@ -520,7 +532,7 @@ pub const Phage = struct {
     /// Perform the actual compaction by rewriting the database file.
     /// This function creates a new file with only reachable entries.
     fn performCompaction(self: *Phage) !void {
-        const temp_path = try std.fmt.allocPrint(self.allocator, "{s}.compact.tmp", .{"phage_store"});
+        const temp_path = try std.fmt.allocPrint(self.allocator, "{s}.compact.tmp", .{self.store_path});
         defer self.allocator.free(temp_path);
 
         // Create temporary file for compacted data
@@ -571,7 +583,7 @@ pub const Phage = struct {
         }
 
         // Atomically replace the old file with the new one
-        try self.atomicFileSwap(temp_path, "phage_store");
+        try self.atomicFileSwap(temp_path, self.store_path);
 
         // Update file size
         self.file_size.store(new_offset, .monotonic);

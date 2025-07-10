@@ -1,6 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const regex = @import("../mvzr.zig");
+const regex = @import("mvzr");
 
 pub const Trie = struct {
     root: *Node,

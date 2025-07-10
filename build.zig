@@ -57,17 +57,6 @@ pub fn build(b: *std.Build) void {
     server_mod.addImport("mvzr", mvzr.module("mvzr"));
     server_mod.addImport("zimq", b.dependency("zimq", .{ .target = target, .optimize = optimize }).module("zimq"));
 
-    const client_mod = b.createModule(.{
-        .root_source_file = b.path("src/client.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    client_mod.addImport("phage", lib_mod);
-    client_mod.addImport("colored_logger", colored_logger.module("colored_logger"));
-    client_mod.addImport("chameleon", cham.module("chameleon"));
-    client_mod.addImport("mvzr", mvzr.module("mvzr"));
-
     // Now, we will create a static library based on the module we created above.
     // This creates a `std.Build.Step.Compile`, which is the build step responsible
     // for actually invoking the compiler.
@@ -89,11 +78,6 @@ pub fn build(b: *std.Build) void {
         .root_module = server_mod,
     });
 
-    const client_exe = b.addExecutable(.{
-        .name = "phage-client",
-        .root_module = client_mod,
-    });
-
     // This is what actually allows us to use this lib in another project.
     _ = b.addModule("phage", .{
         .root_source_file = b.path("src/root.zig"),
@@ -105,7 +89,6 @@ pub fn build(b: *std.Build) void {
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
     b.installArtifact(server_exe);
-    b.installArtifact(client_exe);
 
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish

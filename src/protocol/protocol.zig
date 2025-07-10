@@ -1,5 +1,4 @@
 const std = @import("std");
-pub const protocol = @This();
 
 pub const commands = @import("commands.zig");
 const Phage = @import("phage").Phage;
@@ -14,25 +13,36 @@ const Phage = @import("phage").Phage;
 ///
 /// The basic command format is as follows:
 ///
-/// `[command] [args...] \n`
+/// `[command] [args...] [newline]`
 ///
 /// - [command] must always be the first word in the line.
 /// - [args...] are optional arguments that follow the command.
+/// - [newline] is a newline character (`\n`) that terminates the command.
 ///
 /// ### PING / PONG
 ///
-/// Client: PING?\n (6 bytes)
-/// Server: PONG!\n (6 bytes)
+/// ```
+/// Client: PING\n (5 bytes)
+/// Server: PONG\n (5 bytes)
+/// ```
 ///
-/// ### GET / PUT / DELETE
+/// ### GET / SET / DELETE
 ///
+/// ```
 /// Client: GET key\n (8 bytes)
 /// Server: value\n (6 bytes)
-/// Client: PUT key value\n (12 bytes)
+/// Client: SET key value\n (12 bytes)
 /// Server: OK\n (3 bytes)
 /// Client: DELETE key\n (12 bytes)
 /// Server: OK\n (3 bytes)
+/// ```
 ///
+/// # Note
+/// For simplicity, we use a global atomic counter to generate unique command IDs.
+/// Although the ID won't be unique across multiple instances of the server,
+/// it will be unique within a single instance, which is sufficient for our use case.
+/// This will reset when the server restarts.
+var next_command_id: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 
 // Status defines the status of a command.
 pub const Status = enum(i8) {
@@ -62,9 +72,9 @@ pub const Command = struct {
 
     /// Creates a new command with the given ID and command type,
     /// initializing the payload to `Payload.Unknown`.
-    pub fn init(id: u32, command: CommandType) Command {
+    pub fn init(command: CommandType) Command {
         return Command{
-            .id = id,
+            .id = nextCommandId(),
             .command = command,
             .payload = Payload.Unknown,
             .result = null,
@@ -83,12 +93,71 @@ pub const Command = struct {
         }
     }
 
+    /// Creates a new Set command with the given ID and key-value pair,
+    /// initializing the payload to a SetRequest with the given key and value.
+    pub fn set(key: []const u8, value: []const u8) Command {
+        return Command{
+            .id = nextCommandId(),
+            .command = CommandType.Set,
+            .payload = .{
+                .Set = SetRequest{
+                    .key = key,
+                    .value = value,
+                },
+            },
+            .result = null,
+        };
+    }
+
+    /// Creates a new Get command with the given ID and key,
+    /// initializing the payload to a GetRequest with the given key.
+    pub fn get(key: []const u8) Command {
+        return Command{
+            .id = nextCommandId(),
+            .command = CommandType.Get,
+            .payload = .{
+                .Get = GetRequest{
+                    .key = key,
+                },
+            },
+            .result = null,
+        };
+    }
+
+    /// Creates a new Delete command with the given ID and key,
+    /// initializing the payload to a DeleteRequest with the given key.
+    pub fn delete(key: []const u8) Command {
+        return Command{
+            .id = nextCommandId(),
+            .command = CommandType.Delete,
+            .payload = .{
+                .Delete = DeleteRequest{
+                    .key = key,
+                },
+            },
+            .result = null,
+        };
+    }
+
+    /// Creates a new Ping command with the given ID,
+    /// initializing the payload to a PingRequest.
+    /// Note that this is essentially a no-op command that just checks if the server is alive.
+    pub fn ping() Command {
+        return Command{
+            .id = nextCommandId(),
+            .command = CommandType.Ping,
+            .payload = .{
+                .Ping = PingRequest{},
+            },
+            .result = null,
+        };
+    }
+
     /// Creates a new Keys command with the given ID and pattern,
     /// initializing the payload to a KeysRequest with the given pattern.
     pub fn keys(pattern: []const u8) Command {
-        const id: u32 = 0; // TODO: Generate a unique ID for the command that we can track across ZMQ messages.
         return Command{
-            .id = id,
+            .id = nextCommandId(),
             .command = CommandType.Keys,
             .payload = .{
                 .Keys = KeysRequest{
@@ -100,14 +169,31 @@ pub const Command = struct {
     }
 
     /// Creates a new Unknown command with the given ID.
-    pub fn unknown(id: u32) Command {
+    /// Note that this is essentially a no-op command.
+    pub fn unknown() Command {
         return Command{
-            .id = id,
+            .id = nextCommandId(),
             .command = CommandType.Unknown,
             .payload = .{
                 .Unknown = {},
             },
             .result = null,
+        };
+    }
+
+    /// Executes the command using the given Phage store.
+    /// Returns the result of the command execution.
+    pub fn execute(self: *Command, store: Phage) !Result {
+        return self.execute(store) catch {
+            return Result{
+                .id = self.id,
+                .status = Status.Error,
+                .payload = ResultPayload{
+                    .Unknown = UnknownResult{
+                        .errors = "Command execution failed",
+                    },
+                },
+            };
         };
     }
 };
@@ -133,6 +219,9 @@ pub const Result = struct {
 pub const ResultPayload = union(enum) {
     Set: SetResult,
     Keys: KeysResult,
+    Get: GetResult,
+    Delete: DeleteResult,
+    Ping: PingResult,
     Unknown: UnknownResult,
 };
 
@@ -251,11 +340,12 @@ pub const GetRequest = struct {
 /// that will be filled by the server when the command is executed.
 pub const DeleteRequest = struct {
     key: []const u8,
+    result: ?*DeleteResult = null,
 
-    /// Executes the DELETE command with the given key.
-    pub fn execute(self: DeleteRequest, store: *Phage) !bool {
+    /// Executes the DELETE command with the given key and stores the result in a DeleteResult.
+    pub fn execute(self: DeleteRequest, store: *Phage) !DeleteResult {
         const deleted = try store.delete(self.key);
-        return deleted;
+        return DeleteResult{ .success = deleted };
     }
 
     /// Converts the DeleteRequest to a slice of bytes that can be sent over the wire.
@@ -404,6 +494,18 @@ pub const SetResult = struct {
     value: []const u8,
 };
 
+pub const GetResult = struct {
+    value: []const u8,
+};
+
+pub const DeleteResult = struct {
+    success: bool,
+};
+
+pub const PingResult = struct {
+    response: []const u8, // Typically "PONG\n" :-)
+};
+
 pub const KeysResult = struct {
     keys: [][]const u8,
 };
@@ -423,6 +525,12 @@ const CommandMap = std.StaticStringMap(CommandType).initComptime(.{
     .{ "UNKNOWN", CommandType.Unknown },
 });
 
+/// Returns the next unique command ID.
+pub fn nextCommandId() u32 {
+    // Atomically increment the command ID and return the new value.
+    return next_command_id.fetchAdd(1, .seq_cst);
+}
+
 // Parses a command from a slice of bytes and returns a Command.
 pub fn parseCommandSlice(slice: []const u8) !Command {
     var tokens = std.mem.splitSequence(u8, slice, " ");
@@ -437,7 +545,7 @@ pub fn parseCommandSlice(slice: []const u8) !Command {
         .Set => {
             const request = try SetRequest.fromSlice(slice);
             return Command{
-                .id = 0, // TODO: Generate a unique ID for the command that we can track across ZMQ messages.
+                .id = nextCommandId(),
                 .command = .Set,
                 .payload = .{ .Set = request },
                 .result = null,
@@ -446,7 +554,7 @@ pub fn parseCommandSlice(slice: []const u8) !Command {
         .Get => {
             const request = try GetRequest.fromSlice(slice);
             return Command{
-                .id = 0, // TODO: Generate a unique ID for the command that we can track across ZMQ messages.
+                .id = nextCommandId(),
                 .command = .Get,
                 .payload = .{ .Get = request },
                 .result = null,
@@ -455,7 +563,7 @@ pub fn parseCommandSlice(slice: []const u8) !Command {
         .Delete => {
             const request = try DeleteRequest.fromSlice(slice);
             return Command{
-                .id = 0, // TODO: Generate a unique ID for the command that we can track across ZMQ messages.
+                .id = nextCommandId(),
                 .command = .Delete,
                 .payload = .{ .Delete = request },
                 .result = null,
@@ -464,7 +572,7 @@ pub fn parseCommandSlice(slice: []const u8) !Command {
         .Keys => {
             const request = try KeysRequest.fromSlice(slice);
             return Command{
-                .id = 0, // TODO: Generate a unique ID for the command that we can track across ZMQ messages.
+                .id = nextCommandId(),
                 .command = .Keys,
                 .payload = .{ .Keys = request },
                 .result = null,
@@ -473,50 +581,14 @@ pub fn parseCommandSlice(slice: []const u8) !Command {
         .Ping => {
             const request = try PingRequest.fromSlice(slice);
             return Command{
-                .id = 0, // TODO: Generate a unique ID for the command that we can track across ZMQ messages.
+                .id = nextCommandId(),
                 .command = .Ping,
                 .payload = .{ .Ping = request },
                 .result = null,
             };
         },
         else => {
-            return Command.unknown(0); // TODO: Generate a unique ID for the command that we can track across ZMQ messages.
-        },
-    }
-}
-
-/// Executes a command on the Phage store and returns the result as a slice of bytes.
-pub fn executeCommand(store: *Phage, command: protocol.Command) ![]const u8 {
-    std.log.debug("Executing command: {s}", .{command.name()});
-
-    switch (command.command) {
-        .Set => {
-            try store.put(command.payload.Set.key, command.payload.Set.value);
-            return "OK\n";
-        },
-        .Get => {
-            const value = try store.get(command.payload.Get.key);
-            return value;
-        },
-        .Delete => {
-            const deleted = try store.delete(command.payload.Delete.key);
-            if (deleted) {
-                return "OK\n";
-            } else {
-                return "NOT_FOUND\n";
-            }
-        },
-        .Keys => |_| {
-            const keys = try store.findKeys(command.payload.Keys.pattern);
-            if (keys) |k| {
-                return try std.fmt.allocPrint(store.allocator, "{s}\n", .{try std.mem.join(store.allocator, "\n", k)});
-            } else {
-                return "0\n";
-            }
-        },
-        else => {
-            std.log.err("Unknown command: {s}", .{command.name()});
-            return error.UnknownCommand;
+            return Command.unknown();
         },
     }
 }
