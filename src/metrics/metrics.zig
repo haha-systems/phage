@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See LICENSE.md file in the project root.
 
 const std = @import("std");
+pub const metrics = @This();
 
 pub const Metrics = struct {
     reads: std.atomic.Value(u64),

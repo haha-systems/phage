@@ -4,17 +4,22 @@
 const std = @import("std");
 const linux = @import("std").os.linux;
 const posix = @import("std").posix;
-const log = @import("colored_logger").myLogFn;
+const Allocator = std.mem.Allocator;
 
 const Chameleon = @import("chameleon");
-const mvzr = @import("mvzr");
 
-const Allocator = std.mem.Allocator;
-const BufferPool = @import("buffer_pool.zig").BufferPool;
-const IndexManager = @import("index.zig").IndexManager;
-const EntryHeader = @import("index.zig").EntryHeader;
-const Wal = @import("wal.zig").Wal;
-const IO = @import("io.zig").IO;
+pub const regex = @import("mvzr");
+pub const protocol = @import("protocol/protocol.zig");
+
+const index = @import("index.zig");
+const io = @import("io/io.zig");
+const IO = io.IO;
+const Wal = io.wal.Wal;
+
+const data_structures = @import("data_structures/data_structures.zig");
+const AtomicStack = data_structures.AtomicStack;
+const BufferPool = data_structures.BufferPool;
+const Trie = data_structures.Trie;
 
 pub const Phage = struct {
     allocator: Allocator,
@@ -23,9 +28,10 @@ pub const Phage = struct {
     wal_fd: posix.fd_t,
     file_size: std.atomic.Value(u64),
     wal_file_size: std.atomic.Value(u64),
-    index: IndexManager,
-    buffer_pool: BufferPool,
+    index: index.IndexManager,
+    buffer_pool: data_structures.BufferPool,
     pending_ops: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    server_fd: posix.fd_t = 0,
 
     const RING_ENTRIES: u32 = 128;
 
@@ -33,14 +39,23 @@ pub const Phage = struct {
         allocator: Allocator,
         file_path: []const u8,
     ) !Phage {
-        log(.debug, .phage, "Phage starting...", .{});
+        std.log.info("Phage starting...", .{});
 
-        var options = std.mem.zeroInit(linux.io_uring_params, .{
-            .flags = linux.IORING_SETUP_COOP_TASKRUN |
-                linux.IORING_SETUP_SINGLE_ISSUER,
-        });
+        // var options = std.mem.zeroInit(linux.io_uring_params, .{
+        //     .flags = linux.IORING_SETUP_SQPOLL | linux.IORING_SETUP_CQSIZE,
+        //     .sq_entries = RING_ENTRIES,
+        //     .cq_entries = RING_ENTRIES,
+        //     .features = linux.IORING_FEAT_SINGLE_MMAP | linux.IORING_FEAT_NODROP,
+        //     .sq_thread_idle = 1,
+        //     .sq_thread_cpu = 0,
+        // });
 
-        const ring = linux.IoUring.init_params(RING_ENTRIES, &options) catch |err| {
+        // const ring = linux.IoUring.init_params(RING_ENTRIES, &options) catch |err| {
+        //     return err;
+        // };
+
+        const ring = linux.IoUring.init(RING_ENTRIES, 0) catch |err| {
+            std.log.err("Failed to initialize io_uring: {s}", .{@errorName(err)});
             return err;
         };
 
@@ -75,7 +90,7 @@ pub const Phage = struct {
 
         const file_size = std.atomic.Value(u64).init(@intCast(file_stat.size));
         const wal_file_size = std.atomic.Value(u64).init(@intCast(wal_file_stat.size));
-        const index = try IndexManager.init(allocator);
+        const index_manager = try index.IndexManager.init(allocator);
         const buffer_pool = try BufferPool.init(allocator);
 
         var store = Phage{
@@ -85,24 +100,32 @@ pub const Phage = struct {
             .wal_fd = wal_fd,
             .file_size = file_size,
             .wal_file_size = wal_file_size,
-            .index = index,
+            .index = index_manager,
             .buffer_pool = buffer_pool,
+            .server_fd = 0,
         };
 
+        errdefer store.deinit();
+
         // rebuild the index from the main file
-        log(.debug, .phage, "Rebuilding index...", .{});
-        try store.rebuildIndex();
-        log(.debug, .phage, "Index rebuilt.", .{});
+        std.log.info("Rebuilding index...", .{});
+        try store.restoreIndex();
+        std.log.info("Index rebuilt.", .{});
 
         // recover the WAL entries for consistency
-        log(.debug, .phage, "Checking WAL recovery entries...", .{});
+        std.log.info("Checking WAL recovery entries...", .{});
         try Wal.recover(@ptrCast(&store));
-        log(.debug, .phage, "WAL recovery completed.", .{});
+        std.log.info("WAL recovery completed.", .{});
+
+        std.log.info("Phage started successfully.", .{});
 
         return store;
     }
 
     pub fn deinit(self: *Phage) void {
+        // std.posix.close(self.server_fd);
+        // self.server_fd = 0;
+
         self.ring.deinit();
         posix.close(self.fd);
         posix.close(self.wal_fd);
@@ -129,7 +152,7 @@ pub const Phage = struct {
         const wal_offset = self.wal_file_size.fetchAdd(provisional_wal_entry.len, .monotonic);
 
         var ops_submitted = try self.writeToWal(provisional_wal_entry, wal_offset);
-        try waitForIO(self);
+        try self.waitForIO();
         if (ops_submitted < 1) {
             return error.WriteError;
         }
@@ -141,7 +164,7 @@ pub const Phage = struct {
         const data_offset = self.file_size.fetchAdd(data_entry.len, .monotonic);
         ops_submitted = try IO.writeToFile(&self.pending_ops, self.fd, &self.ring, &data_entry, data_offset);
 
-        try waitForIO(self);
+        try self.waitForIO();
         if (ops_submitted < 1) {
             return error.WriteError;
         }
@@ -150,7 +173,7 @@ pub const Phage = struct {
         const final_wal_entry = try self.formatWalEntry(.put, key, value, data_offset);
         defer self.allocator.free(final_wal_entry);
         ops_submitted = try self.writeToWal(final_wal_entry, wal_offset);
-        try waitForIO(self);
+        try self.waitForIO();
         if (ops_submitted < 1) {
             return error.WriteError;
         }
@@ -176,7 +199,16 @@ pub const Phage = struct {
     /// The caller is responsible for freeing the returned value.
     /// If the key is not found, an error is returned.
     pub fn get(self: *Phage, key: []const u8) ![]u8 {
-        const entry = self.index.get(key) orelse return error.KeyNotFound;
+        std.log.info("Getting key: {s}", .{key});
+
+        // strip newline characters from key first
+        const trimmed_key = std.mem.trimRight(u8, key, "\r\n");
+
+        const entry = self.index.get(trimmed_key) orelse {
+            std.log.info("Key not found: {s}", .{key});
+            return error.KeyNotFound;
+        };
+
         const buf = try self.allocator.alloc(u8, entry.len);
         defer self.allocator.free(buf);
 
@@ -187,17 +219,15 @@ pub const Phage = struct {
 
         try waitForIO(self);
 
-        const key_start = @sizeOf(EntryHeader);
+        const key_start = @sizeOf(index.EntryHeader);
         const stored_key = buf[key_start..][0..entry.key_len];
-        if (!std.mem.eql(u8, stored_key, key)) return error.KeyMismatch;
+        if (!std.mem.eql(u8, stored_key, trimmed_key)) return error.KeyMismatch;
 
         const val_start = key_start + entry.key_len;
         const value = buf[val_start..][0..entry.val_len];
 
-        // note: caller now owns the value
-        return self.allocator.dupe(u8, value) catch |err| {
-            return err;
-        };
+        // note: caller (and their allocator) now owns the value
+        return try self.allocator.dupe(u8, value);
     }
 
     /// Deletes a key-value pair from the database using the provided key.
@@ -227,37 +257,91 @@ pub const Phage = struct {
     }
 
     /// Rebuilds the index from the main database file.
-    pub fn rebuildIndex(self: *Phage) !void {
+    pub fn restoreIndex(self: *Phage) !void {
         var offset: usize = 0;
         const file_stat = try std.posix.fstat(self.fd);
         const file_size = file_stat.size;
 
         while (offset < file_size) {
-            var header_buf: [@sizeOf(EntryHeader)]u8 = undefined;
+            var header_buf: [@sizeOf(index.EntryHeader)]u8 = undefined;
             const header_read = try std.posix.pread(self.fd, &header_buf, offset);
-            if (header_read < @sizeOf(EntryHeader)) break;
+            if (header_read < @sizeOf(index.EntryHeader)) break;
 
-            const header: EntryHeader = @bitCast(header_buf);
+            const header: index.EntryHeader = @bitCast(header_buf);
 
             // Read key
             const key_buf = try self.allocator.alloc(u8, header.key_len);
             defer self.allocator.free(key_buf);
-            const key_read = try std.posix.pread(self.fd, key_buf, offset + @sizeOf(EntryHeader));
+            const key_read = try std.posix.pread(self.fd, key_buf, offset + @sizeOf(index.EntryHeader));
             if (key_read < header.key_len) break;
 
             // Insert into index
             try self.index.put(self.allocator, key_buf, .{
                 .offset = offset,
-                .len = @sizeOf(EntryHeader) + header.key_len + header.val_len,
+                .len = @sizeOf(index.EntryHeader) + header.key_len + header.val_len,
                 .key_len = header.key_len,
                 .val_len = header.val_len,
             });
 
-            offset += @sizeOf(EntryHeader) + header.key_len + header.val_len;
+            offset += @sizeOf(index.EntryHeader) + header.key_len + header.val_len;
         }
     }
 
-    pub fn printKeys(self: *Phage, pattern: []const u8, writer: anytype) !void {
+    /// Restores the database from the Write-Ahead Log (WAL).
+    /// This function reads entries from the WAL and applies them to the main database file.
+    /// It updates the index accordingly.
+    pub fn restoreWAL(self: *Phage) !void {
+        Wal.recover(self) catch |err| {
+            std.log.err("Failed to restore WAL: {s}", .{@errorName(err)});
+            return err;
+        };
+        std.log.debug("WAL restored successfully.", .{});
+    }
+
+    // /// Returns the key-value pairs matching the provided pattern from the database.
+    // /// The pattern is a regular expression that is used to match keys.
+    pub fn findKeys(self: *Phage, pattern: []const u8) !?[][]const u8 {
+        if (pattern.len == 0) {
+            std.log.debug("No pattern provided", .{});
+            return error.InvalidPattern;
+        }
+
+        // Trim whitespace from the pattern
+        const clean_pattern = std.mem.trimRight(u8, pattern, " \t\n\r");
+
+        // Build a trie from the keys in the index
+        var trie = try Trie.init(self.allocator);
+        defer trie.deinit();
+
+        for (self.index.shards) |*shard| {
+            var it = shard.map.keyIterator();
+            while (it.next()) |key| {
+                try trie.insert(key.*);
+            }
+        }
+
+        // Find keys matching the pattern
+        var matches = std.ArrayList([]const u8).init(self.allocator);
+        defer matches.deinit();
+
+        if (std.mem.eql(u8, clean_pattern, "*")) {
+            // wildcard pattern, so modify the pattern to match everything
+            std.log.debug("Wildcard pattern detected, matching all keys", .{});
+            try trie.matchRegex(".*", &matches);
+        } else {
+            try trie.matchRegex(clean_pattern, &matches);
+        }
+
+        if (matches.items.len == 0) {
+            // TODO: swap this to a custom logger
+            std.log.debug("No keys found matching pattern: {s}", .{clean_pattern});
+            return null;
+        } else {
+            return matches.items;
+        }
+    }
+
+    pub fn printKeys(self: *Phage, pattern: []const u8, writer: *std.io.AnyWriter) !void {
         var c = Chameleon.initRuntime(.{
             .allocator = self.allocator,
             .detect_no_color = true,
@@ -265,13 +349,26 @@ pub const Phage = struct {
         defer c.deinit();
 
         if (self.index.count() == 0) {
-            try writer.print("0 keys\n", .{});
+            try writer.print("0\n", .{});
             return;
         }
 
-        const regex = mvzr.compile(pattern);
-        if (regex == null) {
-            try writer.print("Invalid regex pattern: {s}\n", .{pattern});
+        if (pattern.len == 0) {
+            try writer.print("KEYS: No pattern provided\n", .{});
+            return;
+        }
+
+        std.log.debug("Pattern: {s}", .{pattern});
+
+        var final_pattern: []const u8 = std.mem.trimRight(u8, pattern, " \t\n\r");
+        if (std.mem.eql(u8, final_pattern, "*")) {
+            final_pattern = ".*";
+        }
+
+        std.log.debug("Final pattern: {s}", .{final_pattern});
+        const r = regex.compile(final_pattern);
+        if (r == null) {
+            try writer.print("KEYS: Invalid regex pattern: {s}\n", .{final_pattern});
             return;
         }
 
@@ -279,7 +376,7 @@ pub const Phage = struct {
         for (self.index.shards) |*shard| {
             var it = shard.map.keyIterator();
             while (it.next()) |key| {
-                const match = regex.?.isMatch(key.*);
+                const match = r.?.isMatch(key.*);
                 if (match) {
                     const entry = shard.map.get(key.*) orelse continue;
                     const k = try c.red().fmt("{s}", .{key.*});
@@ -297,6 +394,56 @@ pub const Phage = struct {
         defer self.allocator.free(count_str);
 
         try writer.print("[{s}]\n", .{count_str});
+    }
+
+    pub fn parseCommand(cmd: []const u8) !protocol.Command {
+        const command = protocol.command.parseCommand(cmd) catch |err| {
+            // std.log.err("Failed to parse command: {s}", .{cmd});
+            return err;
+        };
+
+        if (protocol.command.validateCommand(cmd)) {
+            return command;
+        } else {
+            // std.log.err("Invalid command: {s}", .{cmd});
+            return error.InvalidCommand;
+        }
+    }
+
+    pub fn executeCommand(self: *Phage, command: protocol.Command) ![]const u8 {
+        // std.log.debug("Executing command: {s}", .{command.name()});
+
+        switch (command.command) {
+            // .put => |put_cmd| {
+            //     try self.put(put_cmd.key, put_cmd.value);
+            //     return "OK\n";
+            // },
+            // .get => |get_cmd| {
+            //     const value = try self.get(get_cmd.key);
+            //     return value;
+            // },
+            // .delete => |delete_cmd| {
+            //     const deleted = try self.delete(delete_cmd.key);
+            //     if (deleted) {
+            //         return "OK\n";
+            //     } else {
+            //         return "NOT_FOUND\n";
+            //     }
+            // },
+
+            .Keys => |_| {
+                const keys = try self.findKeys(command.payload.Keys.pattern);
+                if (keys) |k| {
+                    return try std.fmt.allocPrint(self.allocator, "{s}\n", .{try std.mem.join(self.allocator, "\n", k)});
+                } else {
+                    return "0\n";
+                }
+            },
+            else => {
+                std.log.err("Unknown command: {s}", .{command.name()});
+                return error.UnknownCommand;
+            },
+        }
     }
 
     /// -----------------------------------------------------------------------------------------------
@@ -363,7 +510,7 @@ pub const Phage = struct {
         }
 
         // Calculate sizes
-        const header_size = @sizeOf(EntryHeader); // 8 bytes
+        const header_size = @sizeOf(index.EntryHeader); // 8 bytes
         const total_size = header_size + key.len + value.len;
 
         // Allocate buffer
@@ -371,7 +518,7 @@ pub const Phage = struct {
         errdefer self.allocator.free(buf);
 
         // Create header
-        const header = EntryHeader{
+        const header = index.EntryHeader{
             .key_len = @intCast(key.len),
             .val_len = @intCast(value.len),
         };
@@ -415,7 +562,7 @@ pub const Phage = struct {
     }
 };
 
-test "init" {
+test "root:init" {
     const allocator = std.testing.allocator;
     const file_path = "test.db";
 
@@ -423,7 +570,7 @@ test "init" {
     defer store.deinit();
 }
 
-test "formatWalEntry" {
+test "root:formatWalEntry" {
     const allocator = std.testing.allocator;
 
     var store = try Phage.init(allocator, "test.db");
@@ -442,7 +589,7 @@ test "formatWalEntry" {
     try testCleanup();
 }
 
-test "formatDataEntry" {
+test "root:formatDataEntry" {
     const allocator = std.testing.allocator;
 
     var store = try Phage.init(allocator, "test.db");
@@ -451,8 +598,8 @@ test "formatDataEntry" {
     const buf = try store.formatDataEntry("test_key", "test_value");
     defer allocator.free(buf);
 
-    try std.testing.expectEqual(@sizeOf(EntryHeader) + 8 + 10, buf.len);
-    const header: *const EntryHeader = @ptrCast(@alignCast(buf.ptr));
+    try std.testing.expectEqual(@sizeOf(index.EntryHeader) + 8 + 10, buf.len);
+    const header: *const index.EntryHeader = @ptrCast(@alignCast(buf.ptr));
     try std.testing.expectEqual(8, header.key_len);
     try std.testing.expectEqual(10, header.val_len);
 
@@ -460,7 +607,7 @@ test "formatDataEntry" {
     try testCleanup();
 }
 
-test "put and get key/value" {
+test "root:put_and_get_key_value" {
     const allocator = std.testing.allocator;
     var store = try Phage.init(allocator, "test.db");
     defer store.deinit();
@@ -481,7 +628,7 @@ test "put and get key/value" {
     try testCleanup();
 }
 
-test "delete key" {
+test "root:delete_key" {
     const allocator = std.testing.allocator;
     var store = try Phage.init(allocator, "test.db");
     defer store.deinit();
@@ -499,7 +646,24 @@ test "delete key" {
     try testCleanup();
 }
 
+test "root:findKeys" {
+    const allocator = std.testing.allocator;
+    var store = try Phage.init(allocator, "test.db");
+    defer store.deinit();
+    errdefer testCleanup() catch unreachable;
+
+    try store.put("key1", "value1s");
+    try store.put("key2", "value2");
+    try store.put("key3", "value3");
+
+    // Find keys with a specific pattern
+    _ = try store.findKeys("key*");
+
+    // cleanup test db
+    try testCleanup();
+}
+
 fn testCleanup() !void {
-    try std.posix.unlink("test.db");
-    try std.posix.unlink("test.db.wal");
+    std.posix.unlink("test.db") catch {};
+    std.posix.unlink("test.db.wal") catch {};
 }

@@ -64,6 +64,7 @@ Phage currently only has a single client; a terminal CLI for direct access to th
 
 ## Planned features
 
+- [] Server
 - [] Sets
 - [] Ordered Sets
 - [] JSON blobs

@@ -5,6 +5,11 @@ const std = @import("std");
 const linux = std.os.linux;
 const builtin = @import("builtin");
 
+pub const io = @This();
+pub const wal = @import("wal.zig");
+pub const s2s = @import("s2s.zig");
+
+/// IO operations for the Phage server using Linux io_uring.
 pub const IO = struct {
     id: u64,
     buffer: []u8,
@@ -15,7 +20,13 @@ pub const IO = struct {
     is_write: bool,
     len: usize,
 
-    pub fn readFromFile(pending_ops: *std.atomic.Value(u32), fd: std.posix.fd_t, ring: *linux.IoUring, buf: *const []u8, offset: usize) !usize {
+    pub fn readFromFile(
+        pending_ops: *std.atomic.Value(u32),
+        fd: std.posix.fd_t,
+        ring: *linux.IoUring,
+        buf: *const []u8,
+        offset: usize,
+    ) !usize {
         var sqe = try ring.get_sqe();
         sqe.prep_read(
             fd,
@@ -29,7 +40,13 @@ pub const IO = struct {
         return submitted + pending;
     }
 
-    pub fn writeToFile(pending_ops: *std.atomic.Value(u32), fd: std.posix.fd_t, ring: *linux.IoUring, buf: *const []u8, offset: usize) !usize {
+    pub fn writeToFile(
+        pending_ops: *std.atomic.Value(u32),
+        fd: std.posix.fd_t,
+        ring: *linux.IoUring,
+        buf: *const []u8,
+        offset: usize,
+    ) !usize {
         var sqe = try ring.get_sqe();
         sqe.prep_write(
             fd,

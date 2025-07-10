@@ -2,8 +2,9 @@
 // Licensed under the MIT License. See LICENSE.md file in the project root.
 
 const std = @import("std");
-const StringContext = @import("string_context.zig").StringContext;
-const prefetch = @import("root.zig").Phage.prefetch;
+const StringContext = @import("data_structures/string_context.zig").StringContext;
+const IO = @import("io/io.zig").IO;
+
 const INDEX_SHARDS = 16;
 const HASH_SEED: u64 = 0xdeadbeef;
 
@@ -157,7 +158,7 @@ pub const IndexManager = struct {
     }
 };
 
-test "init" {
+test "index:init" {
     const allocator = std.testing.allocator;
     var index = try IndexManager.init(allocator);
     defer index.deinit(allocator);
@@ -165,7 +166,7 @@ test "init" {
     try std.testing.expectEqual(INDEX_SHARDS, index.shards.len);
 }
 
-test "count" {
+test "index:count" {
     const allocator = std.testing.allocator;
     var index = try IndexManager.init(allocator);
     defer index.deinit(allocator);
@@ -173,10 +174,10 @@ test "count" {
     try std.testing.expectEqual(0, index.count());
 }
 
-test "getShard" {
+test "index:getShard" {
     const allocator = std.testing.allocator;
     var index = try IndexManager.init(allocator);
-    defer index.deinit(allocator);
+    defer index.deinit(allocator); //
 
     const key = "test";
     const hash = std.hash.Wyhash.hash(HASH_SEED, key);
@@ -187,7 +188,7 @@ test "getShard" {
     try std.testing.expectEqual(shard, &index.shards[id]);
 }
 
-test "put and get entry into index" {
+test "index:put_and_get_entry" {
     const allocator = std.testing.allocator;
     var index = try IndexManager.init(allocator);
     defer index.deinit(allocator);
@@ -207,7 +208,7 @@ test "put and get entry into index" {
     try std.testing.expectEqual(entry.key_len, result.key_len);
 }
 
-test "put and get entry with different keys" {
+test "index:put_and_get_entry_with_different_keys" {
     const allocator = std.testing.allocator;
     var index = try IndexManager.init(allocator);
     defer index.deinit(allocator);
@@ -241,7 +242,7 @@ test "put and get entry with different keys" {
     try std.testing.expectEqual(entry2.len, result2.len);
 }
 
-test "put and get entry with same key" {
+test "index:put_and_get_entry_with_same_key" {
     const allocator = std.testing.allocator;
     var index = try IndexManager.init(allocator);
     defer index.deinit(allocator);
@@ -269,7 +270,7 @@ test "put and get entry with same key" {
     try std.testing.expectEqual(entry2.len, result.len);
 }
 
-test "delete" {
+test "index:delete" {
     const allocator = std.testing.allocator;
     var index = try IndexManager.init(allocator);
     defer index.deinit(allocator);
@@ -292,7 +293,7 @@ test "delete" {
     try std.testing.expectEqual(null, result);
 }
 
-test "delete non-existing key" {
+test "index:delete_non_existing_key" {
     const allocator = std.testing.allocator;
     var index = try IndexManager.init(allocator);
     defer index.deinit(allocator);

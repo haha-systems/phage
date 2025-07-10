@@ -15,6 +15,11 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
+    const name: []const u8 = "phage";
+    const colored_logger = b.dependency("colored_logger", .{ .target = target, .optimize = optimize, .project_name = name });
+    const cham = b.dependency("chameleon", .{ .target = target, .optimize = optimize });
+    const mvzr = b.dependency("mvzr", .{ .target = target, .optimize = optimize });
+
     // This creates a "module", which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
     // Every executable or library we compile will be based on one or more modules.
@@ -28,13 +33,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    lib_mod.addImport("colored_logger", colored_logger.module("colored_logger"));
+    lib_mod.addImport("chameleon", cham.module("chameleon"));
+    lib_mod.addImport("mvzr", mvzr.module("mvzr"));
+
     // We will also create a module for our other entry point, 'main.zig'.
-    const exe_mod = b.createModule(.{
+    const server_mod = b.createModule(.{
         // `root_source_file` is the Zig "entry point" of the module. If a module
         // only contains e.g. external object files, you can make this `null`.
         // In this case the main source file is merely a path, however, in more
         // complicated build scripts, this could be a generated file.
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("src/zserver.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -42,7 +51,22 @@ pub fn build(b: *std.Build) void {
     // Modules can depend on one another using the `std.Build.Module.addImport` function.
     // This is what allows Zig source code to use `@import("foo")` where 'foo' is not a
     // file path. In this case, we set up `exe_mod` to import `lib_mod`.
-    exe_mod.addImport("phage", lib_mod);
+    server_mod.addImport("phage", lib_mod);
+    server_mod.addImport("colored_logger", colored_logger.module("colored_logger"));
+    server_mod.addImport("chameleon", cham.module("chameleon"));
+    server_mod.addImport("mvzr", mvzr.module("mvzr"));
+    server_mod.addImport("zimq", b.dependency("zimq", .{ .target = target, .optimize = optimize }).module("zimq"));
+
+    const client_mod = b.createModule(.{
+        .root_source_file = b.path("src/client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    client_mod.addImport("phage", lib_mod);
+    client_mod.addImport("colored_logger", colored_logger.module("colored_logger"));
+    client_mod.addImport("chameleon", cham.module("chameleon"));
+    client_mod.addImport("mvzr", mvzr.module("mvzr"));
 
     // Now, we will create a static library based on the module we created above.
     // This creates a `std.Build.Step.Compile`, which is the build step responsible
@@ -60,30 +84,33 @@ pub fn build(b: *std.Build) void {
 
     // This creates another `std.Build.Step.Compile`, but this one builds an executable
     // rather than a static library.
-    const exe = b.addExecutable(.{
-        .name = "demon",
-        .root_module = exe_mod,
+    const server_exe = b.addExecutable(.{
+        .name = "phage",
+        .root_module = server_mod,
     });
 
-    exe.root_module.addImport("phage", lib_mod);
+    const client_exe = b.addExecutable(.{
+        .name = "phage-client",
+        .root_module = client_mod,
+    });
 
-    // Colored Logger
-    const colored_logger = b.dependency("colored_logger", .{ .project_name = exe.name });
-    const cham = b.dependency("chameleon", .{ .target = target, .optimize = optimize });
-    const mvzr = b.dependency("mvzr", .{ .target = target, .optimize = optimize });
-    exe.root_module.addImport("colored_logger", colored_logger.module("colored_logger"));
-    exe.root_module.addImport("chameleon", cham.module("chameleon"));
-    exe.root_module.addImport("mvzr", mvzr.module("mvzr"));
+    // This is what actually allows us to use this lib in another project.
+    _ = b.addModule("phage", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
-    b.installArtifact(exe);
+    b.installArtifact(server_exe);
+    b.installArtifact(client_exe);
 
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish
     // such a dependency.
-    const run_cmd = b.addRunArtifact(exe);
+    const run_cmd = b.addRunArtifact(server_exe);
 
     // By making the run step depend on the install step, it will be run from the
     // installation directory rather than directly from within the cache directory.
@@ -105,20 +132,21 @@ pub fn build(b: *std.Build) void {
 
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
-    const lib_unit_tests = b.addTest(.{
-        .root_module = lib_mod,
-    });
+    const lib_unit_tests = b.addTest(.{ .root_module = lib_mod, .test_runner = .{ .mode = .simple, .path = b.path("src/test_runner.zig") } });
+
+    lib_unit_tests.root_module.addImport("phage", lib_mod);
+    lib_unit_tests.root_module.addImport("colored_logger", colored_logger.module("colored_logger"));
+    lib_unit_tests.root_module.addImport("chameleon", cham.module("chameleon"));
+    lib_unit_tests.root_module.addImport("mvzr", mvzr.module("mvzr"));
 
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
-    const exe_unit_tests = b.addTest(.{
-        .root_module = exe_mod,
-    });
+    const exe_unit_tests = b.addTest(.{ .root_module = server_mod, .test_runner = .{ .mode = .simple, .path = b.path("src/test_runner.zig") } });
 
-    lib_unit_tests.root_module.addImport("phage", lib_mod);
     exe_unit_tests.root_module.addImport("phage", lib_mod);
-    exe_unit_tests.addIncludePath(b.path("src"));
-    lib_unit_tests.addIncludePath(b.path("src"));
+    exe_unit_tests.root_module.addImport("colored_logger", colored_logger.module("colored_logger"));
+    exe_unit_tests.root_module.addImport("chameleon", cham.module("chameleon"));
+    exe_unit_tests.root_module.addImport("mvzr", mvzr.module("mvzr"));
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 

@@ -3,11 +3,11 @@
 
 const std = @import("std");
 
-const log = @import("colored_logger").myLogFn;
+// const log = @import("colored_logger").myLogFn;
 
-const Phage = @import("root.zig").Phage;
-const IndexEntry = @import("index.zig").IndexEntry;
-const EntryHeader = @import("index.zig").EntryHeader;
+const Phage = @import("../root.zig").Phage;
+const IndexEntry = @import("../index.zig").IndexEntry;
+const EntryHeader = @import("../index.zig").EntryHeader;
 
 pub const Wal = struct {
     wal_path: []const u8,
@@ -86,13 +86,13 @@ pub const Wal = struct {
 
         // check if the wal file is empty with the new size
         if (store.wal_file_size.load(.acquire) == 0) {
-            log(.info, .phage, "WAL file is empty, nothing to recover", .{});
+            //log(.info, .phage, "WAL file is empty, nothing to recover", .{});
             return;
         }
 
         var offset: usize = 0;
         while (offset < store.wal_file_size.load(.acquire)) {
-            log(.debug, .phage, "Reading WAL entry at offset: {d}", .{offset});
+            //log(.debug, .phage, "Reading WAL entry at offset: {d}", .{offset});
 
             var header_buf: [@sizeOf(WalEntryHeader)]u8 = undefined;
             const header_read = try std.posix.pread(store.wal_fd, &header_buf, offset);
@@ -105,29 +105,29 @@ pub const Wal = struct {
             const key_read = try std.posix.pread(store.wal_fd, key_buf, offset + @sizeOf(WalEntryHeader));
             if (key_read < header.key_len) break;
 
-            log(.debug, .phage, "Read WAL entry: {s}", .{key_buf});
-            log(.debug, .phage, "Header: {s}", .{header_buf});
+            //log(.debug, .phage, "Read WAL entry: {s}", .{key_buf});
+            //log(.debug, .phage, "Header: {s}", .{header_buf});
 
             if (calculateChecksum(header.op_type, @intCast(header.key_len), @intCast(header.val_len), header.offset, key_buf) != header.checksum) {
-                log(.err, .phage, "Checksum mismatch for WAL entry at offset: {d}", .{offset});
-                log(.err, .phage, "Expected checksum: {d}, computed checksum: {d}", .{ header.checksum, calculateChecksum(header.op_type, @intCast(header.key_len), @intCast(header.val_len), header.offset, key_buf) });
-                log(.err, .phage, "Key: {s}", .{key_buf});
-                log(.err, .phage, "Header: {s}", .{header_buf});
+                //log(.err, .phage, "Checksum mismatch for WAL entry at offset: {d}", .{offset});
+                //log(.err, .phage, "Expected checksum: {d}, computed checksum: {d}", .{ header.checksum, calculateChecksum(header.op_type, @intCast(header.key_len), @intCast(header.val_len), header.offset, key_buf) });
+                //log(.err, .phage, "Key: {s}", .{key_buf});
+                //log(.err, .phage, "Header: {s}", .{header_buf});
                 return error.ChecksumMismatch;
             }
 
-            log(.debug, .phage, "Checksum verified for offset: {d}", .{offset});
-            log(.debug, .phage, "Key length: {d}, Value length: {d}", .{ header.key_len, header.val_len });
-            log(.debug, .phage, "Offset: {d}", .{header.offset});
-            log(.debug, .phage, "Operation: {}", .{header.op_type});
-            log(.debug, .phage, "Checksum: {d}", .{header.checksum});
+            //log(.debug, .phage, "Checksum verified for offset: {d}", .{offset});
+            //log(.debug, .phage, "Key length: {d}, Value length: {d}", .{ header.key_len, header.val_len });
+            //log(.debug, .phage, "Offset: {d}", .{header.offset});
+            //log(.debug, .phage, "Operation: {}", .{header.op_type});
+            //log(.debug, .phage, "Checksum: {d}", .{header.checksum});
 
             switch (header.op_type) {
                 .put => {
                     // We may have provisional entries in the WAL that haven't been written to the main file
                     // yet for whatever reason. If we find any, just skip them as we haven't guaranteed them yet.
                     if (header.offset == 0 and header.val_len == 0) {
-                        log(.info, .phage, "Skipping provisional entry for key: {s}", .{key_buf});
+                        //log(.info, .phage, "Skipping provisional entry for key: {s}", .{key_buf});
                         offset += @sizeOf(WalEntryHeader) + header.key_len;
                         continue;
                     }
@@ -142,7 +142,7 @@ pub const Wal = struct {
                 .delete => {
                     const deleted = try store.index.delete(store.allocator, key_buf);
                     if (deleted) {
-                        log(.info, .phage, "Deleted entry for key: {s}", .{key_buf});
+                        //log(.info, .phage, "Deleted entry for key: {s}", .{key_buf});
                     }
                 },
             }
@@ -160,19 +160,19 @@ pub const Wal = struct {
         const sync = std.os.linux.fsync(store.wal_fd);
 
         if (truncate != 0) {
-            log(.err, .phage, "Failed to truncate WAL file: {d}", .{truncate});
+            //log(.err, .phage, "Failed to truncate WAL file: {d}", .{truncate});
             return error.TruncateError;
         }
         if (seek != 0) {
-            log(.err, .phage, "Failed to seek WAL file: {d}", .{seek});
+            //log(.err, .phage, "Failed to seek WAL file: {d}", .{seek});
             return error.SeekError;
         }
         if (sync != 0) {
-            log(.err, .phage, "Failed to sync WAL file: {d}", .{sync});
+            //log(.err, .phage, "Failed to sync WAL file: {d}", .{sync});
             return error.SyncError;
         }
 
-        log(.info, .phage, "Truncated WAL file to offset: {d}", .{seek});
+        //log(.info, .phage, "Truncated WAL file to offset: {d}", .{seek});
 
         // Make sure we reset the atomic file size to zero
         store.wal_file_size.store(0, .release);
@@ -196,7 +196,7 @@ pub const Wal = struct {
 
 // ---------------------------------------------------------------
 
-test "recover" {
+test "write_ahead_log:recover" {
     const allocator = std.testing.allocator;
     const path = "test.db";
 
@@ -205,6 +205,7 @@ test "recover" {
 
     // Create a dummy Phage store
     var store = try Phage.init(allocator, path);
+    errdefer store.deinit();
     defer store.deinit();
 
     // Simulate a WAL entry
@@ -241,7 +242,7 @@ test "recover" {
     try testCleanup();
 }
 
-test "recover with provisional entries" {
+test "write_ahead_log:recover_with_provisional_entries" {
     const allocator = std.testing.allocator;
     const path = "test.db";
 
@@ -250,6 +251,7 @@ test "recover with provisional entries" {
 
     // Create a dummy Phage store
     var store = try Phage.init(allocator, path);
+    errdefer store.deinit();
     defer store.deinit();
 
     // Simulate a WAL entry
