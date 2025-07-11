@@ -183,18 +183,59 @@ pub const Command = struct {
 
     /// Executes the command using the given Phage store.
     /// Returns the result of the command execution.
-    pub fn execute(self: *Command, store: Phage) !Result {
-        return self.execute(store) catch {
-            return Result{
-                .id = self.id,
-                .status = Status.Error,
-                .payload = ResultPayload{
-                    .Unknown = UnknownResult{
-                        .errors = "Command execution failed",
-                    },
-                },
-            };
-        };
+    pub fn execute(self: *Command, store: *Phage) !Result {
+        switch (self.command) {
+            .Set => {
+                const request = self.payload.Set;
+                const result = try request.execute(store);
+                return Result{
+                    .id = self.id,
+                    .status = Status.Ok,
+                    .payload = ResultPayload{ .Set = result },
+                };
+            },
+            .Get => {
+                const request = self.payload.Get;
+                const value = try request.execute(store);
+                return Result{
+                    .id = self.id,
+                    .status = Status.Ok,
+                    .payload = ResultPayload{ .Get = GetResult{ .value = value } },
+                };
+            },
+            .Delete => {
+                const request = self.payload.Delete;
+                const success = try store.delete(request.key);
+                return Result{
+                    .id = self.id,
+                    .status = Status.Ok,
+                    .payload = ResultPayload{ .Delete = DeleteResult{ .success = success } },
+                };
+            },
+            .Keys => {
+                const request = self.payload.Keys;
+                const result = try request.execute(store);
+                return Result{
+                    .id = self.id,
+                    .status = Status.Ok,
+                    .payload = ResultPayload{ .Keys = result },
+                };
+            },
+            .Ping => {
+                return Result{
+                    .id = self.id,
+                    .status = Status.Ok,
+                    .payload = ResultPayload{ .Ping = PingResult{ .response = "PONG" } },
+                };
+            },
+            .Unknown => {
+                return Result{
+                    .id = self.id,
+                    .status = Status.Error,
+                    .payload = ResultPayload{ .Unknown = UnknownResult{ .errors = "Unknown command" } },
+                };
+            },
+        }
     }
 };
 
@@ -213,6 +254,34 @@ pub const Result = struct {
     id: u32,
     status: Status,
     payload: ResultPayload,
+
+    /// Converts the result payload to a string that can be sent over the wire.
+    pub fn payloadToString(self: Result, allocator: std.mem.Allocator) ![]const u8 {
+        switch (self.payload) {
+            .Set => {
+                return try std.fmt.allocPrint(allocator, "OK", .{});
+            },
+            .Get => |get_result| {
+                return try std.fmt.allocPrint(allocator, "{s}", .{get_result.value});
+            },
+            .Delete => {
+                return try std.fmt.allocPrint(allocator, "OK", .{});
+            },
+            .Keys => |keys_result| {
+                if (keys_result.keys.len > 0) {
+                    return try std.mem.join(allocator, "\n", keys_result.keys);
+                } else {
+                    return try std.fmt.allocPrint(allocator, "(empty)", .{});
+                }
+            },
+            .Ping => |ping_result| {
+                return try std.fmt.allocPrint(allocator, "{s}", .{ping_result.response});
+            },
+            .Unknown => |unknown_result| {
+                return try std.fmt.allocPrint(allocator, "ERR: {s}", .{unknown_result.errors});
+            },
+        }
+    }
 };
 
 // ResultPayload defines the structure of the payload of a command result.
@@ -439,7 +508,7 @@ pub const KeysRequest = struct {
             return err;
         };
 
-        return KeysResult{ .keys = result };
+        return KeysResult{ .keys = result orelse &[_][]const u8{} };
     }
 
     /// Converts the KeysRequest to a slice of bytes that can be sent over the wire.
@@ -476,11 +545,7 @@ pub const KeysRequest = struct {
     pub fn fromSlice(slice: []const u8) !KeysRequest {
         var tokens = std.mem.splitSequence(u8, slice, " ");
         const cmd = tokens.next() orelse return error.InvalidCommand;
-        const pattern = tokens.rest();
-
-        if (pattern.len != 1) {
-            return error.InvalidCommand;
-        }
+        const pattern = tokens.next() orelse return error.InvalidCommand;
 
         if (std.mem.eql(u8, cmd, "KEYS")) {
             return KeysRequest{ .pattern = pattern };
@@ -514,7 +579,7 @@ pub const UnknownResult = struct {
     errors: []const u8,
 };
 
-// CommandMap is a ComptimeStringMap that maps command names to their corresponding CommandType
+/// DeleteRequest defines the request structure for the DELETE command.\npub const DeleteRequest = struct {\n    key: []const u8,\n\n    /// Converts the DeleteRequest to a slice of bytes that can be sent over the wire.\n    pub fn toSlice(self: DeleteRequest, allocator: std.mem.Allocator) ![]const u8 {\n        return try std.fmt.allocPrint(allocator, \"DELETE {s}\", .{self.key});\n    }\n\n    /// Parses a slice of bytes into a DeleteRequest.\n    pub fn fromSlice(slice: []const u8) !DeleteRequest {\n        var tokens = std.mem.splitSequence(u8, slice, \" \");\n        const cmd = tokens.next() orelse return error.InvalidCommand;\n        const key = tokens.next() orelse return error.InvalidCommand;\n\n        if (std.mem.eql(u8, cmd, \"DELETE\")) {\n            return DeleteRequest{ .key = key };\n        } else {\n            return error.InvalidCommand;\n        }\n    }\n};\n\n// CommandMap is a ComptimeStringMap that maps command names to their corresponding CommandType
 // with O(1) lookup time.
 const CommandMap = std.StaticStringMap(CommandType).initComptime(.{
     .{ "SET", CommandType.Set },
