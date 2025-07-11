@@ -1,5 +1,5 @@
 const std = @import("std");
-const Phage = @import("src/root.zig").Phage;
+const Phage = @import("root.zig").Phage;
 
 pub fn main() !void {
     var allocator = std.heap.page_allocator;
@@ -34,7 +34,10 @@ pub fn main() !void {
         try store.put("key3", value3);
 
         file_stat = try std.posix.fstat(store.fd);
-        std.debug.print("After update {d}: file size = {} bytes, waste ratio = {d:.2}%\n", .{ i, file_stat.size, store.calculateMainFileWasteRatio() * 100 });
+        std.debug.print(
+            "After update {d}: file size = {} bytes, waste ratio = {d:.2}%\n",
+            .{ i, file_stat.size, store.calculateMainFileWasteRatio() * 100 },
+        );
     }
 
     // Test 3: Verify current values are correct
