@@ -3,4 +3,6 @@ zig-out/
 *.db
 *.db.wal
 .git/
-.jj/
+.jj/phage_store*
+*.db
+*.wal
