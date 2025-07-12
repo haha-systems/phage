@@ -45,23 +45,20 @@ pub const Phage = struct {
     ) !Phage {
         std.log.info("Phage starting...", .{});
 
-        // var options = std.mem.zeroInit(linux.io_uring_params, .{
-        //     .flags = linux.IORING_SETUP_SQPOLL | linux.IORING_SETUP_CQSIZE,
-        //     .sq_entries = RING_ENTRIES,
-        //     .cq_entries = RING_ENTRIES,
-        //     .features = linux.IORING_FEAT_SINGLE_MMAP | linux.IORING_FEAT_NODROP,
-        //     .sq_thread_idle = 1,
-        //     .sq_thread_cpu = 0,
-        // });
+        var options = std.mem.zeroInit(linux.io_uring_params, .{
+            .flags = linux.IORING_SETUP_COOP_TASKRUN,
+            .sq_thread_idle = 1,
+            .sq_thread_cpu = 0,
+        });
 
-        // const ring = linux.IoUring.init_params(RING_ENTRIES, &options) catch |err| {
-        //     return err;
-        // };
-
-        const ring = linux.IoUring.init(RING_ENTRIES, 0) catch |err| {
-            std.log.err("Failed to initialize io_uring: {s}", .{@errorName(err)});
+        const ring = linux.IoUring.init_params(RING_ENTRIES, &options) catch |err| {
             return err;
         };
+
+        // const ring = linux.IoUring.init(RING_ENTRIES, 0) catch |err| {
+        //     std.log.err("Failed to initialize io_uring: {s}", .{@errorName(err)});
+        //     return err;
+        // };
 
         const fd = try std.posix.open(
             file_path,
@@ -347,7 +344,7 @@ pub const Phage = struct {
 
         // Find keys matching the pattern
         var matches = std.ArrayList([]const u8).init(self.allocator);
-        defer matches.deinit();
+        // Note: Don't defer deinit here, we need to return the items
 
         if (std.mem.eql(u8, clean_pattern, "*")) {
             // wildcard pattern, so modify the pattern to match everything
@@ -360,9 +357,13 @@ pub const Phage = struct {
         if (matches.items.len == 0) {
             // TODO: swap this to a custom logger
             std.log.debug("No keys found matching pattern: {s}", .{clean_pattern});
+            matches.deinit(); // Clean up if no results
             return null;
         } else {
-            return matches.items;
+            // Return the items and transfer ownership
+            // The caller is responsible for freeing this memory
+            const owned_slice = try matches.toOwnedSlice();
+            return owned_slice;
         }
     }
 

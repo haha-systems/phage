@@ -60,6 +60,7 @@ pub const CommandType = enum(i8) {
     Delete = 3,
     Keys = 4,
     Ping = 5,
+    Benchmark = 6,
     Unknown = -1,
 };
 
@@ -228,6 +229,15 @@ pub const Command = struct {
                     .payload = ResultPayload{ .Ping = PingResult{ .response = "PONG" } },
                 };
             },
+            .Benchmark => {
+                const request = self.payload.Benchmark;
+                const result = try request.execute(store);
+                return Result{
+                    .id = self.id,
+                    .status = Status.Ok,
+                    .payload = ResultPayload{ .Benchmark = result },
+                };
+            },
             .Unknown => {
                 return Result{
                     .id = self.id,
@@ -246,6 +256,7 @@ pub const Payload = union(enum) {
     Delete: DeleteRequest,
     Keys: KeysRequest,
     Ping: PingRequest,
+    Benchmark: BenchmarkRequest,
     Unknown,
 };
 
@@ -277,6 +288,9 @@ pub const Result = struct {
             .Ping => |ping_result| {
                 return try std.fmt.allocPrint(allocator, "{s}", .{ping_result.response});
             },
+            .Benchmark => |benchmark_result| {
+                return try std.fmt.allocPrint(allocator, "{s}", .{benchmark_result.message});
+            },
             .Unknown => |unknown_result| {
                 return try std.fmt.allocPrint(allocator, "ERR: {s}", .{unknown_result.errors});
             },
@@ -291,6 +305,7 @@ pub const ResultPayload = union(enum) {
     Get: GetResult,
     Delete: DeleteResult,
     Ping: PingResult,
+    Benchmark: BenchmarkResult,
     Unknown: UnknownResult,
 };
 
@@ -340,10 +355,13 @@ pub const SetRequest = struct {
     pub fn fromSlice(slice: []const u8) !SetRequest {
         var tokens = std.mem.splitSequence(u8, slice, " ");
         const cmd = tokens.next() orelse return error.InvalidCommand;
-        const key = tokens.next() orelse return error.InvalidCommand;
-        const value = tokens.next() orelse return error.InvalidCommand;
+        const key = tokens.next() orelse return error.MissingKey;
+        const value = tokens.next() orelse return error.MissingValue;
 
         if (std.mem.eql(u8, cmd, "SET")) {
+            // Validate key is not empty
+            if (key.len == 0) return error.EmptyKey;
+            // Value can be empty, but let's allow it
             return SetRequest{ .key = key, .value = value };
         } else {
             return error.InvalidCommand;
@@ -394,9 +412,11 @@ pub const GetRequest = struct {
     pub fn fromSlice(slice: []const u8) !GetRequest {
         var tokens = std.mem.splitSequence(u8, slice, " ");
         const cmd = tokens.next() orelse return error.InvalidCommand;
-        const key = tokens.next() orelse return error.InvalidCommand;
+        const key = tokens.next() orelse return error.MissingKey;
 
         if (std.mem.eql(u8, cmd, "GET")) {
+            // Validate key is not empty
+            if (key.len == 0) return error.EmptyKey;
             return GetRequest{ .key = key };
         } else {
             return error.InvalidCommand;
@@ -448,9 +468,11 @@ pub const DeleteRequest = struct {
     pub fn fromSlice(slice: []const u8) !DeleteRequest {
         var tokens = std.mem.splitSequence(u8, slice, " ");
         const cmd = tokens.next() orelse return error.InvalidCommand;
-        const key = tokens.next() orelse return error.InvalidCommand;
+        const key = tokens.next() orelse return error.MissingKey;
 
         if (std.mem.eql(u8, cmd, "DELETE")) {
+            // Validate key is not empty
+            if (key.len == 0) return error.EmptyKey;
             return DeleteRequest{ .key = key };
         } else {
             return error.InvalidCommand;
@@ -545,10 +567,72 @@ pub const KeysRequest = struct {
     pub fn fromSlice(slice: []const u8) !KeysRequest {
         var tokens = std.mem.splitSequence(u8, slice, " ");
         const cmd = tokens.next() orelse return error.InvalidCommand;
-        const pattern = tokens.next() orelse return error.InvalidCommand;
+        const pattern = tokens.next() orelse return error.MissingPattern;
 
         if (std.mem.eql(u8, cmd, "KEYS")) {
+            // Validate pattern is not empty
+            if (pattern.len == 0) return error.EmptyPattern;
             return KeysRequest{ .pattern = pattern };
+        } else {
+            return error.InvalidCommand;
+        }
+    }
+};
+
+/// BenchmarkRequest defines the request structure for the BENCHMARK command.
+pub const BenchmarkRequest = struct {
+    operations: u32,
+
+    /// Executes the BENCHMARK command with the given number of operations.
+    pub fn execute(self: BenchmarkRequest, store: *Phage) !BenchmarkResult {
+        const start_time = std.time.nanoTimestamp();
+
+        // Perform benchmark operations
+        for (0..self.operations) |i| {
+            const key = try std.fmt.allocPrint(store.allocator, "bench_key_{d}", .{i});
+            defer store.allocator.free(key);
+            const value = try std.fmt.allocPrint(store.allocator, "bench_value_{d}", .{i});
+            defer store.allocator.free(value);
+
+            // Perform SET and GET operations
+            try store.put(key, value);
+            _ = try store.get(key);
+        }
+
+        const end_time = std.time.nanoTimestamp();
+        const total_time_ns: u64 = @intCast(end_time - start_time);
+        const total_time_ms = total_time_ns / 1_000_000;
+        const ops_per_second = if (total_time_ms > 0)
+            (@as(f64, @floatFromInt(self.operations * 2 * 1000)) / @as(f64, @floatFromInt(total_time_ms)))
+        else
+            0.0;
+
+        const message = try std.fmt.allocPrint(store.allocator, "Benchmark completed: {} operations in {} ms ({d:.2} ops/sec)", .{ self.operations * 2, total_time_ms, ops_per_second });
+
+        return BenchmarkResult{
+            .operations = self.operations * 2, // Count both SET and GET
+            .total_time_ms = total_time_ms,
+            .ops_per_second = ops_per_second,
+            .message = message,
+        };
+    }
+
+    /// Converts the BenchmarkRequest to a slice of bytes that can be sent over the wire.
+    pub fn toSlice(self: BenchmarkRequest, allocator: std.mem.Allocator) ![]const u8 {
+        return try std.fmt.allocPrint(allocator, "BENCHMARK {}", .{self.operations});
+    }
+
+    /// Parses a slice of bytes into a BenchmarkRequest.
+    pub fn fromSlice(slice: []const u8) !BenchmarkRequest {
+        var tokens = std.mem.splitSequence(u8, slice, " ");
+        const cmd = tokens.next() orelse return error.InvalidCommand;
+        const ops_str = tokens.next() orelse return error.InvalidCommand;
+
+        if (std.mem.eql(u8, cmd, "BENCHMARK")) {
+            const operations = std.fmt.parseInt(u32, ops_str, 10) catch return error.InvalidCommand;
+            if (operations == 0) return error.InvalidCommand;
+            if (operations > 1_000_000) return error.InvalidCommand; // Reasonable limit
+            return BenchmarkRequest{ .operations = operations };
         } else {
             return error.InvalidCommand;
         }
@@ -579,6 +663,13 @@ pub const UnknownResult = struct {
     errors: []const u8,
 };
 
+pub const BenchmarkResult = struct {
+    operations: u32,
+    total_time_ms: u64,
+    ops_per_second: f64,
+    message: []const u8,
+};
+
 /// DeleteRequest defines the request structure for the DELETE command.\npub const DeleteRequest = struct {\n    key: []const u8,\n\n    /// Converts the DeleteRequest to a slice of bytes that can be sent over the wire.\n    pub fn toSlice(self: DeleteRequest, allocator: std.mem.Allocator) ![]const u8 {\n        return try std.fmt.allocPrint(allocator, \"DELETE {s}\", .{self.key});\n    }\n\n    /// Parses a slice of bytes into a DeleteRequest.\n    pub fn fromSlice(slice: []const u8) !DeleteRequest {\n        var tokens = std.mem.splitSequence(u8, slice, \" \");\n        const cmd = tokens.next() orelse return error.InvalidCommand;\n        const key = tokens.next() orelse return error.InvalidCommand;\n\n        if (std.mem.eql(u8, cmd, \"DELETE\")) {\n            return DeleteRequest{ .key = key };\n        } else {\n            return error.InvalidCommand;\n        }\n    }\n};\n\n// CommandMap is a ComptimeStringMap that maps command names to their corresponding CommandType
 // with O(1) lookup time.
 const CommandMap = std.StaticStringMap(CommandType).initComptime(.{
@@ -587,6 +678,7 @@ const CommandMap = std.StaticStringMap(CommandType).initComptime(.{
     .{ "DELETE", CommandType.Delete },
     .{ "KEYS", CommandType.Keys },
     .{ "PING", CommandType.Ping },
+    .{ "BENCHMARK", CommandType.Benchmark },
     .{ "UNKNOWN", CommandType.Unknown },
 });
 
@@ -649,6 +741,15 @@ pub fn parseCommandSlice(slice: []const u8) !Command {
                 .id = nextCommandId(),
                 .command = .Ping,
                 .payload = .{ .Ping = request },
+                .result = null,
+            };
+        },
+        .Benchmark => {
+            const request = try BenchmarkRequest.fromSlice(slice);
+            return Command{
+                .id = nextCommandId(),
+                .command = .Benchmark,
+                .payload = .{ .Benchmark = request },
                 .result = null,
             };
         },
