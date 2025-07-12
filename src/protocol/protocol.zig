@@ -588,11 +588,12 @@ pub const BenchmarkRequest = struct {
         const start_time = std.time.nanoTimestamp();
 
         // Perform benchmark operations
+        // Preallocate buffers for key and value
+        var key_buffer: [64]u8 = undefined; // Adjust size as needed
+        var value_buffer: [64]u8 = undefined; // Adjust size as needed
         for (0..self.operations) |i| {
-            const key = try std.fmt.allocPrint(store.allocator, "bench_key_{d}", .{i});
-            defer store.allocator.free(key);
-            const value = try std.fmt.allocPrint(store.allocator, "bench_value_{d}", .{i});
-            defer store.allocator.free(value);
+            const key = try std.fmt.bufPrint(&key_buffer, "bench_key_{d}", .{i});
+            const value = try std.fmt.bufPrint(&value_buffer, "bench_value_{d}", .{i});
 
             // Perform SET and GET operations
             try store.put(key, value);
