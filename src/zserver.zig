@@ -143,6 +143,9 @@ pub fn main() !void {
             std.debug.print("Error parsing command: {s}\n", .{@errorName(err)});
             const error_msg = switch (err) {
                 error.InvalidCommand => "ERR Unknown command or invalid syntax\n",
+                error.MissingKey => "ERR Missing key\n",
+                error.MissingValue => "ERR Missing value\n",
+                error.MissingPattern => "ERR Missing pattern\n",
                 else => "ERR Invalid command\n",
             };
             try server_rep.sendConstSlice(error_msg, .{});
