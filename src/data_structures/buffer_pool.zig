@@ -7,8 +7,8 @@ const Allocator = std.mem.Allocator;
 const IO = @import("../io/io.zig").IO;
 
 const BUFFER_POOL_SIZE = 1;
-const BLOCK_SIZE = std.heap.pageSize();
-const MAX_ENTRY_SIZE = std.heap.pageSize();
+const BLOCK_SIZE = 4096; // Default block size, can be adjusted as needed
+const MAX_ENTRY_SIZE = 4096; // Default max entry size, can be adjusted as needed
 
 // stack of buffers for I/O
 pub const BufferPool = struct {

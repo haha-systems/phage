@@ -289,7 +289,13 @@ pub const Result = struct {
                 return try std.fmt.allocPrint(allocator, "{s}", .{ping_result.response});
             },
             .Benchmark => |benchmark_result| {
-                return try std.fmt.allocPrint(allocator, "{s}", .{benchmark_result.message});
+                const write_time_ms = @as(f64, @floatFromInt(benchmark_result.write_time_ns)) / 1_000_000.0;
+                const read_time_ms = @as(f64, @floatFromInt(benchmark_result.read_time_ns)) / 1_000_000.0;
+                const total_time_ms = @as(f64, @floatFromInt(benchmark_result.total_time_ns)) / 1_000_000.0;
+                
+                return try std.fmt.allocPrint(allocator, 
+                    "Benchmark completed: {d} ops, Write: {d:.2}ms, Read: {d:.2}ms, Total: {d:.2}ms", 
+                    .{benchmark_result.num_ops, write_time_ms, read_time_ms, total_time_ms});
             },
             .Unknown => |unknown_result| {
                 return try std.fmt.allocPrint(allocator, "ERR: {s}", .{unknown_result.errors});
@@ -579,61 +585,59 @@ pub const KeysRequest = struct {
     }
 };
 
-/// BenchmarkRequest defines the request structure for the BENCHMARK command.
 pub const BenchmarkRequest = struct {
-    operations: u32,
-
-    /// Executes the BENCHMARK command with the given number of operations.
-    pub fn execute(self: BenchmarkRequest, store: *Phage) !BenchmarkResult {
-        const start_time = std.time.nanoTimestamp();
-
-        // Perform benchmark operations
-        // Preallocate buffers for key and value
-        var key_buffer: [64]u8 = undefined; // Adjust size as needed
-        var value_buffer: [64]u8 = undefined; // Adjust size as needed
-        for (0..self.operations) |i| {
-            const key = try std.fmt.bufPrint(&key_buffer, "bench_key_{d}", .{i});
-            const value = try std.fmt.bufPrint(&value_buffer, "bench_value_{d}", .{i});
-
-            // Perform SET and GET operations
-            try store.put(key, value);
-            _ = try store.get(key);
-        }
-
-        const end_time = std.time.nanoTimestamp();
-        const total_time_ns: u64 = @intCast(end_time - start_time);
-        const total_time_ms = total_time_ns / 1_000_000;
-        const ops_per_second = if (total_time_ms > 0)
-            (@as(f64, @floatFromInt(self.operations * 2 * 1000)) / @as(f64, @floatFromInt(total_time_ms)))
-        else
-            0.0;
-
-        const message = try std.fmt.allocPrint(store.allocator, "Benchmark completed: {} operations in {} ms ({d:.2} ops/sec)", .{ self.operations * 2, total_time_ms, ops_per_second });
-
-        return BenchmarkResult{
-            .operations = self.operations * 2, // Count both SET and GET
-            .total_time_ms = total_time_ms,
-            .ops_per_second = ops_per_second,
-            .message = message,
-        };
-    }
+    num_ops: u32,
 
     /// Converts the BenchmarkRequest to a slice of bytes that can be sent over the wire.
     pub fn toSlice(self: BenchmarkRequest, allocator: std.mem.Allocator) ![]const u8 {
-        return try std.fmt.allocPrint(allocator, "BENCHMARK {}", .{self.operations});
+        return try std.fmt.allocPrint(allocator, "BENCHMARK {d}", .{self.num_ops});
+    }
+
+    /// Executes the benchmark request against the given store.
+    pub fn execute(self: BenchmarkRequest, store: *Phage) !BenchmarkResult {
+        const start_time = std.time.nanoTimestamp();
+        
+        // Perform write operations
+        const write_start = std.time.nanoTimestamp();
+        for (0..self.num_ops) |i| {
+            const key = try std.fmt.allocPrint(store.allocator, "bench_key{d}", .{i});
+            defer store.allocator.free(key);
+            const value = try std.fmt.allocPrint(store.allocator, "bench_value{d}", .{i});
+            defer store.allocator.free(value);
+            try store.put(key, value);
+        }
+        const write_end = std.time.nanoTimestamp();
+        
+        // Perform read operations
+        const read_start = std.time.nanoTimestamp();
+        for (0..self.num_ops) |i| {
+            const key = try std.fmt.allocPrint(store.allocator, "bench_key{d}", .{i});
+            defer store.allocator.free(key);
+            _ = try store.get(key);
+        }
+        const read_end = std.time.nanoTimestamp();
+        
+        const total_time_ns: u64 = @intCast(read_end - start_time);
+        const write_time_ns: u64 = @intCast(write_end - write_start);
+        const read_time_ns: u64 = @intCast(read_end - read_start);
+        
+        return BenchmarkResult{
+            .num_ops = self.num_ops,
+            .total_time_ns = total_time_ns,
+            .write_time_ns = write_time_ns,
+            .read_time_ns = read_time_ns,
+        };
     }
 
     /// Parses a slice of bytes into a BenchmarkRequest.
     pub fn fromSlice(slice: []const u8) !BenchmarkRequest {
         var tokens = std.mem.splitSequence(u8, slice, " ");
         const cmd = tokens.next() orelse return error.InvalidCommand;
-        const ops_str = tokens.next() orelse return error.InvalidCommand;
+        const num_ops_str = tokens.next() orelse return error.InvalidCommand;
 
         if (std.mem.eql(u8, cmd, "BENCHMARK")) {
-            const operations = std.fmt.parseInt(u32, ops_str, 10) catch return error.InvalidCommand;
-            if (operations == 0) return error.InvalidCommand;
-            if (operations > 1_000_000) return error.InvalidCommand; // Reasonable limit
-            return BenchmarkRequest{ .operations = operations };
+            const num_ops = std.fmt.parseInt(u32, num_ops_str, 10) catch return error.InvalidCommand;
+            return BenchmarkRequest{ .num_ops = num_ops };
         } else {
             return error.InvalidCommand;
         }
@@ -660,15 +664,15 @@ pub const KeysResult = struct {
     keys: [][]const u8,
 };
 
-pub const UnknownResult = struct {
-    errors: []const u8,
+pub const BenchmarkResult = struct {
+    num_ops: u32,
+    total_time_ns: u64,
+    write_time_ns: u64,
+    read_time_ns: u64,
 };
 
-pub const BenchmarkResult = struct {
-    operations: u32,
-    total_time_ms: u64,
-    ops_per_second: f64,
-    message: []const u8,
+pub const UnknownResult = struct {
+    errors: []const u8,
 };
 
 /// DeleteRequest defines the request structure for the DELETE command.\npub const DeleteRequest = struct {\n    key: []const u8,\n\n    /// Converts the DeleteRequest to a slice of bytes that can be sent over the wire.\n    pub fn toSlice(self: DeleteRequest, allocator: std.mem.Allocator) ![]const u8 {\n        return try std.fmt.allocPrint(allocator, \"DELETE {s}\", .{self.key});\n    }\n\n    /// Parses a slice of bytes into a DeleteRequest.\n    pub fn fromSlice(slice: []const u8) !DeleteRequest {\n        var tokens = std.mem.splitSequence(u8, slice, \" \");\n        const cmd = tokens.next() orelse return error.InvalidCommand;\n        const key = tokens.next() orelse return error.InvalidCommand;\n\n        if (std.mem.eql(u8, cmd, \"DELETE\")) {\n            return DeleteRequest{ .key = key };\n        } else {\n            return error.InvalidCommand;\n        }\n    }\n};\n\n// CommandMap is a ComptimeStringMap that maps command names to their corresponding CommandType

@@ -221,13 +221,13 @@ pub const Phage = struct {
     /// The caller is responsible for freeing the returned value.
     /// If the key is not found, an error is returned.
     pub fn get(self: *Phage, key: []const u8) ![]u8 {
-        std.log.info("Getting key: {s}", .{key});
+        std.log.debug("Getting key: {s}", .{key});
 
         // strip newline characters from key first
         const trimmed_key = std.mem.trimRight(u8, key, "\r\n");
 
         const entry = self.index.get(trimmed_key) orelse {
-            std.log.info("Key not found: {s}", .{key});
+            std.log.debug("Key not found: {s}", .{key});
             return error.KeyNotFound;
         };
 
@@ -594,6 +594,9 @@ pub const Phage = struct {
 
     /// Atomically swap the temporary compacted file with the main database file.
     fn atomicFileSwap(self: *Phage, temp_path: []const u8, target_path: []const u8) !void {
+        // Wait for all pending I/O operations to complete before closing the file
+        try self.waitForIO();
+
         // Close the current file descriptor
         std.posix.close(self.fd);
 
