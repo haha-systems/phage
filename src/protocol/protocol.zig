@@ -361,10 +361,13 @@ pub const SetRequest = struct {
     pub fn fromSlice(slice: []const u8) !SetRequest {
         var tokens = std.mem.splitSequence(u8, slice, " ");
         const cmd = tokens.next() orelse return error.InvalidCommand;
-        const key = tokens.next() orelse return error.InvalidCommand;
-        const value = tokens.next() orelse return error.InvalidCommand;
+        const key = tokens.next() orelse return error.MissingKey;
+        const value = tokens.next() orelse return error.MissingValue;
 
         if (std.mem.eql(u8, cmd, "SET")) {
+            // Validate key is not empty
+            if (key.len == 0) return error.EmptyKey;
+            // Value can be empty, but let's allow it
             return SetRequest{ .key = key, .value = value };
         } else {
             return error.InvalidCommand;
@@ -415,9 +418,11 @@ pub const GetRequest = struct {
     pub fn fromSlice(slice: []const u8) !GetRequest {
         var tokens = std.mem.splitSequence(u8, slice, " ");
         const cmd = tokens.next() orelse return error.InvalidCommand;
-        const key = tokens.next() orelse return error.InvalidCommand;
+        const key = tokens.next() orelse return error.MissingKey;
 
         if (std.mem.eql(u8, cmd, "GET")) {
+            // Validate key is not empty
+            if (key.len == 0) return error.EmptyKey;
             return GetRequest{ .key = key };
         } else {
             return error.InvalidCommand;
@@ -469,9 +474,11 @@ pub const DeleteRequest = struct {
     pub fn fromSlice(slice: []const u8) !DeleteRequest {
         var tokens = std.mem.splitSequence(u8, slice, " ");
         const cmd = tokens.next() orelse return error.InvalidCommand;
-        const key = tokens.next() orelse return error.InvalidCommand;
+        const key = tokens.next() orelse return error.MissingKey;
 
         if (std.mem.eql(u8, cmd, "DELETE")) {
+            // Validate key is not empty
+            if (key.len == 0) return error.EmptyKey;
             return DeleteRequest{ .key = key };
         } else {
             return error.InvalidCommand;
@@ -566,9 +573,11 @@ pub const KeysRequest = struct {
     pub fn fromSlice(slice: []const u8) !KeysRequest {
         var tokens = std.mem.splitSequence(u8, slice, " ");
         const cmd = tokens.next() orelse return error.InvalidCommand;
-        const pattern = tokens.next() orelse return error.InvalidCommand;
+        const pattern = tokens.next() orelse return error.MissingPattern;
 
         if (std.mem.eql(u8, cmd, "KEYS")) {
+            // Validate pattern is not empty
+            if (pattern.len == 0) return error.EmptyPattern;
             return KeysRequest{ .pattern = pattern };
         } else {
             return error.InvalidCommand;
