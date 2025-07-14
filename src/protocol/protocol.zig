@@ -597,23 +597,45 @@ pub const BenchmarkRequest = struct {
     pub fn execute(self: BenchmarkRequest, store: *Phage) !BenchmarkResult {
         const start_time = std.time.nanoTimestamp();
         
-        // Perform write operations
+        // Use batched operations for better performance
+        const BATCH_SIZE = 100; // Process in batches to avoid excessive memory usage
+        
+        // Perform write operations using batching
         const write_start = std.time.nanoTimestamp();
-        for (0..self.num_ops) |i| {
-            const key = try std.fmt.allocPrint(store.allocator, "bench_key{d}", .{i});
-            defer store.allocator.free(key);
-            const value = try std.fmt.allocPrint(store.allocator, "bench_value{d}", .{i});
-            defer store.allocator.free(value);
-            try store.put(key, value);
+        var i: u32 = 0;
+        while (i < self.num_ops) {
+            const batch_end = @min(i + BATCH_SIZE, self.num_ops);
+            const batch_size = batch_end - i;
+            
+            // Prepare batch of key-value pairs
+            const pairs = try store.allocator.alloc(struct { key: []const u8, value: []const u8 }, batch_size);
+            defer {
+                for (pairs) |pair| {
+                    store.allocator.free(pair.key);
+                    store.allocator.free(pair.value);
+                }
+                store.allocator.free(pairs);
+            }
+            
+            for (0..batch_size) |j| {
+                const key = try std.fmt.allocPrint(store.allocator, "bench_key{d}", .{i + j});
+                const value = try std.fmt.allocPrint(store.allocator, "bench_value{d}", .{i + j});
+                pairs[j] = .{ .key = key, .value = value };
+            }
+            
+            // Execute batch PUT
+            try store.putBatch(pairs);
+            i = batch_end;
         }
         const write_end = std.time.nanoTimestamp();
         
-        // Perform read operations
+        // Perform read operations (individual reads are still necessary)
         const read_start = std.time.nanoTimestamp();
-        for (0..self.num_ops) |i| {
-            const key = try std.fmt.allocPrint(store.allocator, "bench_key{d}", .{i});
+        for (0..self.num_ops) |j| {
+            const key = try std.fmt.allocPrint(store.allocator, "bench_key{d}", .{j});
             defer store.allocator.free(key);
-            _ = try store.get(key);
+            const value = try store.get(key);
+            defer store.allocator.free(value);
         }
         const read_end = std.time.nanoTimestamp();
         

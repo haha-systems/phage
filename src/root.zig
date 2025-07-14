@@ -158,38 +158,30 @@ pub const Phage = struct {
     /// freed until the database is closed or the entry is deleted.
     ///
     pub fn put(self: *Phage, key: []const u8, value: []const u8) !void {
-        // Step 1: Write provisional entry to WAL, we'll get the offset later
-        const provisional_wal_entry = try self.formatWalEntry(.put, key, value, 0);
-        defer self.allocator.free(provisional_wal_entry);
-
-        const wal_offset = self.wal_file_size.fetchAdd(provisional_wal_entry.len, .monotonic);
-
-        var ops_submitted = try self.writeToWal(provisional_wal_entry, wal_offset);
-        try self.waitForIO();
-        if (ops_submitted < 1) {
-            return error.WriteError;
-        }
-
-        // Step 2: Write to main file to secure the offset
+        // Optimized PUT: Batch operations and avoid synchronous waits where possible
+        
+        // Step 1: Write to main file first to secure the offset
         const data_entry = try self.formatDataEntry(key, value);
         defer self.allocator.free(data_entry);
 
         const data_offset = self.file_size.fetchAdd(data_entry.len, .monotonic);
-        ops_submitted = try IO.writeToFile(&self.pending_ops, self.fd, &self.ring, &data_entry, data_offset);
-
-        try self.waitForIO();
+        var ops_submitted = try IO.writeToFile(&self.pending_ops, self.fd, &self.ring, &data_entry, data_offset);
         if (ops_submitted < 1) {
             return error.WriteError;
         }
 
-        // Step 3: Update WAL entry with the offset
+        // Step 2: Write final WAL entry with the known offset (skip provisional entry)
         const final_wal_entry = try self.formatWalEntry(.put, key, value, data_offset);
         defer self.allocator.free(final_wal_entry);
+        
+        const wal_offset = self.wal_file_size.fetchAdd(final_wal_entry.len, .monotonic);
         ops_submitted = try self.writeToWal(final_wal_entry, wal_offset);
-        try self.waitForIO();
         if (ops_submitted < 1) {
             return error.WriteError;
         }
+
+        // Step 3: Wait for both operations to complete
+        try self.waitForIO();
 
         // Step 4: Finally, we update the index
         try self.index.put(self.allocator, key, .{
@@ -204,6 +196,72 @@ pub const Phage = struct {
         self.wal_file_size.store(0, .monotonic);
 
         // Step 4b: Check if compaction is needed (non-blocking)
+        self.checkAndScheduleCompaction() catch |err| {
+            std.log.warn("Failed to schedule compaction: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Optimized batch PUT operation for better performance
+    /// Batches multiple key-value pairs and minimizes I/O waits
+    pub fn putBatch(self: *Phage, pairs: []const struct { key: []const u8, value: []const u8 }) !void {
+        if (pairs.len == 0) return;
+
+        // Prepare all data entries first
+        var data_entries = try self.allocator.alloc([]u8, pairs.len);
+        defer {
+            for (data_entries) |entry| {
+                self.allocator.free(entry);
+            }
+            self.allocator.free(data_entries);
+        }
+
+        var wal_entries = try self.allocator.alloc([]u8, pairs.len);
+        defer {
+            for (wal_entries) |entry| {
+                self.allocator.free(entry);
+            }
+            self.allocator.free(wal_entries);
+        }
+
+        var data_offsets = try self.allocator.alloc(usize, pairs.len);
+        defer self.allocator.free(data_offsets);
+
+        // Step 1: Format all data entries and submit all main file writes
+        for (pairs, 0..) |pair, i| {
+            data_entries[i] = try self.formatDataEntry(pair.key, pair.value);
+            data_offsets[i] = self.file_size.fetchAdd(data_entries[i].len, .monotonic);
+            
+            const ops_submitted = try IO.writeToFile(&self.pending_ops, self.fd, &self.ring, &data_entries[i], data_offsets[i]);
+            if (ops_submitted < 1) {
+                return error.WriteError;
+            }
+        }
+
+        // Step 2: Format and submit all WAL entries
+        for (pairs, 0..) |pair, i| {
+            wal_entries[i] = try self.formatWalEntry(.put, pair.key, pair.value, data_offsets[i]);
+            const wal_offset = self.wal_file_size.fetchAdd(wal_entries[i].len, .monotonic);
+            
+            const ops_submitted = try self.writeToWal(wal_entries[i], wal_offset);
+            if (ops_submitted < 1) {
+                return error.WriteError;
+            }
+        }
+
+        // Step 3: Wait for all I/O operations to complete (single wait for entire batch)
+        try self.waitForIO();
+
+        // Step 4: Update index for all entries
+        for (pairs, 0..) |pair, i| {
+            try self.index.put(self.allocator, pair.key, .{
+                .offset = data_offsets[i],
+                .len = data_entries[i].len,
+                .key_len = pair.key.len,
+                .val_len = pair.value.len,
+            });
+        }
+
+        // Step 5: Check compaction only once for the entire batch
         self.checkAndScheduleCompaction() catch |err| {
             std.log.warn("Failed to schedule compaction: {s}", .{@errorName(err)});
         };
