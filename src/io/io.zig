@@ -6,11 +6,21 @@ const linux = std.os.linux;
 const builtin = @import("builtin");
 
 pub const io = @This();
+pub const backend = @import("backend.zig");
+pub const Backend = backend.Backend;
+pub const BackendKind = backend.BackendKind;
+pub const default_backend_kind = backend.default_kind;
 pub const wal = @import("wal.zig");
 pub const s2s = @import("s2s.zig");
 
 /// IO operations for the Phage server using Linux io_uring.
-pub const IO = struct {
+pub const IO = if (builtin.os.tag == .linux) LinuxIO else PosixIOCompat;
+
+const PosixIOCompat = struct {
+    pub inline fn prefetch(_: anytype, _: bool) void {}
+};
+
+const LinuxIO = struct {
     id: u64,
     buffer: []u8,
     offset: u64,
@@ -73,15 +83,13 @@ pub const IO = struct {
                     asm volatile ("prefetchw (%[addr])"
                         :
                         : [addr] "r" (addr),
-                        : "memory"
-                    );
+                        : .{ .memory = true });
                 } else {
                     // PREFETCHT0 for read operations (L1 cache)
                     asm volatile ("prefetcht0 (%[addr])"
                         :
                         : [addr] "r" (addr),
-                        : "memory"
-                    );
+                        : .{ .memory = true });
                 }
             },
             .aarch64, .arm => {
@@ -90,15 +98,13 @@ pub const IO = struct {
                     asm volatile ("prfm pstl1keep, [%[addr]]"
                         :
                         : [addr] "r" (addr),
-                        : "memory"
-                    );
+                        : .{ .memory = true });
                 } else {
                     // PLDL1KEEP for read operations (preload to L1)
                     asm volatile ("prfm pldl1keep, [%[addr]]"
                         :
                         : [addr] "r" (addr),
-                        : "memory"
-                    );
+                        : .{ .memory = true });
                 }
             },
             else => {

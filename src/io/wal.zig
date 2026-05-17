@@ -150,27 +150,9 @@ pub const Wal = struct {
             offset += @sizeOf(WalEntryHeader) + header.key_len;
         }
 
-        // Truncate the WAL file to remove processed entries
-        const truncate = std.os.linux.ftruncate(store.wal_fd, @intCast(0));
-
-        // Note: might need to use llseek for 32-bit systems
-        const seek = std.os.linux.lseek(store.wal_fd, 0, 0);
-
-        // Sync the WAL file to ensure data is written
-        const sync = std.os.linux.fsync(store.wal_fd);
-
-        if (truncate != 0) {
-            //log(.err, .phage, "Failed to truncate WAL file: {d}", .{truncate});
-            return error.TruncateError;
-        }
-        if (seek != 0) {
-            //log(.err, .phage, "Failed to seek WAL file: {d}", .{seek});
-            return error.SeekError;
-        }
-        if (sync != 0) {
-            //log(.err, .phage, "Failed to sync WAL file: {d}", .{sync});
-            return error.SyncError;
-        }
+        try std.posix.ftruncate(store.wal_fd, 0);
+        try std.posix.lseek_SET(store.wal_fd, 0);
+        try std.posix.fsync(store.wal_fd);
 
         //log(.info, .phage, "Truncated WAL file to offset: {d}", .{seek});
 

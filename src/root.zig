@@ -2,7 +2,6 @@
 // Licensed under the MIT License. See LICENSE.md file in the project root.
 
 const std = @import("std");
-const linux = @import("std").os.linux;
 const posix = @import("std").posix;
 const Allocator = std.mem.Allocator;
 
@@ -13,7 +12,7 @@ pub const protocol = @import("protocol/protocol.zig");
 
 const index = @import("index.zig");
 const io = @import("io/io.zig");
-const IO = io.IO;
+const Backend = io.Backend;
 const Wal = io.wal.Wal;
 
 const data_structures = @import("data_structures/data_structures.zig");
@@ -23,21 +22,18 @@ const Trie = data_structures.Trie;
 
 pub const Phage = struct {
     allocator: Allocator,
-    ring: linux.IoUring,
+    backend: Backend,
     fd: posix.fd_t,
     wal_fd: posix.fd_t,
     file_size: std.atomic.Value(u64),
     wal_file_size: std.atomic.Value(u64),
     index: index.IndexManager,
     buffer_pool: data_structures.BufferPool,
-    pending_ops: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     server_fd: posix.fd_t = 0,
     store_path: []const u8 = "phage_store", // Default path for the main database file
     wal_path: []const u8 = "phage_store.wal", // Default path for the Write-Ahead Log (WAL)
     compaction_threshold: f64 = 0.5, // Trigger compaction at 50% waste
     compaction_in_progress: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    const RING_ENTRIES: u32 = 128;
 
     pub fn init(
         allocator: Allocator,
@@ -45,20 +41,8 @@ pub const Phage = struct {
     ) !Phage {
         std.log.info("Phage starting...", .{});
 
-        var options = std.mem.zeroInit(linux.io_uring_params, .{
-            .flags = linux.IORING_SETUP_COOP_TASKRUN,
-            .sq_thread_idle = 1,
-            .sq_thread_cpu = 0,
-        });
-
-        const ring = linux.IoUring.init_params(RING_ENTRIES, &options) catch |err| {
-            return err;
-        };
-
-        // const ring = linux.IoUring.init(RING_ENTRIES, 0) catch |err| {
-        //     std.log.err("Failed to initialize io_uring: {s}", .{@errorName(err)});
-        //     return err;
-        // };
+        var backend = try Backend.init();
+        errdefer backend.deinit();
 
         const fd = try std.posix.open(
             file_path,
@@ -104,7 +88,7 @@ pub const Phage = struct {
 
         var store = Phage{
             .allocator = allocator,
-            .ring = ring,
+            .backend = backend,
             .fd = fd,
             .wal_fd = wal_fd,
             .file_size = file_size,
@@ -139,7 +123,7 @@ pub const Phage = struct {
         // std.posix.close(self.server_fd);
         // self.server_fd = 0;
 
-        self.ring.deinit();
+        self.backend.deinit();
         posix.close(self.fd);
         posix.close(self.wal_fd);
         self.index.deinit(self.allocator);
@@ -159,13 +143,13 @@ pub const Phage = struct {
     ///
     pub fn put(self: *Phage, key: []const u8, value: []const u8) !void {
         // Optimized PUT: Batch operations and avoid synchronous waits where possible
-        
+
         // Step 1: Write to main file first to secure the offset
         const data_entry = try self.formatDataEntry(key, value);
         defer self.allocator.free(data_entry);
 
         const data_offset = self.file_size.fetchAdd(data_entry.len, .monotonic);
-        var ops_submitted = try IO.writeToFile(&self.pending_ops, self.fd, &self.ring, &data_entry, data_offset);
+        var ops_submitted = try self.backend.write(self.fd, data_entry, data_offset);
         if (ops_submitted < 1) {
             return error.WriteError;
         }
@@ -173,7 +157,7 @@ pub const Phage = struct {
         // Step 2: Write final WAL entry with the known offset (skip provisional entry)
         const final_wal_entry = try self.formatWalEntry(.put, key, value, data_offset);
         defer self.allocator.free(final_wal_entry);
-        
+
         const wal_offset = self.wal_file_size.fetchAdd(final_wal_entry.len, .monotonic);
         ops_submitted = try self.writeToWal(final_wal_entry, wal_offset);
         if (ops_submitted < 1) {
@@ -230,8 +214,8 @@ pub const Phage = struct {
         for (pairs, 0..) |pair, i| {
             data_entries[i] = try self.formatDataEntry(pair.key, pair.value);
             data_offsets[i] = self.file_size.fetchAdd(data_entries[i].len, .monotonic);
-            
-            const ops_submitted = try IO.writeToFile(&self.pending_ops, self.fd, &self.ring, &data_entries[i], data_offsets[i]);
+
+            const ops_submitted = try self.backend.write(self.fd, data_entries[i], data_offsets[i]);
             if (ops_submitted < 1) {
                 return error.WriteError;
             }
@@ -241,7 +225,7 @@ pub const Phage = struct {
         for (pairs, 0..) |pair, i| {
             wal_entries[i] = try self.formatWalEntry(.put, pair.key, pair.value, data_offsets[i]);
             const wal_offset = self.wal_file_size.fetchAdd(wal_entries[i].len, .monotonic);
-            
+
             const ops_submitted = try self.writeToWal(wal_entries[i], wal_offset);
             if (ops_submitted < 1) {
                 return error.WriteError;
@@ -292,7 +276,7 @@ pub const Phage = struct {
         const buf = try self.allocator.alloc(u8, entry.len);
         defer self.allocator.free(buf);
 
-        const ops_submitted = try IO.readFromFile(&self.pending_ops, self.fd, &self.ring, &buf, entry.offset);
+        const ops_submitted = try self.backend.read(self.fd, buf, entry.offset);
         if (ops_submitted < 1) {
             return error.ReadError;
         }
@@ -674,16 +658,7 @@ pub const Phage = struct {
 
     /// Waits for all pending I/O operations to complete.
     fn waitForIO(self: *Phage) !void {
-        while (self.pending_ops.load(.acquire) > 0) {
-            // var cqe: linux.io_uring_cqe = undefined;
-            const cqe = try self.ring.copy_cqe();
-            if (cqe.res < 0) return error.IOUringError;
-            const completed = self.pending_ops.fetchSub(1, .monotonic);
-            if (completed == 0) {
-                // No more pending operations
-                break;
-            }
-        }
+        try self.backend.wait();
     }
 
     /// Formats a WAL entry with the given operation, key, value, and offset.
@@ -759,31 +734,11 @@ pub const Phage = struct {
     }
 
     fn readFromWal(store: *Phage, buf: []u8, offset: usize) !usize {
-        var sqe = try store.ring.get_sqe();
-        sqe.prep_read(
-            store.wal_fd,
-            buf,
-            offset,
-        );
-        sqe.flags |= linux.IOSQE_ASYNC;
-        sqe.user_data = @intFromPtr(buf.ptr);
-        const submitted = try store.ring.submit();
-        const pending = try store.pending_ops.fetchAdd(1, .monotonic);
-        return submitted + pending;
+        return try store.backend.read(store.wal_fd, buf, offset);
     }
 
     fn writeToWal(store: *Phage, buf: []u8, offset: usize) !usize {
-        var sqe = try store.ring.get_sqe();
-        sqe.prep_write(
-            store.wal_fd,
-            buf,
-            offset,
-        );
-        sqe.flags |= linux.IOSQE_ASYNC;
-        sqe.user_data = @intFromPtr(buf.ptr);
-        const submitted = try store.ring.submit();
-        const pending = store.pending_ops.fetchAdd(submitted, .monotonic);
-        return submitted + pending;
+        return try store.backend.write(store.wal_fd, buf, offset);
     }
 };
 

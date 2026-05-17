@@ -6,12 +6,12 @@ const std = @import("std");
 /// AtomicStack provides a very simple mutex-protected stack structure.
 pub const AtomicStack = struct {
     mutex: std.Thread.Mutex = .{}, // Store by value, not pointer
-    list: std.ArrayList([]const u8),
+    list: std.array_list.Managed([]const u8),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) !AtomicStack {
         return AtomicStack{
-            .list = std.ArrayList([]const u8).init(allocator),
+            .list = std.array_list.Managed([]const u8).init(allocator),
             .allocator = allocator,
         };
     }
@@ -100,7 +100,7 @@ pub const AtomicStack = struct {
         // Copy the contents of the stack to a new slice.
         // We need to do this because if we use .toOwnedSlice()
         // directly on the list, it will clear and invalidate the pointers.
-        var slice = std.ArrayList([]const u8).init(self.list.allocator);
+        var slice = std.array_list.Managed([]const u8).init(self.list.allocator);
         for (self.list.items) |item| {
             try slice.append(item);
         }

@@ -24,7 +24,7 @@ pub const BufferPool = struct {
         const buffers = try allocator.alloc([]u8, BUFFER_POOL_SIZE);
 
         for (0..BUFFER_POOL_SIZE) |i| {
-            buffers[i] = try allocator.alignedAlloc(u8, @alignOf(u8), MAX_ENTRY_SIZE);
+            buffers[i] = try allocator.alloc(u8, MAX_ENTRY_SIZE);
             pool.list.appendAssumeCapacity(buffers[i]);
         }
 
