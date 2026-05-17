@@ -2,6 +2,33 @@ const std = @import("std");
 const Phage = @import("phage").Phage;
 const log = @import("colored_logger").myLogFn;
 
+const NANOSECONDS_PER_SECOND: f64 = 1_000_000_000.0;
+const NANOSECONDS_PER_MILLISECOND: u64 = 1_000_000;
+
+pub const BenchmarkStats = struct {
+    num_ops: u32,
+    write_time_ns: u64,
+    read_time_ns: u64,
+    total_time_ns: u64,
+
+    pub fn writeOpsPerSec(self: BenchmarkStats) f64 {
+        return opsPerSec(self.num_ops, self.write_time_ns);
+    }
+
+    pub fn readOpsPerSec(self: BenchmarkStats) f64 {
+        return opsPerSec(self.num_ops, self.read_time_ns);
+    }
+
+    pub fn totalOpsPerSec(self: BenchmarkStats) f64 {
+        return opsPerSec(@as(u64, self.num_ops) * 2, self.total_time_ns);
+    }
+
+    fn opsPerSec(num_ops: u64, elapsed_ns: u64) f64 {
+        if (num_ops == 0 or elapsed_ns == 0) return 0.0;
+        return @as(f64, @floatFromInt(num_ops)) / (@as(f64, @floatFromInt(elapsed_ns)) / NANOSECONDS_PER_SECOND);
+    }
+};
+
 pub const Command = enum {
     put,
     get,
@@ -155,6 +182,46 @@ fn handleRestoreWAL(store: *Phage, writer: *std.io.AnyWriter) !void {
     log(.debug, .demon, "Restored WAL successfully. {d} key-values currently in index.", .{store.index.count()});
 }
 
+fn runBenchmark(store: anytype, numOps: u32) !BenchmarkStats {
+    const write_start = std.time.nanoTimestamp();
+    for (0..numOps) |i| {
+        const key = try std.fmt.allocPrint(store.allocator, "key{d}", .{i});
+        defer store.allocator.free(key);
+
+        const value = try std.fmt.allocPrint(store.allocator, "value{d}", .{i});
+        defer store.allocator.free(value);
+
+        try store.put(key, value);
+    }
+    const write_end = std.time.nanoTimestamp();
+
+    const read_start = std.time.nanoTimestamp();
+    for (0..numOps) |i| {
+        const key = try std.fmt.allocPrint(store.allocator, "key{d}", .{i});
+        defer store.allocator.free(key);
+
+        const value = try store.get(key);
+        defer store.allocator.free(value);
+    }
+    const read_end = std.time.nanoTimestamp();
+
+    return .{
+        .num_ops = numOps,
+        .write_time_ns = @intCast(write_end - write_start),
+        .read_time_ns = @intCast(read_end - read_start),
+        .total_time_ns = @intCast(read_end - write_start),
+    };
+}
+
+fn printBenchmarkStats(stats: BenchmarkStats, writer: *std.io.AnyWriter) !void {
+    try writer.print("Write time: {d} ms\n", .{stats.write_time_ns / NANOSECONDS_PER_MILLISECOND});
+    try writer.print("Read time: {d} ms\n", .{stats.read_time_ns / NANOSECONDS_PER_MILLISECOND});
+    try writer.print("Total time: {d} ms\n", .{stats.total_time_ns / NANOSECONDS_PER_MILLISECOND});
+    try writer.print("Write throughput: {d:.2} ops/sec\n", .{stats.writeOpsPerSec()});
+    try writer.print("Read throughput: {d:.2} ops/sec\n", .{stats.readOpsPerSec()});
+    try writer.print("Total throughput: {d:.2} ops/sec\n", .{stats.totalOpsPerSec()});
+}
+
 fn handleBenchmark(store: *Phage, numOps: []const u8, writer: *std.io.AnyWriter) !void {
     try writer.print("Benchmarking...\n", .{});
 
@@ -162,32 +229,14 @@ fn handleBenchmark(store: *Phage, numOps: []const u8, writer: *std.io.AnyWriter)
         try writer.print("Error: Invalid number of operations: {s}\n", .{@errorName(err)});
         return;
     };
-    const startWrite: usize = @intCast(std.time.nanoTimestamp());
 
-    for (0..numOpsInt) |i| {
-        const key = try std.fmt.allocPrint(store.allocator, "key{d}", .{i});
-        const value = try std.fmt.allocPrint(store.allocator, "value{d}", .{i});
-        store.put(key, value) catch |err| {
-            try writer.print("Error: Failed to put key '{s}': {s}\n", .{ key, @errorName(err) });
-            return;
-        };
-        _ = store.get(key) catch |err| {
-            try writer.print("Error: Failed to get key '{s}': {s}\n", .{ key, @errorName(err) });
-            return;
-        };
-        store.allocator.free(key);
-        store.allocator.free(value);
-    }
-    const endWrite: usize = @intCast(std.time.nanoTimestamp());
-    const elapsedTime: usize = endWrite - startWrite;
-    const elapsedTimeSec: usize = elapsedTime / 1_000_000_000;
-    const writeTime = (endWrite - startWrite) / 1_000_000;
-    const readTime = (endWrite - startWrite) / 1_000_000;
-    try writer.print("Write time: {d} ms\n", .{writeTime});
-    try writer.print("Read time: {d} ms\n", .{readTime});
-    try writer.print("Total time: {d} seconds\n", .{elapsedTimeSec});
-    log(.debug, .demon, "Benchmark completed. Write time: {d} ms, Read time: {d} ms", .{ writeTime, readTime });
-    log(.debug, .demon, "Total time: {d} seconds", .{elapsedTimeSec});
+    const stats = runBenchmark(store, numOpsInt) catch |err| {
+        try writer.print("Error: Benchmark failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+
+    try printBenchmarkStats(stats, writer);
+    log(.debug, .demon, "Benchmark completed. Write throughput: {d:.2} ops/sec, Read throughput: {d:.2} ops/sec", .{ stats.writeOpsPerSec(), stats.readOpsPerSec() });
     try writer.print("Benchmark completed.\n", .{});
 }
 
@@ -243,4 +292,44 @@ pub fn executeCommand(store: *Phage, allocator: std.mem.Allocator, input: []cons
         Command.exit => try handleExit(),
         Command.unknown => try handleUnknown(cmd, &writer),
     }
+}
+
+test "benchmark stats reports separate rates" {
+    const stats = BenchmarkStats{
+        .num_ops = 100,
+        .write_time_ns = 100_000_000,
+        .read_time_ns = 50_000_000,
+        .total_time_ns = 150_000_000,
+    };
+
+    try std.testing.expectEqual(@as(f64, 1000.0), stats.writeOpsPerSec());
+    try std.testing.expectEqual(@as(f64, 2000.0), stats.readOpsPerSec());
+    try std.testing.expectApproxEqAbs(@as(f64, 1333.3333333333333), stats.totalOpsPerSec(), 0.000000000001);
+}
+
+test "benchmark runner writes then reads and frees values" {
+    const FakeStore = struct {
+        allocator: std.mem.Allocator,
+        puts: usize = 0,
+        gets: usize = 0,
+
+        fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            _ = key;
+            _ = value;
+            self.puts += 1;
+        }
+
+        fn get(self: *@This(), key: []const u8) ![]u8 {
+            _ = key;
+            self.gets += 1;
+            return try self.allocator.dupe(u8, "value");
+        }
+    };
+
+    var store = FakeStore{ .allocator = std.testing.allocator };
+    const stats = try runBenchmark(&store, 3);
+
+    try std.testing.expectEqual(@as(usize, 3), store.puts);
+    try std.testing.expectEqual(@as(usize, 3), store.gets);
+    try std.testing.expectEqual(@as(u32, 3), stats.num_ops);
 }
