@@ -701,7 +701,7 @@ test "type hasher basics" {
 }
 
 fn testSerialize(comptime T: type, value: T) !void {
-    var data = std.ArrayList(u8).init(std.testing.allocator);
+    var data = std.array_list.Managed(u8).init(std.testing.allocator);
     defer data.deinit();
 
     try serialize(data.writer(), T, value);
@@ -765,7 +765,7 @@ test "serialize basics" {
 }
 
 fn testSerDesAlloc(comptime T: type, value: T) !void {
-    var data: std.ArrayList(u8) = .init(std.testing.allocator);
+    var data: std.array_list.Managed(u8) = .init(std.testing.allocator);
     defer data.deinit();
 
     try serialize(data.writer(), T, value);
@@ -779,7 +779,7 @@ fn testSerDesAlloc(comptime T: type, value: T) !void {
 }
 
 fn testSerDesPtrContentEquality(comptime T: type, value: T) !void {
-    var data = std.ArrayList(u8).init(std.testing.allocator);
+    var data = std.array_list.Managed(u8).init(std.testing.allocator);
     defer data.deinit();
 
     try serialize(data.writer(), T, value);
@@ -793,7 +793,7 @@ fn testSerDesPtrContentEquality(comptime T: type, value: T) !void {
 }
 
 fn testSerDesSliceContentEquality(comptime T: type, value: T) !void {
-    var data = std.ArrayList(u8).init(std.testing.allocator);
+    var data = std.array_list.Managed(u8).init(std.testing.allocator);
     defer data.deinit();
 
     try serialize(data.writer(), T, value);

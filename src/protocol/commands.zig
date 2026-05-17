@@ -274,7 +274,7 @@ pub fn executeCommand(store: *Phage, allocator: std.mem.Allocator, input: []cons
     }
     const cmd = tokens.next() orelse return error.InvalidCommand;
 
-    var writer = std.io.getStdOut().writer().any();
+    var writer = std.fs.File.stdout().deprecatedWriter().any();
 
     const command = parseCommand(cmd);
     std.log.debug("Command: {s}\n", .{cmd});

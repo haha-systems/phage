@@ -385,7 +385,7 @@ pub const Phage = struct {
         }
 
         // Find keys matching the pattern
-        var matches = std.ArrayList([]const u8).init(self.allocator);
+        var matches = std.array_list.Managed([]const u8).init(self.allocator);
         // Note: Don't defer deinit here, we need to return the items
 
         if (std.mem.eql(u8, clean_pattern, "*")) {
@@ -837,7 +837,9 @@ test "root:findKeys" {
     try store.put("key3", "value3");
 
     // Find keys with a specific pattern
-    _ = try store.findKeys("key*");
+    const keys = try store.findKeys("key*");
+    defer if (keys) |found_keys| allocator.free(found_keys);
+    try std.testing.expect(keys != null);
 
     // cleanup test db
     try testCleanup();

@@ -85,7 +85,7 @@ pub const Trie = struct {
     pub fn findKeysWithPrefix(
         self: *const Trie,
         prefix: []const u8,
-        results: *std.ArrayList([]const u8),
+        results: *std.array_list.Managed([]const u8),
     ) !void {
         var current = self.root;
 
@@ -100,7 +100,7 @@ pub const Trie = struct {
     }
 
     // Returns all keys in the trie
-    pub fn getAllKeys(self: *const Trie, results: *std.ArrayList([]const u8)) !void {
+    pub fn getAllKeys(self: *const Trie, results: *std.array_list.Managed([]const u8)) !void {
         // Collect all keys with depth-first search
         try self.collectKeys(self.root, results);
     }
@@ -109,7 +109,7 @@ pub const Trie = struct {
     fn collectKeys(
         self: *const Trie,
         node: *const Node,
-        results: *std.ArrayList([]const u8),
+        results: *std.array_list.Managed([]const u8),
     ) !void {
         if (node.is_terminal) {
             const key = node.key orelse return error.InvalidKey;
@@ -126,12 +126,12 @@ pub const Trie = struct {
     /// and then using the regex pattern to filter the results.
     /// The regex pattern should be a valid regex string.
     /// The results are stored in the provided ArrayList.
-    pub fn matchRegex(self: *const Trie, pattern: []const u8, results: *std.ArrayList([]const u8)) !void {
+    pub fn matchRegex(self: *const Trie, pattern: []const u8, results: *std.array_list.Managed([]const u8)) !void {
         std.log.debug("Matching regex: {s}", .{pattern});
         const compiled_regex = regex.compile(pattern) orelse return error.InvalidRegex;
 
         // Get all keys first
-        var all_keys = std.ArrayList([]const u8).init(self.allocator);
+        var all_keys = std.array_list.Managed([]const u8).init(self.allocator);
         defer all_keys.deinit();
 
         try self.getAllKeys(&all_keys);
@@ -168,7 +168,7 @@ test "trie:find_keys_with_prefix" {
     try trie.insert("hell");
     try trie.insert("worldss");
 
-    var results = std.ArrayList([]const u8).init(allocator);
+    var results = std.array_list.Managed([]const u8).init(allocator);
     defer results.deinit();
 
     try trie.findKeysWithPrefix("he", &results);
@@ -188,7 +188,7 @@ test "trie:match_regex" {
     try trie.insert("hell");
     try trie.insert("worlds");
 
-    var results = std.ArrayList([]const u8).init(allocator);
+    var results = std.array_list.Managed([]const u8).init(allocator);
     defer results.deinit();
 
     try trie.matchRegex("he.*", &results);
