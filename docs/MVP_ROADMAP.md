@@ -52,10 +52,10 @@ Phage's core key/value store, persistence/WAL code, sharded index, and native be
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Multi-client behavior | TODO | Current ZeroMQ server loop needs explicit runtime verification. |
-| Graceful shutdown | TODO | Tracked by production-readiness slices. |
-| Structured logging/metrics | TODO | Should avoid local config mutation. |
-| Sustained smoke/leak checks | TODO | Needed before production claims. |
+| Multi-client behavior | TODO | Live ZeroMQ runtime verification is still blocked until the server is restored to the build graph. |
+| Graceful shutdown | Source-present / unit-tested helper | `src/server/runtime.zig` covers SIGINT/SIGTERM shutdown state and `src/zserver.zig` checks it, but live server smoke remains blocked by missing build graph support. |
+| Structured logging/metrics | In progress / tested core counters | Core storage exposes `store.metrics.snapshot()` for read/write/delete counts, error counts, and total latencies; server source logs lifecycle and shutdown metric snapshots. |
+| Sustained smoke/leak checks | Documented core smoke | Use `zig build test` plus `zig build -Doptimize=ReleaseFast benchmark -- 5000 --mode memory --value-size 16 --batch-size 64` for the supported no-artifact smoke path. |
 
 ## Verification commands
 

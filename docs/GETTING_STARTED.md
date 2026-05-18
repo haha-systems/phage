@@ -51,6 +51,12 @@ The protocol `BENCHMARK` command is separate from this native benchmark runner. 
 
 `src/zserver.zig` contains a ZeroMQ REP server implementation with command-line options for port, database path, and requested log level. It is not currently installed by the default build graph, so the examples below document the protocol behavior rather than a copy-paste-ready server launch workflow.
 
+Runtime readiness notes:
+
+- `src/server/runtime.zig` provides the server shutdown state used by `src/zserver.zig` for SIGINT/SIGTERM handling. The server loop checks this state and logs shutdown metrics before resources deinitialize, but a live server smoke still depends on a future build-graph/ZeroMQ wiring slice.
+- Lifecycle logs use structured key/value-style messages for server start, bind, receive errors, and shutdown.
+- Core storage exposes `store.metrics.snapshot()` with read/write/delete operation counts, error counts, and accumulated latency nanoseconds. `putBatch` records one write per key/value pair.
+
 The parser accepts these commands:
 
 ```text
@@ -91,11 +97,22 @@ DELETE greeting
 # OK
 ```
 
+## Sustained smoke/readiness checks
+
+Use the full test suite plus a disposable in-memory sustained benchmark smoke before making runtime-readiness claims:
+
+```sh
+zig build test
+zig build -Doptimize=ReleaseFast benchmark -- 5000 --mode memory --value-size 16 --batch-size 64
+```
+
+The benchmark command above avoids local database/WAL artifacts. It is a cheap leak/FD sanity smoke for the supported core benchmark path; it is not a substitute for a future live multi-client ZeroMQ server smoke once the server is restored to the build graph.
+
 ## Current limitations
 
 - The ZeroMQ server is source-present but not exposed as a default `zig build` run/install artifact.
+- Live multi-client server behavior still needs runtime verification after server build support is restored.
 - The old external Demon client examples are not part of this repository and are not required for the supported test/benchmark workflow.
-- Multi-client behavior, graceful shutdown, and production runtime observability are tracked as later production-readiness work.
 - Server log-level configuration is parsed and printed, but Zig log filtering is still compile-time constrained.
 
 ## Troubleshooting
