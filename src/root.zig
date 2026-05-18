@@ -269,43 +269,68 @@ pub const Phage = struct {
     ///
     /// This function performs the following steps:
     /// 1. Retrieves the entry from the index using the key.
-    /// 2. Allocates a buffer to read the entry from the main database file.
-    /// 3. Reads the entry from the main database file.
-    /// 4. Validates the key and extracts the value.
-    /// 5. Returns the value to the caller.
+    /// 2. Allocates a value-sized buffer.
+    /// 3. Reads the value through `getInto`.
+    /// 4. Returns the value to the caller.
     ///
     /// The caller is responsible for freeing the returned value.
     /// If the key is not found, an error is returned.
     pub fn get(self: *Phage, key: []const u8) ![]u8 {
-        std.log.debug("Getting key: {s}", .{key});
-
-        // strip newline characters from key first
         const trimmed_key = std.mem.trimRight(u8, key, "\r\n");
-
         const entry = self.index.get(trimmed_key) orelse {
             std.log.debug("Key not found: {s}", .{key});
             return error.KeyNotFound;
         };
 
-        const buf = try self.allocator.alloc(u8, entry.len);
-        defer self.allocator.free(buf);
+        const value = try self.allocator.alloc(u8, entry.val_len);
+        errdefer self.allocator.free(value);
+        return try self.getInto(trimmed_key, value);
+    }
 
-        const ops_submitted = try self.backend.read(self.fd, buf, entry.offset);
-        if (ops_submitted < 1) {
+    /// Reads a value into caller-provided storage and returns the populated slice.
+    ///
+    /// The caller retains ownership of `buffer`; the returned slice points inside
+    /// it and remains valid until the caller reuses or frees the buffer. The
+    /// buffer must be at least as large as the stored value length.
+    pub fn getInto(self: *Phage, key: []const u8, buffer: []u8) ![]u8 {
+        std.log.debug("Getting key into caller buffer: {s}", .{key});
+
+        const trimmed_key = std.mem.trimRight(u8, key, "\r\n");
+        const entry = self.index.get(trimmed_key) orelse {
+            std.log.debug("Key not found: {s}", .{key});
+            return error.KeyNotFound;
+        };
+        if (buffer.len < entry.val_len) return error.InsufficientBuffer;
+
+        const header_size = @sizeOf(index.EntryHeader);
+        var header_buf: [header_size]u8 = undefined;
+        try self.readDataInto(&header_buf, entry.offset);
+        const header: index.EntryHeader = @bitCast(header_buf);
+        if (header.key_len != entry.key_len or header.val_len != entry.val_len) {
             return error.ReadError;
         }
+        if (header.key_len != trimmed_key.len) return error.KeyMismatch;
 
-        try waitForIO(self);
+        var key_offset: usize = 0;
+        var chunk_buf: [256]u8 = undefined;
+        while (key_offset < entry.key_len) {
+            const chunk_len = @min(chunk_buf.len, entry.key_len - key_offset);
+            const chunk = chunk_buf[0..chunk_len];
+            try self.readDataInto(chunk, entry.offset + header_size + key_offset);
+            const expected = trimmed_key[key_offset..][0..chunk_len];
+            if (!std.mem.eql(u8, chunk, expected)) return error.KeyMismatch;
+            key_offset += chunk_len;
+        }
 
-        const key_start = @sizeOf(index.EntryHeader);
-        const stored_key = buf[key_start..][0..entry.key_len];
-        if (!std.mem.eql(u8, stored_key, trimmed_key)) return error.KeyMismatch;
+        const value = buffer[0..entry.val_len];
+        try self.readDataInto(value, entry.offset + header_size + entry.key_len);
+        return value;
+    }
 
-        const val_start = key_start + entry.key_len;
-        const value = buf[val_start..][0..entry.val_len];
-
-        // note: caller (and their allocator) now owns the value
-        return try self.allocator.dupe(u8, value);
+    fn readDataInto(self: *Phage, buffer: []u8, offset: usize) !void {
+        const ops_submitted = try self.backend.read(self.fd, buffer, offset);
+        if (ops_submitted < 1) return error.ReadError;
+        try self.waitForIO();
     }
 
     /// Deletes a key-value pair from the database using the provided key.
@@ -1010,6 +1035,55 @@ test "root:put_and_get_key_value" {
     try std.testing.expectEqualStrings("value2", val2);
 
     // cleanup test db
+    try testCleanup();
+}
+
+test "root:getInto reads value into caller buffer" {
+    const allocator = std.testing.allocator;
+    var store = try Phage.init(allocator, root_test_path);
+    defer store.deinit();
+    errdefer testCleanup() catch unreachable;
+
+    try store.put("buffered-key", "buffered-value");
+
+    var buffer: [64]u8 = undefined;
+    const value = try store.getInto("buffered-key", &buffer);
+
+    try std.testing.expectEqualStrings("buffered-value", value);
+    try std.testing.expectEqual(@intFromPtr(buffer[0..].ptr), @intFromPtr(value.ptr));
+
+    try testCleanup();
+}
+
+test "root:getInto rejects insufficient caller buffer" {
+    const allocator = std.testing.allocator;
+    var store = try Phage.init(allocator, root_test_path);
+    defer store.deinit();
+    errdefer testCleanup() catch unreachable;
+
+    try store.put("small-buffer-key", "too-large");
+
+    var buffer: [3]u8 = undefined;
+    try std.testing.expectError(error.InsufficientBuffer, store.getInto("small-buffer-key", &buffer));
+
+    try testCleanup();
+}
+
+test "root:getInto reports missing keys and key mismatches" {
+    const allocator = std.testing.allocator;
+    var store = try Phage.init(allocator, root_test_path);
+    defer store.deinit();
+    errdefer testCleanup() catch unreachable;
+
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectError(error.KeyNotFound, store.getInto("missing-key", &buffer));
+
+    try store.put("stored-key", "stored-value");
+    const entry = store.index.get("stored-key").?;
+    try store.index.put(allocator, "alias-key", entry);
+
+    try std.testing.expectError(error.KeyMismatch, store.getInto("alias-key", &buffer));
+
     try testCleanup();
 }
 
