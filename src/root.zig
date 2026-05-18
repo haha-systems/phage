@@ -13,6 +13,7 @@ pub const protocol = @import("protocol/protocol.zig");
 const index = @import("index.zig");
 const io = @import("io/io.zig");
 const Backend = io.Backend;
+const WriteOperation = io.backend.WriteOperation;
 const Wal = io.wal.Wal;
 
 const data_structures = @import("data_structures/data_structures.zig");
@@ -176,18 +177,18 @@ pub const Phage = struct {
         defer self.allocator.free(data_entry);
 
         const data_offset = self.file_size.fetchAdd(data_entry.len, .monotonic);
-        var ops_submitted = try self.backend.write(self.fd, data_entry, data_offset);
-        if (ops_submitted < 1) {
-            return error.WriteError;
-        }
 
         // Step 2: Write final WAL entry with the known offset (skip provisional entry)
         const final_wal_entry = try self.formatWalEntry(.put, key, value, data_offset);
         defer self.allocator.free(final_wal_entry);
 
         const wal_offset = self.wal_file_size.fetchAdd(final_wal_entry.len, .monotonic);
-        ops_submitted = try self.writeToWal(final_wal_entry, wal_offset);
-        if (ops_submitted < 1) {
+        const writes = [_]WriteOperation{
+            .{ .fd = self.fd, .buf = data_entry, .offset = data_offset },
+            .{ .fd = self.wal_fd, .buf = final_wal_entry, .offset = wal_offset },
+        };
+        const ops_submitted = try self.backend.writeMany(&writes);
+        if (ops_submitted != writes.len) {
             return error.WriteError;
         }
 
@@ -231,22 +232,20 @@ pub const Phage = struct {
             wal_offset.* += wal_base_offset;
         }
 
-        // Step 1: Write all data entries as one contiguous main-file write
-        const data_ops_submitted = try self.backend.write(self.fd, data_batch.buffer, data_base_offset);
-        if (data_ops_submitted < 1) {
+        // Step 1: Queue the coalesced main-file and WAL writes together.
+        const writes = [_]WriteOperation{
+            .{ .fd = self.fd, .buf = data_batch.buffer, .offset = data_base_offset },
+            .{ .fd = self.wal_fd, .buf = wal_batch.buffer, .offset = wal_base_offset },
+        };
+        const ops_submitted = try self.backend.writeMany(&writes);
+        if (ops_submitted != writes.len) {
             return error.WriteError;
         }
 
-        // Step 2: Write all WAL entries as one contiguous WAL write
-        const wal_ops_submitted = try self.writeToWal(wal_batch.buffer, wal_base_offset);
-        if (wal_ops_submitted < 1) {
-            return error.WriteError;
-        }
-
-        // Step 3: Wait for all I/O operations to complete (single wait for entire batch)
+        // Step 2: Wait for all I/O operations to complete (single wait for entire batch)
         try self.waitForIO();
 
-        // Step 4: Update index for all entries, batching by shard so each shard is locked once
+        // Step 3: Update index for all entries, batching by shard so each shard is locked once
         const index_entries = try self.allocator.alloc(index.IndexManager.BatchEntry, pairs.len);
         defer self.allocator.free(index_entries);
         for (pairs, 0..) |pair, i| {
