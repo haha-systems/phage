@@ -45,7 +45,7 @@ The ZeroMQ server source in `src/zserver.zig` contains structured lifecycle logg
 | Native benchmark runner | Active | Supports cheap memory and persisted one-shot smoke runs through the `benchmark` build step. |
 | Benchmark matrix workflow | Active / implemented for review | `bench/benchmark-matrix.sh --quick --output /tmp/phage-benchmark-matrix.jsonl` emits row-level JSON Lines and `/tmp/phage-benchmark-matrix-summary.json`; `--profile full` covers memory/persisted, batch sizes `1/16/64`, value sizes `16/256`, and `get`/`get-into` read APIs. Current macOS fallback quick baseline: memory `11.90M` total ops/sec, persisted `1.16M` total ops/sec; see [macOS POSIX-fallback benchmark baseline](benchmarks/2026-05-18-macos-fallback-baseline.md). |
 | Benchmark output/reporting | Active / reviewed | Human output remains default for one-shot runs; `--json` emits machine-readable mode/count/value/batch/latency/throughput fields, and matrix summaries add reproducibility metadata without replacing one-shot JSON. |
-| Linux io_uring verification | Blocked waiting for Linux host | Current worker evidence is macOS POSIX fallback only. Use the Linux verification runbook to collect quick and fuller `linux-io-uring` matrix artifacts on a Linux host before making final backend performance claims. |
+| Linux io_uring verification | Deferred with remediation | OrbStack Ubuntu 24.04 arm64 produced real `linux-io-uring` matrix evidence (`row_count=2` quick, `row_count=24` with `--profile linux-io-uring --ops 1000`) and representative persisted rows are recorded in [Linux io_uring benchmark verification](benchmarks/2026-05-18-linux-io-uring-verification.md). The same Linux host exposed a `zig build test` failure in `write_ahead_log:recover_committed_empty_put_at_zero_offset`; fix tracked by Kanban card `t_c54e96cd` before claiming the full Linux correctness gate is green. |
 
 ### Phase 2: Protocol and server MVP
 
@@ -102,7 +102,7 @@ bench/benchmark-matrix.sh --profile full --output /tmp/phage-benchmark-matrix-fu
 python3 -m json.tool /tmp/phage-benchmark-matrix-full-summary.json >/dev/null
 ```
 
-Backend note: macOS runs the POSIX fallback path. Linux is the target platform for `io_uring` fast-path performance and should be used for final Linux backend benchmarking; see [Linux io_uring benchmark verification runbook](benchmarks/2026-05-18-linux-io-uring-verification.md) for the required Linux commands and expected `/tmp` artifacts. The current macOS quick-profile fallback baseline is recorded in [macOS POSIX-fallback benchmark baseline](benchmarks/2026-05-18-macos-fallback-baseline.md).
+Backend note: macOS runs the POSIX fallback path. Linux is the target platform for `io_uring` fast-path performance. OrbStack Ubuntu 24.04 now provides Linux matrix evidence, but the full Linux correctness gate is deferred by a `zig build test` failure tracked in Kanban card `t_c54e96cd`; see [Linux io_uring benchmark verification](benchmarks/2026-05-18-linux-io-uring-verification.md) for representative rows, required commands, and remediation status. The current macOS quick-profile fallback baseline is recorded in [macOS POSIX-fallback benchmark baseline](benchmarks/2026-05-18-macos-fallback-baseline.md).
 
 Server status check:
 

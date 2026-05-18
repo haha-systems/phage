@@ -99,7 +99,7 @@ Matrix row JSON Lines include stable automation fields from the one-shot benchma
 ### Platform notes
 
 - macOS uses the POSIX fallback backend. It is suitable for correctness tests and local smoke checks, including persisted smokes with an explicit `/tmp/...` path. The current quick-profile fallback baseline is recorded in [macOS POSIX-fallback benchmark baseline](benchmarks/2026-05-18-macos-fallback-baseline.md).
-- Linux is the intended high-performance target for the `io_uring` backend. Linux-only backend changes should still keep macOS tests green, but final `io_uring` performance claims need a Linux host; see the [Linux io_uring benchmark verification runbook](benchmarks/2026-05-18-linux-io-uring-verification.md) for required commands and artifacts.
+- Linux is the intended high-performance target for the `io_uring` backend. The current Linux verification note records OrbStack Ubuntu 24.04 matrix evidence with `metadata.backend_status=linux-io-uring-intended`, but the full Linux correctness gate is deferred because `zig build test` exposed an `io_uring` WAL empty-value recovery failure tracked by Kanban card `t_c54e96cd`; see the [Linux io_uring benchmark verification note](benchmarks/2026-05-18-linux-io-uring-verification.md) for commands, representative rows, and the remediation status.
 - Memory-mode benchmark examples are portable and avoid generated database/WAL artifacts.
 
 ## Server/protocol status
