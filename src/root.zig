@@ -218,9 +218,9 @@ pub const Phage = struct {
         // Step 4a: Clear the WAL file now that the entry is complete
         try Wal.clear(self);
 
-        // Step 4b: Check if compaction is needed (non-blocking)
+        // Step 4b: Check if compaction is needed (runs inline when threshold is reached)
         self.checkAndScheduleCompaction() catch |err| {
-            std.log.warn("Failed to schedule compaction: {s}", .{@errorName(err)});
+            std.log.warn("Failed to perform compaction: {s}", .{@errorName(err)});
         };
 
         self.metrics.recordWrite(elapsedNsSince(metrics_start));
@@ -281,9 +281,9 @@ pub const Phage = struct {
         // Step 5: Clear the WAL file now that all batch entries are complete
         try Wal.clear(self);
 
-        // Step 6: Check compaction only once for the entire batch
+        // Step 6: Check compaction only once for the entire batch; compaction runs inline when needed.
         self.checkAndScheduleCompaction() catch |err| {
-            std.log.warn("Failed to schedule compaction: {s}", .{@errorName(err)});
+            std.log.warn("Failed to perform compaction: {s}", .{@errorName(err)});
         };
 
         self.metrics.recordWrites(@intCast(pairs.len), elapsedNsSince(metrics_start));
@@ -624,8 +624,9 @@ pub const Phage = struct {
         return wal_size_f / main_size_f;
     }
 
-    /// Check if compaction is needed and schedule it if necessary.
-    /// This function is non-blocking and will not interfere with ongoing operations.
+    /// Check if compaction is needed and perform it inline if necessary.
+    /// The in-progress flag prevents overlapping compactions, but callers pay
+    /// the compaction cost when the threshold is reached.
     fn checkAndScheduleCompaction(self: *Phage) !void {
         // Skip if compaction is already in progress
         if (self.compaction_in_progress.load(.acquire)) {
@@ -638,9 +639,8 @@ pub const Phage = struct {
 
             // Set compaction flag atomically
             if (self.compaction_in_progress.cmpxchgWeak(false, true, .acquire, .acquire) == null) {
-                // We successfully set the flag, schedule background compaction
+                defer self.compaction_in_progress.store(false, .release);
                 try self.performCompaction();
-                self.compaction_in_progress.store(false, .release);
                 std.log.info("Compaction completed successfully", .{});
             }
         }
@@ -651,6 +651,14 @@ pub const Phage = struct {
     fn performCompaction(self: *Phage) !void {
         const temp_path = try std.fmt.allocPrint(self.allocator, "{s}.compact.tmp", .{self.store_path});
         defer self.allocator.free(temp_path);
+        errdefer std.posix.unlink(temp_path) catch {};
+
+        // Remove any stale temp file before opening with EXCL so compaction never
+        // follows or truncates a pre-existing path at the predictable temp name.
+        std.posix.unlink(temp_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
 
         // Create temporary file for compacted data
         const temp_fd = try std.posix.open(
@@ -658,6 +666,7 @@ pub const Phage = struct {
             .{
                 .ACCMODE = .RDWR,
                 .CREAT = true,
+                .EXCL = true,
                 .TRUNC = true,
                 .CLOEXEC = true,
             },
@@ -667,9 +676,19 @@ pub const Phage = struct {
 
         var new_offset: usize = 0;
         var entries_compacted: usize = 0;
+        const PendingOffsetUpdate = struct {
+            shard_index: usize,
+            key: []const u8,
+            offset: usize,
+        };
+        const offset_updates = try self.allocator.alloc(PendingOffsetUpdate, self.index.count());
+        defer self.allocator.free(offset_updates);
+        var offset_update_count: usize = 0;
 
-        // Iterate through all entries in the index and write them to the new file
-        for (self.index.shards) |*shard| {
+        // Iterate through all entries in the index and write them to the new file.
+        // Publish new index offsets only after every entry is copied and the file
+        // swap succeeds, so a failed compaction leaves the old file/index usable.
+        for (self.index.shards, 0..) |*shard, shard_index| {
             shard.mutex.lock();
             defer shard.mutex.unlock();
 
@@ -692,8 +711,15 @@ pub const Phage = struct {
                     return error.WriteError;
                 }
 
-                // Update the index entry with the new offset
-                entry.value_ptr.*.offset = new_offset;
+                if (offset_update_count >= offset_updates.len) {
+                    return error.IndexChangedDuringCompaction;
+                }
+                offset_updates[offset_update_count] = .{
+                    .shard_index = shard_index,
+                    .key = entry.key_ptr.*,
+                    .offset = new_offset,
+                };
+                offset_update_count += 1;
                 new_offset += entry_buf.len;
                 entries_compacted += 1;
             }
@@ -701,6 +727,15 @@ pub const Phage = struct {
 
         // Atomically replace the old file with the new one
         try self.atomicFileSwap(temp_path, self.store_path);
+
+        for (offset_updates[0..offset_update_count]) |offset_update| {
+            const shard = &self.index.shards[offset_update.shard_index];
+            shard.mutex.lock();
+            defer shard.mutex.unlock();
+            if (shard.map.getPtr(offset_update.key)) |index_entry| {
+                index_entry.offset = offset_update.offset;
+            }
+        }
 
         // Update file size
         self.file_size.store(new_offset, .monotonic);
@@ -710,17 +745,16 @@ pub const Phage = struct {
 
     /// Atomically swap the temporary compacted file with the main database file.
     fn atomicFileSwap(self: *Phage, temp_path: []const u8, target_path: []const u8) !void {
-        // Wait for all pending I/O operations to complete before closing the file
+        // Wait for all pending I/O operations to complete before swapping files.
         try self.waitForIO();
 
-        // Close the current file descriptor
-        std.posix.close(self.fd);
-
-        // Rename temp file to target (atomic on most filesystems)
+        // Rename temp file to target (atomic on most filesystems). Keep the old
+        // descriptor open until the replacement is reopened successfully so a
+        // rename failure does not leave the live store with a closed fd.
+        const old_fd = self.fd;
         try std.posix.rename(temp_path, target_path);
 
-        // Reopen the file
-        self.fd = try std.posix.open(
+        const new_fd = try std.posix.open(
             target_path,
             .{
                 .ACCMODE = .RDWR,
@@ -728,6 +762,8 @@ pub const Phage = struct {
             },
             0,
         );
+        self.fd = new_fd;
+        std.posix.close(old_fd);
     }
 
     /// Waits for all pending I/O operations to complete.

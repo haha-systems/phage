@@ -9,6 +9,7 @@ const Phage = phage.Phage;
 const compaction_test_dir = ".zig-cache/phage-tests";
 const compaction_test_path = compaction_test_dir ++ "/compaction_correctness.db";
 const compaction_wal_boundary_path = compaction_test_dir ++ "/compaction_wal_boundary.db";
+const compaction_error_path = compaction_test_dir ++ "/compaction_error_cleanup.db";
 
 test "wal_compaction: repeated updates compact to latest readable index entries" {
     const allocator = std.testing.allocator;
@@ -94,6 +95,76 @@ test "wal_compaction: recovery replays WAL delete after compacted index rebuild"
         const wal_stat = try std.posix.fstat(recovered.wal_fd);
         try std.testing.expectEqual(@as(i64, 0), wal_stat.size);
     }
+}
+
+test "wal_compaction: failed inline compaction resets flag and removes temp file" {
+    const allocator = std.testing.allocator;
+    try std.fs.cwd().makePath(compaction_test_dir);
+    cleanupPath(compaction_error_path);
+    defer cleanupPath(compaction_error_path);
+
+    var store = try Phage.init(allocator, compaction_error_path);
+    defer store.deinit();
+
+    const early_key = findCompactionTestKey(.early);
+    const late_key = findCompactionTestKey(.late);
+    const dangling_key = findCompactionTestKey(.dangling);
+
+    store.compaction_threshold = 2.0;
+    try store.put(late_key, "late-v0");
+    try store.put(early_key, "early-v0");
+
+    try store.index.put(allocator, dangling_key, .{
+        .offset = 1_000_000,
+        .len = @sizeOf(index.EntryHeader) + dangling_key.len + "x".len,
+        .key_len = dangling_key.len,
+        .val_len = "x".len,
+    });
+
+    store.compaction_threshold = 0.0;
+    try store.put("trigger", "trigger-v0");
+
+    try std.testing.expect(!store.compaction_in_progress.load(.acquire));
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(compaction_error_path ++ ".compact.tmp", .{}));
+    try expectIndexEntryReadsValue(&store, late_key, "late-v0");
+    try expectIndexEntryReadsValue(&store, early_key, "early-v0");
+    try expectIndexEntryReadsValue(&store, "trigger", "trigger-v0");
+}
+
+const CompactionFailureKeyRole = enum { early, late, dangling };
+
+fn findCompactionTestKey(comptime role: CompactionFailureKeyRole) []const u8 {
+    const candidates = [_][]const u8{
+        "compact-key-00", "compact-key-01", "compact-key-02", "compact-key-03",
+        "compact-key-04", "compact-key-05", "compact-key-06", "compact-key-07",
+        "compact-key-08", "compact-key-09", "compact-key-10", "compact-key-11",
+        "compact-key-12", "compact-key-13", "compact-key-14", "compact-key-15",
+        "compact-key-16", "compact-key-17", "compact-key-18", "compact-key-19",
+        "compact-key-20", "compact-key-21", "compact-key-22", "compact-key-23",
+        "compact-key-24", "compact-key-25", "compact-key-26", "compact-key-27",
+        "compact-key-28", "compact-key-29", "compact-key-30", "compact-key-31",
+    };
+
+    const target_shard: usize = switch (role) {
+        .early => 0,
+        .late => 15,
+        .dangling => 15,
+    };
+    const skip_first_late = role == .dangling;
+    var seen_late = false;
+    for (candidates) |candidate| {
+        if (compactionTestShard(candidate) != target_shard) continue;
+        if (skip_first_late and !seen_late) {
+            seen_late = true;
+            continue;
+        }
+        return candidate;
+    }
+    @panic("compaction test key candidates must cover early and late shards");
+}
+
+fn compactionTestShard(key: []const u8) usize {
+    return std.hash.Wyhash.hash(0xdeadbeef, key) & 15;
 }
 
 fn createCompactedStore(store: *Phage, allocator: std.mem.Allocator) !void {
