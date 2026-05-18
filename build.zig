@@ -157,6 +157,7 @@ pub fn build(b: *std.Build) void {
     });
     benchmark_unit_tests.root_module.addImport("phage", lib_mod);
     const run_benchmark_unit_tests = b.addRunArtifact(benchmark_unit_tests);
+    const benchmark_matrix_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "bench/test_benchmark_matrix.py" });
 
     const compaction_tests_mod = b.createModule(.{
         .root_source_file = b.path("src/test_wal_compaction_correctness.zig"),
@@ -208,6 +209,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_benchmark_unit_tests.step);
+    test_step.dependOn(&benchmark_matrix_tests.step);
     test_step.dependOn(&run_compaction_unit_tests.step);
     test_step.dependOn(&run_protocol_command_tests.step);
     test_step.dependOn(&run_server_config_tests.step);
