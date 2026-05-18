@@ -94,7 +94,7 @@ Matrix row JSON Lines include stable automation fields from the one-shot benchma
 ### Platform notes
 
 - macOS uses the POSIX fallback backend. It is suitable for correctness tests and local smoke checks, including persisted smokes with an explicit `/tmp/...` path.
-- Linux is the intended high-performance target for the `io_uring` backend. Linux-only backend changes should still keep macOS tests green, but final `io_uring` performance claims need a Linux host.
+- Linux is the intended high-performance target for the `io_uring` backend. Linux-only backend changes should still keep macOS tests green, but final `io_uring` performance claims need a Linux host; see the [Linux io_uring benchmark verification runbook](benchmarks/2026-05-18-linux-io-uring-verification.md) for required commands and artifacts.
 - Memory-mode benchmark examples are portable and avoid generated database/WAL artifacts.
 
 ## Server/protocol status
@@ -207,3 +207,4 @@ Use `KEYS *` for all keys. For prefixes, prefer regex-style patterns such as `KE
 
 - [API Reference](API_REFERENCE.md)
 - [MVP Roadmap](MVP_ROADMAP.md)
+- [Linux io_uring benchmark verification runbook](benchmarks/2026-05-18-linux-io-uring-verification.md)

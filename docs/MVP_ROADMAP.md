@@ -45,6 +45,7 @@ The ZeroMQ server source in `src/zserver.zig` contains structured lifecycle logg
 | Native benchmark runner | Active | Supports cheap memory and persisted one-shot smoke runs through the `benchmark` build step. |
 | Benchmark matrix workflow | Active / implemented for review | `bench/benchmark-matrix.sh --quick --output /tmp/phage-benchmark-matrix.jsonl` emits row-level JSON Lines and `/tmp/phage-benchmark-matrix-summary.json`; `--profile full` covers memory/persisted, batch sizes `1/16/64`, value sizes `16/256`, and `get`/`get-into` read APIs. |
 | Benchmark output/reporting | Active / reviewed | Human output remains default for one-shot runs; `--json` emits machine-readable mode/count/value/batch/latency/throughput fields, and matrix summaries add reproducibility metadata without replacing one-shot JSON. |
+| Linux io_uring verification | Blocked waiting for Linux host | Current worker evidence is macOS POSIX fallback only. Use the Linux verification runbook to collect quick and fuller `linux-io-uring` matrix artifacts on a Linux host before making final backend performance claims. |
 
 ### Phase 2: Protocol and server MVP
 
@@ -96,7 +97,7 @@ bench/benchmark-matrix.sh --quick --output /tmp/phage-benchmark-matrix.jsonl
 python3 -m json.tool /tmp/phage-benchmark-matrix-summary.json >/dev/null
 ```
 
-Backend note: macOS runs the POSIX fallback path. Linux is the target platform for `io_uring` fast-path performance and should be used for final Linux backend benchmarking.
+Backend note: macOS runs the POSIX fallback path. Linux is the target platform for `io_uring` fast-path performance and should be used for final Linux backend benchmarking; see [Linux io_uring benchmark verification runbook](benchmarks/2026-05-18-linux-io-uring-verification.md) for the required Linux commands and expected `/tmp` artifacts.
 
 Server status check:
 
@@ -123,3 +124,4 @@ zig build run-server -- --help
 
 - [Getting Started](GETTING_STARTED.md)
 - [API Reference](API_REFERENCE.md)
+- [Linux io_uring benchmark verification runbook](benchmarks/2026-05-18-linux-io-uring-verification.md)
