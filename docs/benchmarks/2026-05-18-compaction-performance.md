@@ -1,7 +1,7 @@
 # Compaction benchmark and status evidence — 2026-05-18
 
-Status: S3 curated evidence for the compaction performance and safety PRD.
-PRD slice: S3 — document compaction benchmark evidence and user-facing status.
+Status: S3 curated evidence plus S4 Linux `io_uring` verification for the compaction performance and safety PRD.
+PRD slices: S3 — document compaction benchmark evidence and user-facing status; S4 — verify compaction on Linux `io_uring`.
 
 This note records curated benchmark and review evidence only. Raw JSONL, summary JSON, database, WAL, `.compact.tmp`, and log artifacts are local run outputs and are intentionally not committed.
 
@@ -66,12 +66,74 @@ Interpretation:
 
 ## Linux `io_uring` status
 
-No compaction-specific Linux `io_uring` benchmark row has been accepted in this S3 slice. That verification is intentionally separated into the downstream S4 Linux compaction card so macOS POSIX-fallback evidence is not conflated with Linux backend evidence.
+S4 verified the compaction path on the intended Linux backend. These rows are Linux `io_uring` evidence and must not be mixed into the macOS POSIX-fallback table above.
 
-Current related Linux status:
+Host/tool metadata for the accepted Linux evidence:
 
-- The WAL write-path Linux verification is already documented in [Linux io_uring benchmark verification](2026-05-18-linux-io-uring-verification.md), but those are WAL/matrix rows, not compaction-profile evidence.
-- A future compaction Linux run should record `uname -a`, `zig version`, full git revision, `metadata.backend_status=linux-io-uring-intended`, `zig build test`, `bench/benchmark-matrix.sh --profile compaction ...`, summary JSON validation, representative compaction fields, and cleanup status.
+- S4 verification git revision: `7f1d25c8e2100309a0c33551fe515491aab524df` — `fix(io): serialize compaction with store reads`.
+- Included accepted compaction benchmark/safety history: `7cffd33` (S1 compaction profile), `f86c4a8` (S2 failed-compaction cleanup), and subsequent compaction serialization hardening commits present in current HEAD.
+- Host: OrbStack machine `phage-linux`, Ubuntu 24.04 arm64.
+- `uname -a`: `Linux phage-linux 7.0.5-orbstack-00330-ge3df4e19b0a0-dirty #1 SMP PREEMPT Sun May 10 11:47:42 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux`.
+- Zig version: `0.15.2`.
+- Python version: `3.12.3`; git version: `2.43.0`.
+- Backend status: `linux-io-uring-intended`.
+- Clone path for the run: `/tmp/phage-s4-716/repo`, cloned from `/mnt/mac/Users/xiy/code/phage`; initial clone `git status --short --untracked-files=all` was empty.
+- Tooling note: the machine already had `/usr/local/bin/zig` pointing at `/tmp/zig-aarch64-linux-0.15.2/zig`; the target had gone stale, so the worker rehydrated the same Zig `0.15.2` tarball under `/tmp` before running checks. No package-manager, OrbStack, or repository configuration was changed.
+
+Commands run on Linux:
+
+```sh
+git clone /mnt/mac/Users/xiy/code/phage /tmp/phage-s4-716/repo
+cd /tmp/phage-s4-716/repo
+git status --short --untracked-files=all
+git rev-parse HEAD
+uname -a
+zig version
+zig build test
+
+zig build -Doptimize=ReleaseFast benchmark -- 64 --profile compaction --mode persisted --value-size 64 --update-rounds 2 --read-api get-into --json --db-path /tmp/phage-s4-716-direct-db > /tmp/phage-s4-716-direct.json
+python3 -m json.tool /tmp/phage-s4-716-direct.json >/dev/null
+
+bench/benchmark-matrix.sh --profile compaction --output /tmp/phage-s4-716-profile.jsonl
+python3 -m json.tool /tmp/phage-s4-716-profile-summary.json >/dev/null
+```
+
+Linux correctness result:
+
+- `zig build test` passed on the Linux backend: the final test runner reported `58 of 58 tests passed`.
+- The compaction-related slowest-test list included the repeated-update, WAL-boundary, mutation-serialization, and public-read compaction tests, confirming the current compaction safety coverage ran on Linux.
+
+### Representative Linux compaction rows
+
+| Source | Git revision | Command shape | Live keys | Operation count | Value bytes | Update rounds | Triggered / count | Waste before → after | File size before → after | Reduction bytes | Write ops/sec | Write p50/p95/p99 (us) | Trigger latency (us) |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | ---: | ---: | --- | ---: |
+| S4 Linux direct smoke | `7f1d25c` | `zig build -Doptimize=ReleaseFast benchmark -- 64 --profile compaction --mode persisted --value-size 64 --update-rounds 2 --read-api get-into --json --db-path /tmp/phage-s4-716-direct-db` | 64 | 192 | 64 | 2 | true / 2 | 0.496055 → 0.0 | 9,759 → 4,918 | 9,682 | 372,874.18 | 1.83 / 2.79 / 33.25 | 34.00 |
+| S4 Linux matrix compaction row | `7f1d25c` | `bench/benchmark-matrix.sh --profile compaction --output /tmp/phage-s4-716-profile.jsonl` | 128 | 384 | 64 | 2 | true / 2 | 0.498017 → 0.0 | 19,670 → 9,874 | 19,592 | 390,589.24 | 1.88 / 2.63 / 16.25 | 53.50 |
+
+Linux matrix summary evidence:
+
+- `/tmp/phage-s4-716-profile-summary.json` validated with `python3 -m json.tool`.
+- `type=benchmark_summary`.
+- `metadata.profile=compaction`.
+- `metadata.git_revision=7f1d25c8e2100309a0c33551fe515491aab524df`.
+- `metadata.os_platform=Linux-7.0.5-orbstack-00330-ge3df4e19b0a0-dirty-aarch64-with-glibc2.39`.
+- `metadata.zig_version=0.15.2`.
+- `metadata.backend_status=linux-io-uring-intended`.
+- `row_count=1`.
+- `rows_by_mode.persisted=1`.
+
+Linux artifact hygiene:
+
+- Direct-smoke persisted artifacts were absent after the run: `/tmp/phage-s4-716-direct-db`, `/tmp/phage-s4-716-direct-db.wal`, and `/tmp/phage-s4-716-direct-db.compact.tmp`.
+- Matrix persisted artifacts were absent after the run: `/tmp/phage-benchmark-matrix-zzu0778f/phage-matrix-row-00-v64-b1-get-into`, matching `.wal`, and matching `.compact.tmp`.
+- Raw direct JSON, matrix JSONL, matrix summary JSON, and the temporary Linux clone root were removed after extracting the curated evidence. A follow-up cleanup check confirmed those paths were absent.
+- The Linux clone briefly generated Python bytecode under `bench/__pycache__` during the matrix run; it was inside the temporary clone and was removed with the clone root.
+
+Interpretation:
+
+- The S1 compaction profile and current compaction safety/read-serialization behavior pass on the Linux `io_uring` backend at current HEAD.
+- Both direct and matrix Linux rows report `backend_status=linux-io-uring-intended`, `triggered=true`, `trigger_count=2`, and waste reduced to `0.0`.
+- These are cheap S4 verification rows, not definitive Linux performance claims.
 
 ## Correctness and review evidence
 
@@ -99,8 +161,9 @@ Raw artifacts from this PRD loop remain local only and are not committed. Exampl
 - `/tmp/phage-compaction-s1-profile.jsonl` and `/tmp/phage-compaction-s1-profile-summary.json`
 - `/tmp/phage-compaction-s1-smoke.json`
 - `/tmp/phage-compaction-s2-smoke-final2-19378.json`
+- `/tmp/phage-s4-716-direct.json`, `/tmp/phage-s4-716-profile.jsonl`, and `/tmp/phage-s4-716-profile-summary.json` from the Linux S4 run
 
-The accepted S1/S2 handoffs and reviews confirmed the direct-smoke database, `.wal`, and `.compact.tmp` paths were absent after the runs. S3 docs verification also ran a local compaction smoke and matrix row under `/tmp` to spot-check the current command shape, but those raw outputs remain uncommitted and are not used as new source-commit evidence in the table above.
+The accepted S1/S2 handoffs and reviews confirmed the direct-smoke database, `.wal`, and `.compact.tmp` paths were absent after the runs. S3 docs verification also ran a local compaction smoke and matrix row under `/tmp` to spot-check the current command shape, but those raw outputs remain uncommitted and are not used as new source-commit evidence in the table above. S4 Linux verification removed its raw JSON/JSONL/summary files and temporary clone after extracting the curated Linux rows recorded here.
 
 Repository-root `matrix.json-summary.json` was already present as an untracked generated-looking file before this S3 docs work and remains unstaged.
 

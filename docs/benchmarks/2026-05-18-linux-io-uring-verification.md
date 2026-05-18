@@ -1,12 +1,12 @@
 # Linux io_uring benchmark verification
 
 Date: 2026-05-18
-Status: Linux `io_uring` correctness and post-optimization WAL write-path evidence verified on OrbStack NixOS after remediation
+Status: Linux `io_uring` correctness, WAL write-path evidence, and compaction-profile follow-up verified on OrbStack Linux
 PRD slice: S4 Linux io_uring verification path
 
 ## Status summary
 
-The original S4 worker ran on macOS and correctly refused to treat POSIX-fallback numbers as Linux `io_uring` evidence. A follow-up approved Linux execution path became available through OrbStack, and the Linux benchmark matrix workflow completed both the quick smoke and a fuller `linux-io-uring` profile on an Ubuntu 24.04 arm64 machine.
+The original S4 worker ran on macOS and correctly refused to treat POSIX-fallback numbers as Linux `io_uring` evidence. A follow-up approved Linux execution path became available through OrbStack, and the Linux benchmark matrix workflow completed both the quick smoke and a fuller `linux-io-uring` profile on an Ubuntu 24.04 arm64 machine. A later compaction-specific S4 follow-up also verified the compaction profile and current compaction safety/read-serialization behavior on OrbStack `phage-linux` with `metadata.backend_status=linux-io-uring-intended`.
 
 Linux status for this slice: `verified after remediation`.
 
@@ -181,6 +181,29 @@ Representative post-remediation rows:
 The S4 run confirms the optimized WAL write path is correct on Linux `io_uring`, but the cheap 1,000-op persisted throughput rows are noisy and lower than the earlier Ubuntu profile in some rows. Treat this as correctness and backend-status evidence for the optimization PRD, not a definitive Linux performance win/loss claim.
 
 Persisted S4 `db_path` values and matching `.wal` files under `/tmp/phage-benchmark-matrix-*` were absent after the runner completed. Raw JSONL and summary JSON artifacts stayed under `/tmp` and were not committed.
+
+### Compaction profile follow-up
+
+A later compaction-specific S4 run verified the compaction benchmark/profile path on OrbStack `phage-linux` at git revision `7f1d25c8e2100309a0c33551fe515491aab524df` with `metadata.backend_status=linux-io-uring-intended`. The run used Zig `0.15.2`, host `Linux phage-linux 7.0.5-orbstack-00330-ge3df4e19b0a0-dirty #1 SMP PREEMPT Sun May 10 11:47:42 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux`, and a temporary native Linux clone at `/tmp/phage-s4-716/repo`.
+
+Verification commands:
+
+```sh
+zig build test
+zig build -Doptimize=ReleaseFast benchmark -- 64 --profile compaction --mode persisted --value-size 64 --update-rounds 2 --read-api get-into --json --db-path /tmp/phage-s4-716-direct-db > /tmp/phage-s4-716-direct.json
+python3 -m json.tool /tmp/phage-s4-716-direct.json >/dev/null
+bench/benchmark-matrix.sh --profile compaction --output /tmp/phage-s4-716-profile.jsonl
+python3 -m json.tool /tmp/phage-s4-716-profile-summary.json >/dev/null
+```
+
+Results:
+
+- Linux `zig build test` passed with `58 of 58 tests passed`.
+- Direct compaction smoke: `operation_count=192`, `live_key_count=64`, `value_size=64`, `update_rounds=2`, `triggered=true`, `trigger_count=2`, `waste_ratio_before=0.496055`, `waste_ratio_after=0.0`, `file_size_before=9759`, `file_size_after=4918`, `file_size_reduction_bytes=9682`, `write_ops_per_sec=372874.18`, write p50/p95/p99 `1.83/2.79/33.25us`, trigger latency `34.00us`.
+- Matrix compaction summary JSON: `metadata.profile=compaction`, `metadata.backend_status=linux-io-uring-intended`, `row_count=1`, `rows_by_mode.persisted=1`; representative row `operation_count=384`, `live_key_count=128`, `trigger_count=2`, waste `0.498017→0.0`, file size `19670→9874`, write p50/p95/p99 `1.88/2.63/16.25us`.
+- Direct and matrix database, `.wal`, and `.compact.tmp` paths were absent after the run; raw JSON/JSONL/summary artifacts and the temporary clone were removed after extracting curated evidence.
+
+See [Compaction benchmark and status evidence](2026-05-18-compaction-performance.md) for the full compaction-specific S4 table and artifact-hygiene details.
 
 ## Correctness blocker remediated on Linux
 
