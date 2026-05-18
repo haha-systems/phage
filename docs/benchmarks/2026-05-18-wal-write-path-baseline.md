@@ -56,6 +56,7 @@ All persisted `db_path` values were generated under `/tmp/phage-benchmark-matrix
 ## Related documents
 
 - [WAL write-path optimization PRD](../prds/2026-05-18-phage-wal-write-path-optimization-prd.md)
+- [WAL write-path optimization evidence](2026-05-18-wal-write-path-optimization.md)
 - [macOS POSIX-fallback benchmark baseline](2026-05-18-macos-fallback-baseline.md)
 - [Linux io_uring benchmark verification](2026-05-18-linux-io-uring-verification.md)
 - [MVP Roadmap](../MVP_ROADMAP.md)

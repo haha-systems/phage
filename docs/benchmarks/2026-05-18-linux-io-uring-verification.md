@@ -201,5 +201,6 @@ When the Linux correctness remediation is fixed, the final handoff should record
 ## Related documents
 
 - [Benchmark matrix PRD](../prds/2026-05-18-phage-benchmark-matrix-linux-verification-prd.md)
+- [WAL write-path optimization evidence](2026-05-18-wal-write-path-optimization.md)
 - [Getting Started](../GETTING_STARTED.md)
 - [MVP Roadmap](../MVP_ROADMAP.md)

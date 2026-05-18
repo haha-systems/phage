@@ -273,6 +273,7 @@ This PRD is complete only when Gate 2 records evidence for all of the following:
 
 ## Related documents
 
+- [WAL write-path optimization evidence](../benchmarks/2026-05-18-wal-write-path-optimization.md)
 - [Benchmark matrix and Linux io_uring verification PRD](2026-05-18-phage-benchmark-matrix-linux-verification-prd.md)
 - [macOS POSIX-fallback benchmark baseline](../benchmarks/2026-05-18-macos-fallback-baseline.md)
 - [Linux io_uring benchmark verification](../benchmarks/2026-05-18-linux-io-uring-verification.md)
