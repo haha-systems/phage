@@ -202,9 +202,8 @@ pub const Phage = struct {
             .val_len = value.len,
         });
 
-        // Step 4a: Truncate the WAL file now that the entry is complete
-        try std.posix.ftruncate(self.wal_fd, 0);
-        self.wal_file_size.store(0, .monotonic);
+        // Step 4a: Clear the WAL file now that the entry is complete
+        try Wal.clear(self);
 
         // Step 4b: Check if compaction is needed (non-blocking)
         self.checkAndScheduleCompaction() catch |err| {
@@ -257,9 +256,8 @@ pub const Phage = struct {
             });
         }
 
-        // Step 5: Truncate the WAL file now that all batch entries are complete
-        try std.posix.ftruncate(self.wal_fd, 0);
-        self.wal_file_size.store(0, .monotonic);
+        // Step 5: Clear the WAL file now that all batch entries are complete
+        try Wal.clear(self);
 
         // Step 6: Check compaction only once for the entire batch
         self.checkAndScheduleCompaction() catch |err| {

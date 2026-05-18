@@ -70,6 +70,19 @@ pub const Wal = struct {
         }
     };
 
+    const RawWalEntryHeader = packed struct {
+        op_type: u8,
+        key_len: usize,
+        val_len: usize,
+        offset: usize,
+        checksum: u32,
+        padding: u24,
+
+        comptime {
+            if (@sizeOf(@This()) != @sizeOf(WalEntryHeader)) @compileError("invalid raw header size");
+        }
+    };
+
     const WalEntry = struct {
         header: WalEntryHeader,
         key: []const u8,
@@ -96,7 +109,7 @@ pub const Wal = struct {
             const header_read = try std.posix.pread(store.wal_fd, &header_buf, offset);
             if (header_read < @sizeOf(WalEntryHeader)) break;
 
-            const header: WalEntryHeader = @bitCast(header_buf);
+            const header = Wal.parseWalEntryHeader(header_buf) orelse break;
             const entry_len = std.math.add(usize, @sizeOf(WalEntryHeader), header.key_len) catch break;
             if (entry_len > wal_size - offset) break;
 
@@ -124,14 +137,6 @@ pub const Wal = struct {
 
             switch (header.op_type) {
                 .put => {
-                    // We may have provisional entries in the WAL that haven't been written to the main file
-                    // yet for whatever reason. If we find any, just skip them as we haven't guaranteed them yet.
-                    if (header.offset == 0 and header.val_len == 0) {
-                        //log(.info, .phage, "Skipping provisional entry for key: {s}", .{key_buf});
-                        offset += @sizeOf(WalEntryHeader) + header.key_len;
-                        continue;
-                    }
-
                     try store.index.put(store.allocator, key_buf, .{
                         .offset = header.offset,
                         .len = @sizeOf(EntryHeader) + header.key_len + header.val_len,
@@ -175,6 +180,24 @@ pub const Wal = struct {
     fn verifyWalEntryIntegrity(header: *WalEntryHeader, key: []const u8) bool {
         const computed = calculateChecksum(header.op_type, @intCast(header.key_len), @intCast(header.val_len), header.offset, key);
         return computed == header.checksum;
+    }
+
+    fn parseWalEntryHeader(header_buf: [@sizeOf(WalEntryHeader)]u8) ?WalEntryHeader {
+        const raw: RawWalEntryHeader = @bitCast(header_buf);
+        const op_type: WalOperation = switch (raw.op_type) {
+            @intFromEnum(WalOperation.put) => .put,
+            @intFromEnum(WalOperation.delete) => .delete,
+            else => return null,
+        };
+
+        return .{
+            .op_type = op_type,
+            .key_len = raw.key_len,
+            .val_len = raw.val_len,
+            .offset = raw.offset,
+            .checksum = raw.checksum,
+            .padding = raw.padding,
+        };
     }
 };
 
@@ -303,6 +326,32 @@ test "write_ahead_log:recover_committed_put_entry_reads_value" {
     try expectWalCleared(&store);
 }
 
+test "write_ahead_log:recover_committed_empty_put_at_zero_offset" {
+    const allocator = std.testing.allocator;
+    const path = "test_wal_recover_empty_put.db";
+    const wal_path = "test_wal_recover_empty_put.db.wal";
+
+    cleanupFiles(path, wal_path);
+    defer cleanupFiles(path, wal_path);
+
+    var store = try Phage.init(allocator, path);
+    defer store.deinit();
+
+    const key = "empty-at-zero";
+    const value = "";
+    const data_offset: usize = 0;
+    _ = try writeDataEntry(store.fd, key, value, data_offset);
+    const wal_len = try writeWalEntry(store.wal_fd, .put, key, value.len, data_offset, 0, null);
+    store.wal_file_size.store(wal_len, .release);
+
+    try Wal.recover(&store);
+
+    const recovered = try store.get(key);
+    defer allocator.free(recovered);
+    try std.testing.expectEqualStrings(value, recovered);
+    try expectWalCleared(&store);
+}
+
 test "write_ahead_log:recover_skips_provisional_put_and_applies_final_put_at_zero_offset" {
     const allocator = std.testing.allocator;
     const path = "test_wal_recover_provisional.db";
@@ -347,6 +396,9 @@ test "write_ahead_log:recover_replays_delete_after_restore_index" {
         try store.put("deleted-key", "old-value");
         try std.testing.expect(try store.delete("deleted-key"));
     }
+
+    const wal_stat_before_startup = try std.fs.cwd().statFile(wal_path);
+    try std.testing.expect(wal_stat_before_startup.size > 0);
 
     var recovered_store = try Phage.init(allocator, path);
     defer recovered_store.deinit();
@@ -425,6 +477,36 @@ test "write_ahead_log:recover_preserves_valid_prefix_before_truncated_tail" {
     try expectWalCleared(&store);
 }
 
+test "write_ahead_log:recover_preserves_valid_prefix_before_invalid_op_type" {
+    const allocator = std.testing.allocator;
+    const path = "test_wal_recover_invalid_op.db";
+    const wal_path = "test_wal_recover_invalid_op.db.wal";
+
+    cleanupFiles(path, wal_path);
+    defer cleanupFiles(path, wal_path);
+
+    var store = try Phage.init(allocator, path);
+    defer store.deinit();
+
+    const good_key = "valid-prefix-key";
+    const good_value = "valid-prefix-value";
+    const good_offset: usize = 0;
+    _ = try writeDataEntry(store.fd, good_key, good_value, good_offset);
+
+    var wal_offset: usize = 0;
+    wal_offset += try writeWalEntry(store.wal_fd, .put, good_key, good_value.len, good_offset, wal_offset, null);
+    wal_offset += try writeInvalidOpWalEntry(store.wal_fd, 99, "invalid-op-key", wal_offset);
+    store.wal_file_size.store(wal_offset, .release);
+
+    try Wal.recover(&store);
+
+    const recovered = try store.get(good_key);
+    defer allocator.free(recovered);
+    try std.testing.expectEqualStrings(good_value, recovered);
+    try std.testing.expectError(error.KeyNotFound, store.get("invalid-op-key"));
+    try expectWalCleared(&store);
+}
+
 fn writeDataEntry(fd: std.posix.fd_t, key: []const u8, value: []const u8, offset: usize) !usize {
     const header = EntryHeader{
         .key_len = @intCast(key.len),
@@ -459,6 +541,26 @@ fn writeWalEntry(
     var cursor = wal_offset;
     try expectFullWrite(@sizeOf(Wal.WalEntryHeader), try std.posix.pwrite(fd, std.mem.asBytes(&header), cursor));
     cursor += @sizeOf(Wal.WalEntryHeader);
+    try expectFullWrite(key.len, try std.posix.pwrite(fd, key, cursor));
+    return @sizeOf(Wal.WalEntryHeader) + key.len;
+}
+
+fn writeInvalidOpWalEntry(fd: std.posix.fd_t, invalid_op_type: u8, key: []const u8, wal_offset: usize) !usize {
+    const header = Wal.WalEntryHeader{
+        .op_type = .delete,
+        .key_len = key.len,
+        .val_len = 0,
+        .offset = 0,
+        .checksum = Wal.calculateChecksum(.delete, @intCast(key.len), 0, 0, key),
+        .padding = 0,
+    };
+    var header_bytes: [@sizeOf(Wal.WalEntryHeader)]u8 = undefined;
+    @memcpy(header_bytes[0..], std.mem.asBytes(&header));
+    header_bytes[0] = invalid_op_type;
+
+    var cursor = wal_offset;
+    try expectFullWrite(header_bytes.len, try std.posix.pwrite(fd, &header_bytes, cursor));
+    cursor += header_bytes.len;
     try expectFullWrite(key.len, try std.posix.pwrite(fd, key, cursor));
     return @sizeOf(Wal.WalEntryHeader) + key.len;
 }
