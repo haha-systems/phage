@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import pathlib
+import shutil
 import sys
 import tempfile
 import unittest
@@ -55,6 +56,23 @@ class BenchmarkMatrixTests(unittest.TestCase):
             for row in persisted:
                 self.assertTrue(row.db_path.startswith(tmp_root))
                 self.assertEqual([row.db_path, row.db_path + ".wal"], benchmark_matrix.cleanup_targets(row))
+
+    def test_default_persisted_rows_use_tmp_root_contract(self):
+        rows = benchmark_matrix.profile_rows("quick", ops=1000)
+        persisted_roots = []
+        try:
+            persisted = [row for row in rows if row.mode == "persisted"]
+
+            self.assertGreaterEqual(len(persisted), 1)
+            for row in persisted:
+                persisted_roots.append(str(pathlib.Path(row.db_path).parent))
+                self.assertTrue(
+                    row.db_path.startswith("/tmp/phage-benchmark-matrix-"),
+                    f"expected default persisted db_path under /tmp/phage-benchmark-matrix-, got {row.db_path}",
+                )
+        finally:
+            for root in set(persisted_roots):
+                shutil.rmtree(root, ignore_errors=True)
 
     def test_enrich_row_preserves_benchmark_metrics_and_metadata(self):
         row = benchmark_matrix.MatrixRow(

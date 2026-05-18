@@ -17,6 +17,14 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
 
+TMP_ROOT_DIR = "/tmp"
+TMP_ROOT_PREFIX = "phage-benchmark-matrix-"
+
+
+def make_tmp_root() -> str:
+    return tempfile.mkdtemp(prefix=TMP_ROOT_PREFIX, dir=TMP_ROOT_DIR)
+
+
 @dataclass(frozen=True)
 class MatrixRow:
     index: int
@@ -47,7 +55,7 @@ def profile_rows(profile: str, ops: Optional[int] = None, tmp_root: Optional[str
     else:
         raise ValueError(f"unknown benchmark matrix profile: {profile}")
 
-    root = tmp_root or tempfile.mkdtemp(prefix="phage-benchmark-matrix-")
+    root = tmp_root or make_tmp_root()
     rows: List[MatrixRow] = []
     for index, (mode, value_size, batch_size, read_api) in enumerate(dimensions):
         db_path = None
@@ -199,7 +207,7 @@ def summary_path_for(output_path: pathlib.Path) -> pathlib.Path:
 
 
 def run_matrix(profile: str, output_path: pathlib.Path, summary_path: pathlib.Path, ops: Optional[int]) -> Dict[str, Any]:
-    tmp_root = tempfile.mkdtemp(prefix="phage-benchmark-matrix-")
+    tmp_root = make_tmp_root()
     metadata = build_metadata(profile, sys.argv)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
