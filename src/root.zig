@@ -53,6 +53,10 @@ pub const Phage = struct {
     /// Serializes main-file/WAL/index mutations with inline compaction so fd swaps
     /// and offset publication cannot race concurrent writers or deletes.
     mutation_mutex: std.Thread.Mutex = .{},
+    /// Serializes public reads with inline compaction generation transitions so a
+    /// read observes one stable `(fd, index offsets)` generation from lookup
+    /// through header/key/value validation.
+    read_compaction_lock: std.Thread.RwLock = .{},
     metrics: runtime_metrics.Metrics = runtime_metrics.Metrics.init(),
 
     pub fn init(
@@ -127,6 +131,7 @@ pub const Phage = struct {
             .compaction_threshold = 0.5, // Default compaction threshold
             .compaction_in_progress = std.atomic.Value(bool).init(false),
             .mutation_mutex = .{},
+            .read_compaction_lock = .{},
             .metrics = runtime_metrics.Metrics.init(),
         };
         fd_owned_by_store = true;
@@ -311,16 +316,20 @@ pub const Phage = struct {
     /// If the key is not found, an error is returned.
     pub fn get(self: *Phage, key: []const u8) ![]u8 {
         const metrics_start = std.time.nanoTimestamp();
+        errdefer self.metrics.recordReadError(elapsedNsSince(metrics_start));
+
+        self.read_compaction_lock.lockShared();
+        defer self.read_compaction_lock.unlockShared();
+
         const trimmed_key = std.mem.trimRight(u8, key, "\r\n");
         const entry = self.index.get(trimmed_key) orelse {
             std.log.debug("Key not found: {s}", .{key});
-            self.metrics.recordReadError(elapsedNsSince(metrics_start));
             return error.KeyNotFound;
         };
 
         const value = try self.allocator.alloc(u8, entry.val_len);
         errdefer self.allocator.free(value);
-        return try self.getInto(trimmed_key, value);
+        return try self.getIntoLocked(trimmed_key, value, metrics_start);
     }
 
     /// Reads a value into caller-provided storage and returns the populated slice.
@@ -332,6 +341,13 @@ pub const Phage = struct {
         const metrics_start = std.time.nanoTimestamp();
         errdefer self.metrics.recordReadError(elapsedNsSince(metrics_start));
 
+        self.read_compaction_lock.lockShared();
+        defer self.read_compaction_lock.unlockShared();
+
+        return try self.getIntoLocked(key, buffer, metrics_start);
+    }
+
+    fn getIntoLocked(self: *Phage, key: []const u8, buffer: []u8, metrics_start: i128) ![]u8 {
         std.log.debug("Getting key into caller buffer: {s}", .{key});
 
         const trimmed_key = std.mem.trimRight(u8, key, "\r\n");
@@ -662,6 +678,9 @@ pub const Phage = struct {
     /// Perform the actual compaction by rewriting the database file.
     /// This function creates a new file with only reachable entries.
     fn performCompaction(self: *Phage) !void {
+        self.read_compaction_lock.lock();
+        defer self.read_compaction_lock.unlock();
+
         const temp_path = try std.fmt.allocPrint(self.allocator, "{s}.compact.tmp", .{self.store_path});
         defer self.allocator.free(temp_path);
         errdefer std.posix.unlink(temp_path) catch {};

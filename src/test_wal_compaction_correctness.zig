@@ -11,6 +11,8 @@ const compaction_test_path = compaction_test_dir ++ "/compaction_correctness.db"
 const compaction_wal_boundary_path = compaction_test_dir ++ "/compaction_wal_boundary.db";
 const compaction_error_path = compaction_test_dir ++ "/compaction_error_cleanup.db";
 const compaction_serialization_path = compaction_test_dir ++ "/compaction_serialization.db";
+const compaction_read_blocks_path = compaction_test_dir ++ "/compaction_read_blocks.db";
+const compaction_read_holds_path = compaction_test_dir ++ "/compaction_read_holds.db";
 
 test "wal_compaction: repeated updates compact to latest readable index entries" {
     const allocator = std.testing.allocator;
@@ -184,6 +186,66 @@ test "wal_compaction: mutations share compaction serialization lock" {
     try std.testing.expectError(error.KeyNotFound, store.get("delete-target"));
 }
 
+test "wal_compaction: public reads wait for compaction generation lock" {
+    const allocator = std.testing.allocator;
+    try std.fs.cwd().makePath(compaction_test_dir);
+    cleanupPath(compaction_read_blocks_path);
+    defer cleanupPath(compaction_read_blocks_path);
+
+    var store = try Phage.init(allocator, compaction_read_blocks_path);
+    defer store.deinit();
+
+    store.compaction_threshold = 2.0;
+    try store.put("read-key", "read-value");
+
+    var worker = ReadWorker.init();
+    store.read_compaction_lock.lock();
+    var read_thread = try std.Thread.spawn(.{}, runGetIntoWhileCompactionWriteLocked, .{ &store, &worker });
+
+    waitForReadWorkerStart(&worker);
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    try std.testing.expect(!worker.done.load(.acquire));
+
+    store.read_compaction_lock.unlock();
+    read_thread.join();
+
+    try std.testing.expect(worker.done.load(.acquire));
+    try std.testing.expect(!worker.failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, "read-value".len), worker.result_len.load(.acquire));
+    try std.testing.expectEqualStrings("read-value", worker.buffer[0.."read-value".len]);
+}
+
+test "wal_compaction: held public read blocks inline compaction transition" {
+    const allocator = std.testing.allocator;
+    try std.fs.cwd().makePath(compaction_test_dir);
+    cleanupPath(compaction_read_holds_path);
+    defer cleanupPath(compaction_read_holds_path);
+
+    var store = try Phage.init(allocator, compaction_read_holds_path);
+    defer store.deinit();
+
+    store.compaction_threshold = 2.0;
+    try store.put("held-read", "held-read-v0");
+
+    var worker = MutationWorker.init();
+    store.compaction_threshold = 0.0;
+    store.read_compaction_lock.lockShared();
+    var put_thread = try std.Thread.spawn(.{}, runPutTriggeringCompactionWhileReadLocked, .{ &store, &worker });
+
+    waitForWorkerStart(&worker);
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    try std.testing.expect(!worker.done.load(.acquire));
+
+    store.read_compaction_lock.unlockShared();
+    put_thread.join();
+
+    try std.testing.expect(worker.done.load(.acquire));
+    try std.testing.expect(!worker.failed.load(.acquire));
+    try std.testing.expect(!store.compaction_in_progress.load(.acquire));
+    try expectIndexEntryReadsValue(&store, "held-read", "held-read-v0");
+    try expectIndexEntryReadsValue(&store, "read-lock-trigger", "trigger-v0");
+}
+
 const MutationWorker = struct {
     started: std.atomic.Value(bool),
     done: std.atomic.Value(bool),
@@ -197,6 +259,38 @@ const MutationWorker = struct {
         };
     }
 };
+
+const ReadWorker = struct {
+    started: std.atomic.Value(bool),
+    done: std.atomic.Value(bool),
+    failed: std.atomic.Value(bool),
+    result_len: std.atomic.Value(usize),
+    buffer: [32]u8,
+
+    fn init() ReadWorker {
+        return .{
+            .started = std.atomic.Value(bool).init(false),
+            .done = std.atomic.Value(bool).init(false),
+            .failed = std.atomic.Value(bool).init(false),
+            .result_len = std.atomic.Value(usize).init(0),
+            .buffer = undefined,
+        };
+    }
+};
+
+fn runGetIntoWhileCompactionWriteLocked(store: *Phage, worker: *ReadWorker) void {
+    worker.started.store(true, .release);
+    const value = store.getInto("read-key", worker.buffer[0..]) catch {
+        worker.failed.store(true, .release);
+        worker.done.store(true, .release);
+        return;
+    };
+    worker.result_len.store(value.len, .release);
+    if (!std.mem.eql(u8, value, "read-value")) {
+        worker.failed.store(true, .release);
+    }
+    worker.done.store(true, .release);
+}
 
 fn runPutWhileMutationLocked(store: *Phage, worker: *MutationWorker) void {
     worker.started.store(true, .release);
@@ -222,7 +316,21 @@ fn runDeleteWhileMutationLocked(store: *Phage, worker: *MutationWorker) void {
     worker.done.store(true, .release);
 }
 
+fn runPutTriggeringCompactionWhileReadLocked(store: *Phage, worker: *MutationWorker) void {
+    worker.started.store(true, .release);
+    store.put("read-lock-trigger", "trigger-v0") catch {
+        worker.failed.store(true, .release);
+    };
+    worker.done.store(true, .release);
+}
+
 fn waitForWorkerStart(worker: *MutationWorker) void {
+    while (!worker.started.load(.acquire)) {
+        std.Thread.yield() catch std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+}
+
+fn waitForReadWorkerStart(worker: *ReadWorker) void {
     while (!worker.started.load(.acquire)) {
         std.Thread.yield() catch std.Thread.sleep(1 * std.time.ns_per_ms);
     }
