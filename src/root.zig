@@ -211,12 +211,11 @@ pub const Phage = struct {
         }
 
         // Prepare WAL entries first, using known data offsets
-        var wal_entries = try self.allocator.alloc([]u8, pairs.len);
-        defer {
-            for (wal_entries) |entry| {
-                self.allocator.free(entry);
-            }
-            self.allocator.free(wal_entries);
+        var wal_batch = try self.formatBatchWalEntries(pairs, data_batch.offsets, 0);
+        defer wal_batch.deinit(self.allocator);
+        const wal_base_offset = self.wal_file_size.fetchAdd(wal_batch.buffer.len, .monotonic);
+        for (wal_batch.offsets) |*wal_offset| {
+            wal_offset.* += wal_base_offset;
         }
 
         // Step 1: Write all data entries as one contiguous main-file write
@@ -225,15 +224,10 @@ pub const Phage = struct {
             return error.WriteError;
         }
 
-        // Step 2: Format and submit all WAL entries
-        for (pairs, 0..) |pair, i| {
-            wal_entries[i] = try self.formatWalEntry(.put, pair.key, pair.value, data_batch.offsets[i]);
-            const wal_offset = self.wal_file_size.fetchAdd(wal_entries[i].len, .monotonic);
-
-            const ops_submitted = try self.writeToWal(wal_entries[i], wal_offset);
-            if (ops_submitted < 1) {
-                return error.WriteError;
-            }
+        // Step 2: Write all WAL entries as one contiguous WAL write
+        const wal_ops_submitted = try self.writeToWal(wal_batch.buffer, wal_base_offset);
+        if (wal_ops_submitted < 1) {
+            return error.WriteError;
         }
 
         // Step 3: Wait for all I/O operations to complete (single wait for entire batch)
@@ -706,6 +700,50 @@ pub const Phage = struct {
         return buf;
     }
 
+    fn formatBatchWalEntries(self: *Phage, pairs: []const BatchPair, data_offsets: []const usize, wal_base_offset: usize) !BatchDataEntries {
+        if (pairs.len != data_offsets.len) return error.InvalidBatch;
+
+        const header_size = @sizeOf(Wal.WalEntryHeader);
+        var total_size: usize = 0;
+        for (pairs) |pair| {
+            total_size += header_size + pair.key.len;
+        }
+
+        const buffer = try self.allocator.alloc(u8, total_size);
+        errdefer self.allocator.free(buffer);
+        const offsets = try self.allocator.alloc(usize, pairs.len);
+        errdefer self.allocator.free(offsets);
+        const lengths = try self.allocator.alloc(usize, pairs.len);
+        errdefer self.allocator.free(lengths);
+
+        var cursor: usize = 0;
+        for (pairs, 0..) |pair, i| {
+            const val_len = pair.value.len;
+            const entry_len = header_size + pair.key.len;
+            offsets[i] = wal_base_offset + cursor;
+            lengths[i] = entry_len;
+
+            const header = Wal.WalEntryHeader{
+                .op_type = .put,
+                .key_len = pair.key.len,
+                .val_len = val_len,
+                .offset = data_offsets[i],
+                .checksum = Wal.calculateChecksum(.put, @intCast(pair.key.len), @intCast(val_len), data_offsets[i], pair.key),
+                .padding = 0,
+            };
+            @memcpy(buffer[cursor .. cursor + header_size], std.mem.asBytes(&header));
+            cursor += header_size;
+            @memcpy(buffer[cursor .. cursor + pair.key.len], pair.key);
+            cursor += pair.key.len;
+        }
+
+        return .{
+            .buffer = buffer,
+            .offsets = offsets,
+            .lengths = lengths,
+        };
+    }
+
     /// Formats a data entry with the given key and value.
     /// Returns a buffer containing the serialized entry.
     /// The caller is responsible for freeing the buffer.
@@ -814,6 +852,44 @@ test "root:formatWalEntry" {
     try std.testing.expectEqual(Wal.WalOperation.put, header.op_type);
     try std.testing.expectEqual(8, header.key_len);
     try std.testing.expectEqual(10, header.val_len);
+
+    // cleanup test db
+    try testCleanup();
+}
+
+test "root:formatBatchWalEntries coalesces WAL entries and reports offsets" {
+    const allocator = std.testing.allocator;
+
+    var store = try Phage.init(allocator, "test.db");
+    defer store.deinit();
+
+    const pairs = [_]Phage.BatchPair{
+        .{ .key = "k1", .value = "value1" },
+        .{ .key = "key-two", .value = "v2" },
+    };
+    const data_offsets = [_]usize{ 200, 216 };
+    var batch = try store.formatBatchWalEntries(&pairs, &data_offsets, 50);
+    defer batch.deinit(allocator);
+
+    const first_len = @sizeOf(Wal.WalEntryHeader) + pairs[0].key.len;
+    const second_len = @sizeOf(Wal.WalEntryHeader) + pairs[1].key.len;
+    try std.testing.expectEqual(first_len + second_len, batch.buffer.len);
+    try std.testing.expectEqual(@as(usize, 50), batch.offsets[0]);
+    try std.testing.expectEqual(@as(usize, 50 + first_len), batch.offsets[1]);
+    try std.testing.expectEqual(first_len, batch.lengths[0]);
+    try std.testing.expectEqual(second_len, batch.lengths[1]);
+
+    const first_header = std.mem.bytesToValue(Wal.WalEntryHeader, batch.buffer[0..@sizeOf(Wal.WalEntryHeader)]);
+    try std.testing.expectEqual(Wal.WalOperation.put, first_header.op_type);
+    try std.testing.expectEqual(@as(usize, 200), first_header.offset);
+    try std.testing.expectEqual(@as(usize, pairs[0].key.len), first_header.key_len);
+    try std.testing.expectEqual(@as(usize, pairs[0].value.len), first_header.val_len);
+
+    const second_header = std.mem.bytesToValue(Wal.WalEntryHeader, batch.buffer[first_len..][0..@sizeOf(Wal.WalEntryHeader)]);
+    try std.testing.expectEqual(Wal.WalOperation.put, second_header.op_type);
+    try std.testing.expectEqual(@as(usize, 216), second_header.offset);
+    try std.testing.expectEqual(@as(usize, pairs[1].key.len), second_header.key_len);
+    try std.testing.expectEqual(@as(usize, pairs[1].value.len), second_header.val_len);
 
     // cleanup test db
     try testCleanup();
