@@ -2,15 +2,18 @@
 
 ## Current build and server status
 
-Phage currently builds the core library and native benchmark runner through `build.zig`:
+Phage currently builds the core library, native benchmark runner, and supported ZeroMQ server workflow through `build.zig`:
 
 ```sh
 zig build
 zig build test
+zig build phage-server
+zig build run-server -- --help
+zig build server-smoke -- --db-path /tmp/phage-server-smoke
 zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16 --batch-size 16 --read-api get-into
 ```
 
-The ZeroMQ server implementation lives in `src/zserver.zig`, but it is not wired into the default Zig build graph at this time. `zig build --help` lists `install`, `uninstall`, `benchmark`, and `test`; there is no supported `zig build run` server step. The command-line options below describe the current `zserver.zig` implementation if/when that executable is built separately.
+The live server smoke starts the built `phage-server` executable on an available localhost port, uses the supplied disposable `/tmp/...` database path, verifies the documented MVP command set over ZeroMQ, terminates the server, and removes the generated database/WAL files. It requires the same ZeroMQ/`zimq` dependencies as the server build and does not require the external Demon client.
 
 ## Core store API
 

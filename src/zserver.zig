@@ -5,6 +5,14 @@ const zimq = @import("zimq");
 const server_config = @import("server/config.zig");
 const server_runtime = @import("server/runtime.zig");
 
+fn freeResultPayload(allocator: std.mem.Allocator, result: phage.protocol.Result) void {
+    switch (result.payload) {
+        .Get => |get_result| allocator.free(get_result.value),
+        .Keys => |keys_result| allocator.free(keys_result.keys),
+        else => {},
+    }
+}
+
 pub fn main() !void {
     var allocator = std.heap.GeneralPurposeAllocator(.{}){};
 
@@ -57,6 +65,7 @@ pub fn main() !void {
 
     while (server_runtime.processShouldContinue()) {
         var buf: zimq.Message = .empty();
+        defer buf.deinit();
         _ = server_rep.recvMsg(&buf, .{}) catch |err| {
             if (!server_runtime.processShouldContinue()) break;
             std.log.err("server receive error={s}", .{@errorName(err)});
@@ -93,6 +102,7 @@ pub fn main() !void {
             try server_rep.sendConstSlice(error_msg, .{});
             continue;
         };
+        defer freeResultPayload(allocator_ptr, result);
 
         switch (result.status) {
             .Ok => {
@@ -116,7 +126,7 @@ pub fn main() !void {
 
         const response_payload = try result.payloadToString(allocator_ptr);
         defer allocator_ptr.free(response_payload);
-        try server_rep.sendConstSlice(response_payload, .{});
+        try server_rep.sendSlice(response_payload, .{});
         std.debug.print("Sent: {}\n", .{result});
     }
 

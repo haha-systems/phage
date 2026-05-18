@@ -99,6 +99,28 @@ pub fn build(b: *std.Build) void {
     const run_server_step = b.step("run-server", "Run the ZeroMQ Phage server; pass args after --");
     run_server_step.dependOn(&run_server_cmd.step);
 
+    const server_smoke_mod = b.createModule(.{
+        .root_source_file = b.path("src/server/smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_smoke_mod.addImport("zimq", zimq_mod);
+
+    const server_smoke_exe = b.addExecutable(.{
+        .name = "phage-server-smoke",
+        .root_module = server_smoke_mod,
+    });
+
+    const run_server_smoke_cmd = b.addRunArtifact(server_smoke_exe);
+    run_server_smoke_cmd.step.dependOn(&server_exe.step);
+    run_server_smoke_cmd.addArg("--server-exe");
+    run_server_smoke_cmd.addArtifactArg(server_exe);
+    if (b.args) |args| {
+        run_server_smoke_cmd.addArgs(args);
+    }
+    const server_smoke_step = b.step("server-smoke", "Run a live ZeroMQ smoke against the Phage server; pass args after --");
+    server_smoke_step.dependOn(&run_server_smoke_cmd.step);
+
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_mod,
         .test_runner = .{ .mode = .simple, .path = b.path("src/test_runner.zig") },
