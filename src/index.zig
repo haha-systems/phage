@@ -34,6 +34,8 @@ pub const EntryHeader = packed struct {
 /// IndexManager is a thread-safe in-memory index manager that uses
 /// sharded hash maps to store index entries in memory.
 pub const IndexManager = struct {
+    pub const BatchEntry = struct { key: []const u8, entry: IndexEntry };
+
     shards: []IndexShard,
 
     /// IndexShard is a thread-safe shard of the index manager.
@@ -61,6 +63,18 @@ pub const IndexManager = struct {
 
             self.map.clearAndFree();
         }
+
+        fn putLocked(self: *IndexShard, allocator: std.mem.Allocator, key: []const u8, entry: IndexEntry) !void {
+            const key_copy = try allocator.dupe(u8, key);
+            errdefer allocator.free(key_copy);
+
+            const gop = try self.map.getOrPut(key_copy);
+            if (gop.found_existing) {
+                allocator.free(gop.key_ptr.*);
+                gop.key_ptr.* = key_copy;
+            }
+            gop.value_ptr.* = normalizeEntry(entry);
+        }
     };
 
     pub fn init(allocator: std.mem.Allocator) !IndexManager {
@@ -78,11 +92,14 @@ pub const IndexManager = struct {
         allocator.free(self.shards);
     }
 
+    fn shardIndex(self: *IndexManager, key: []const u8) usize {
+        const hash = std.hash.Wyhash.hash(HASH_SEED, key);
+        return hash & (self.shards.len - 1);
+    }
+
     /// Get the shard for a given key.
     pub fn getShard(self: *IndexManager, key: []const u8) *IndexShard {
-        const hash = std.hash.Wyhash.hash(HASH_SEED, key);
-        const id = hash & (self.shards.len - 1);
-        return &self.shards[id];
+        return &self.shards[self.shardIndex(key)];
     }
 
     /// Count the total number of entries in all shards.
@@ -97,6 +114,15 @@ pub const IndexManager = struct {
         return total;
     }
 
+    fn normalizeEntry(entry: IndexEntry) IndexEntry {
+        return .{
+            .offset = entry.offset,
+            .len = @sizeOf(EntryHeader) + entry.key_len + entry.val_len,
+            .val_len = entry.val_len,
+            .key_len = entry.key_len,
+        };
+    }
+
     /// Puts an entry into the index.
     /// If the key already exists, it will be replaced.
     pub fn put(self: *IndexManager, allocator: std.mem.Allocator, key: []const u8, entry: IndexEntry) !void {
@@ -104,30 +130,32 @@ pub const IndexManager = struct {
         shard.mutex.lock();
         defer shard.mutex.unlock();
 
-        const key_copy = try allocator.dupe(u8, key);
-        errdefer allocator.free(key_copy);
+        try shard.putLocked(allocator, key, entry);
+    }
 
-        const gop = try shard.map.getOrPut(key_copy);
+    /// Puts a batch of entries into the index, grouping by shard so each
+    /// affected shard is locked at most once for the batch.
+    /// Duplicate keys are applied in input order, so the last entry wins.
+    pub fn putBatch(self: *IndexManager, allocator: std.mem.Allocator, entries: []const BatchEntry) !void {
+        if (entries.len == 0) return;
 
-        if (gop.found_existing) {
-            // Free old key and value
-            allocator.free(gop.key_ptr.*);
+        for (self.shards, 0..) |*shard, shard_id| {
+            var has_entries = false;
+            for (entries) |batch_entry| {
+                if (self.shardIndex(batch_entry.key) == shard_id) {
+                    has_entries = true;
+                    break;
+                }
+            }
+            if (!has_entries) continue;
 
-            // Update with new copies
-            gop.key_ptr.* = key_copy;
-            gop.value_ptr.* = .{
-                .offset = entry.offset,
-                .len = @sizeOf(EntryHeader) + entry.key_len + entry.val_len,
-                .val_len = entry.val_len,
-                .key_len = entry.key_len,
-            };
-        } else {
-            gop.value_ptr.* = .{
-                .offset = entry.offset,
-                .len = @sizeOf(EntryHeader) + entry.key_len + entry.val_len,
-                .val_len = entry.val_len,
-                .key_len = entry.key_len,
-            };
+            shard.mutex.lock();
+            defer shard.mutex.unlock();
+
+            for (entries) |batch_entry| {
+                if (self.shardIndex(batch_entry.key) != shard_id) continue;
+                try shard.putLocked(allocator, batch_entry.key, batch_entry.entry);
+            }
         }
     }
 
@@ -303,4 +331,58 @@ test "index:delete_non_existing_key" {
     const removed = try index.delete(allocator, key);
 
     try std.testing.expect(!removed);
+}
+
+test "index:putBatch updates multiple shards and replaces duplicate keys" {
+    const allocator = std.testing.allocator;
+    var manager = try IndexManager.init(allocator);
+    defer manager.deinit(allocator);
+
+    var key_buffers: [3][32]u8 = undefined;
+    var keys: [3][]const u8 = undefined;
+    var shard_ids: [3]usize = undefined;
+    var found: usize = 0;
+    var candidate: usize = 0;
+    while (found < keys.len) : (candidate += 1) {
+        const key = try std.fmt.bufPrint(&key_buffers[found], "batch-key-{d}", .{candidate});
+        const id = std.hash.Wyhash.hash(HASH_SEED, key) & (manager.shards.len - 1);
+        var seen = false;
+        for (shard_ids[0..found]) |existing_id| {
+            if (existing_id == id) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+
+        keys[found] = key;
+        shard_ids[found] = id;
+        found += 1;
+    }
+
+    const updates = [_]IndexManager.BatchEntry{
+        .{ .key = keys[0], .entry = .{ .offset = 10, .len = 0, .key_len = keys[0].len, .val_len = 4 } },
+        .{ .key = keys[1], .entry = .{ .offset = 20, .len = 0, .key_len = keys[1].len, .val_len = 5 } },
+        .{ .key = keys[2], .entry = .{ .offset = 30, .len = 0, .key_len = keys[2].len, .val_len = 6 } },
+        .{ .key = keys[1], .entry = .{ .offset = 40, .len = 0, .key_len = keys[1].len, .val_len = 7 } },
+    };
+
+    try manager.putBatch(allocator, &updates);
+
+    try std.testing.expectEqual(@as(usize, 3), manager.count());
+
+    const first = manager.get(keys[0]) orelse return error.MissingFirstBatchKey;
+    try std.testing.expectEqual(@as(usize, 10), first.offset);
+    try std.testing.expectEqual(keys[0].len, first.key_len);
+    try std.testing.expectEqual(@as(usize, 4), first.val_len);
+
+    const second = manager.get(keys[1]) orelse return error.MissingSecondBatchKey;
+    try std.testing.expectEqual(@as(usize, 40), second.offset);
+    try std.testing.expectEqual(keys[1].len, second.key_len);
+    try std.testing.expectEqual(@as(usize, 7), second.val_len);
+
+    const third = manager.get(keys[2]) orelse return error.MissingThirdBatchKey;
+    try std.testing.expectEqual(@as(usize, 30), third.offset);
+    try std.testing.expectEqual(keys[2].len, third.key_len);
+    try std.testing.expectEqual(@as(usize, 6), third.val_len);
 }

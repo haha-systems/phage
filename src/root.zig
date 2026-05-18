@@ -246,15 +246,21 @@ pub const Phage = struct {
         // Step 3: Wait for all I/O operations to complete (single wait for entire batch)
         try self.waitForIO();
 
-        // Step 4: Update index for all entries
+        // Step 4: Update index for all entries, batching by shard so each shard is locked once
+        const index_entries = try self.allocator.alloc(index.IndexManager.BatchEntry, pairs.len);
+        defer self.allocator.free(index_entries);
         for (pairs, 0..) |pair, i| {
-            try self.index.put(self.allocator, pair.key, .{
-                .offset = data_batch.offsets[i],
-                .len = data_batch.lengths[i],
-                .key_len = pair.key.len,
-                .val_len = pair.value.len,
-            });
+            index_entries[i] = .{
+                .key = pair.key,
+                .entry = .{
+                    .offset = data_batch.offsets[i],
+                    .len = data_batch.lengths[i],
+                    .key_len = pair.key.len,
+                    .val_len = pair.value.len,
+                },
+            };
         }
+        try self.index.putBatch(self.allocator, index_entries);
 
         // Step 5: Clear the WAL file now that all batch entries are complete
         try Wal.clear(self);
