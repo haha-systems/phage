@@ -22,6 +22,17 @@ const Trie = data_structures.Trie;
 
 pub const Phage = struct {
     pub const BatchPair = struct { key: []const u8, value: []const u8 };
+    const BatchDataEntries = struct {
+        buffer: []u8,
+        offsets: []usize,
+        lengths: []usize,
+
+        fn deinit(self: *BatchDataEntries, allocator: Allocator) void {
+            allocator.free(self.buffer);
+            allocator.free(self.offsets);
+            allocator.free(self.lengths);
+        }
+    };
 
     allocator: Allocator,
     backend: Backend,
@@ -192,15 +203,14 @@ pub const Phage = struct {
     pub fn putBatch(self: *Phage, pairs: []const BatchPair) !void {
         if (pairs.len == 0) return;
 
-        // Prepare all data entries first
-        var data_entries = try self.allocator.alloc([]u8, pairs.len);
-        defer {
-            for (data_entries) |entry| {
-                self.allocator.free(entry);
-            }
-            self.allocator.free(data_entries);
+        var data_batch = try self.formatBatchDataEntries(pairs, 0);
+        defer data_batch.deinit(self.allocator);
+        const data_base_offset = self.file_size.fetchAdd(data_batch.buffer.len, .monotonic);
+        for (data_batch.offsets) |*data_offset| {
+            data_offset.* += data_base_offset;
         }
 
+        // Prepare WAL entries first, using known data offsets
         var wal_entries = try self.allocator.alloc([]u8, pairs.len);
         defer {
             for (wal_entries) |entry| {
@@ -209,23 +219,15 @@ pub const Phage = struct {
             self.allocator.free(wal_entries);
         }
 
-        var data_offsets = try self.allocator.alloc(usize, pairs.len);
-        defer self.allocator.free(data_offsets);
-
-        // Step 1: Format all data entries and submit all main file writes
-        for (pairs, 0..) |pair, i| {
-            data_entries[i] = try self.formatDataEntry(pair.key, pair.value);
-            data_offsets[i] = self.file_size.fetchAdd(data_entries[i].len, .monotonic);
-
-            const ops_submitted = try self.backend.write(self.fd, data_entries[i], data_offsets[i]);
-            if (ops_submitted < 1) {
-                return error.WriteError;
-            }
+        // Step 1: Write all data entries as one contiguous main-file write
+        const data_ops_submitted = try self.backend.write(self.fd, data_batch.buffer, data_base_offset);
+        if (data_ops_submitted < 1) {
+            return error.WriteError;
         }
 
         // Step 2: Format and submit all WAL entries
         for (pairs, 0..) |pair, i| {
-            wal_entries[i] = try self.formatWalEntry(.put, pair.key, pair.value, data_offsets[i]);
+            wal_entries[i] = try self.formatWalEntry(.put, pair.key, pair.value, data_batch.offsets[i]);
             const wal_offset = self.wal_file_size.fetchAdd(wal_entries[i].len, .monotonic);
 
             const ops_submitted = try self.writeToWal(wal_entries[i], wal_offset);
@@ -240,8 +242,8 @@ pub const Phage = struct {
         // Step 4: Update index for all entries
         for (pairs, 0..) |pair, i| {
             try self.index.put(self.allocator, pair.key, .{
-                .offset = data_offsets[i],
-                .len = data_entries[i].len,
+                .offset = data_batch.offsets[i],
+                .len = data_batch.lengths[i],
                 .key_len = pair.key.len,
                 .val_len = pair.value.len,
             });
@@ -739,6 +741,48 @@ pub const Phage = struct {
         return buf;
     }
 
+    fn formatBatchDataEntries(self: *Phage, pairs: []const BatchPair, base_offset: usize) !BatchDataEntries {
+        const header_size = @sizeOf(index.EntryHeader);
+        var total_size: usize = 0;
+        for (pairs) |pair| {
+            if (pair.key.len > std.math.maxInt(u32) or pair.value.len > std.math.maxInt(u32)) {
+                return error.ValueTooLarge;
+            }
+            total_size += header_size + pair.key.len + pair.value.len;
+        }
+
+        const buffer = try self.allocator.alloc(u8, total_size);
+        errdefer self.allocator.free(buffer);
+        const offsets = try self.allocator.alloc(usize, pairs.len);
+        errdefer self.allocator.free(offsets);
+        const lengths = try self.allocator.alloc(usize, pairs.len);
+        errdefer self.allocator.free(lengths);
+
+        var cursor: usize = 0;
+        for (pairs, 0..) |pair, i| {
+            const entry_len = header_size + pair.key.len + pair.value.len;
+            offsets[i] = base_offset + cursor;
+            lengths[i] = entry_len;
+
+            const header = index.EntryHeader{
+                .key_len = @intCast(pair.key.len),
+                .val_len = @intCast(pair.value.len),
+            };
+            @memcpy(buffer[cursor .. cursor + header_size], std.mem.asBytes(&header));
+            cursor += header_size;
+            @memcpy(buffer[cursor .. cursor + pair.key.len], pair.key);
+            cursor += pair.key.len;
+            @memcpy(buffer[cursor .. cursor + pair.value.len], pair.value);
+            cursor += pair.value.len;
+        }
+
+        return .{
+            .buffer = buffer,
+            .offsets = offsets,
+            .lengths = lengths,
+        };
+    }
+
     fn readFromWal(store: *Phage, buf: []u8, offset: usize) !usize {
         return try store.backend.read(store.wal_fd, buf, offset);
     }
@@ -788,6 +832,39 @@ test "root:formatDataEntry" {
     const header: *const index.EntryHeader = @ptrCast(@alignCast(buf.ptr));
     try std.testing.expectEqual(8, header.key_len);
     try std.testing.expectEqual(10, header.val_len);
+
+    // cleanup test db
+    try testCleanup();
+}
+
+test "root:formatBatchDataEntries coalesces entries and reports absolute offsets" {
+    const allocator = std.testing.allocator;
+
+    var store = try Phage.init(allocator, "test.db");
+    defer store.deinit();
+
+    const pairs = [_]Phage.BatchPair{
+        .{ .key = "k1", .value = "value1" },
+        .{ .key = "key-two", .value = "v2" },
+    };
+    var batch = try store.formatBatchDataEntries(&pairs, 100);
+    defer batch.deinit(allocator);
+
+    const first_len = @sizeOf(index.EntryHeader) + pairs[0].key.len + pairs[0].value.len;
+    const second_len = @sizeOf(index.EntryHeader) + pairs[1].key.len + pairs[1].value.len;
+    try std.testing.expectEqual(first_len + second_len, batch.buffer.len);
+    try std.testing.expectEqual(@as(usize, 100), batch.offsets[0]);
+    try std.testing.expectEqual(@as(usize, 100 + first_len), batch.offsets[1]);
+    try std.testing.expectEqual(first_len, batch.lengths[0]);
+    try std.testing.expectEqual(second_len, batch.lengths[1]);
+
+    const first_header: *const index.EntryHeader = @ptrCast(@alignCast(batch.buffer.ptr));
+    try std.testing.expectEqual(@as(u32, @intCast(pairs[0].key.len)), first_header.key_len);
+    try std.testing.expectEqual(@as(u32, @intCast(pairs[0].value.len)), first_header.val_len);
+
+    const second_header: *const index.EntryHeader = @ptrCast(@alignCast(batch.buffer[first_len..].ptr));
+    try std.testing.expectEqual(@as(u32, @intCast(pairs[1].key.len)), second_header.key_len);
+    try std.testing.expectEqual(@as(u32, @intCast(pairs[1].value.len)), second_header.val_len);
 
     // cleanup test db
     try testCleanup();
