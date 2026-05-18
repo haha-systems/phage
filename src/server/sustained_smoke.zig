@@ -1,5 +1,11 @@
 const std = @import("std");
 const zimq = @import("zimq");
+const harness = @import("harness.zig");
+
+const whole_harness_timeout_ms: i64 = 60_000;
+const startup_timeout_ms: i64 = 5_000;
+const shutdown_timeout_ms: i64 = 5_000;
+const request_timeout_ms: i32 = 1_000;
 
 const SustainedConfig = struct {
     server_exe: ?[]const u8 = null,
@@ -12,6 +18,8 @@ const ClientWorker = struct {
     endpoint: [:0]const u8,
     client_id: usize,
     requests: usize,
+    context: harness.Context,
+    deadline: harness.Deadline,
     err: ?anyerror = null,
 };
 
@@ -39,6 +47,14 @@ pub fn main() !void {
     };
 
     const port = try chooseAvailablePort();
+    const context = harness.Context{
+        .name = "server-sustained-smoke",
+        .db_path = db_path,
+        .port = port,
+        .clients = config.clients,
+        .requests_per_client = config.requests,
+    };
+    const whole_deadline = harness.Deadline.init(whole_harness_timeout_ms);
     const endpoint = try std.fmt.allocPrintSentinel(allocator, "tcp://127.0.0.1:{}", .{port}, 0);
     defer allocator.free(endpoint);
     const port_arg = try std.fmt.allocPrint(allocator, "{}", .{port});
@@ -65,21 +81,29 @@ pub fn main() !void {
     try child.spawn();
     var child_running = true;
     defer if (child_running) {
-        if (child.kill()) |_| {
+        if (harness.terminateChildWithDeadline(&child, context, shutdown_timeout_ms)) |_| {
             child_running = false;
+            harness.closeChildStreams(&child);
         } else |err| {
             child_running = false;
+            harness.closeChildStreams(&child);
             std.debug.print("warning: failed to terminate server: {s}\n", .{@errorName(err)});
         }
     };
 
-    try waitForServer(allocator, endpoint);
-    try runSustainedClients(allocator, endpoint, config.clients, config.requests);
+    try waitForServer(allocator, endpoint, context, whole_deadline);
+    try runSustainedClients(allocator, endpoint, config.clients, config.requests, context, whole_deadline);
 
-    try std.posix.kill(child.id, std.posix.SIG.TERM);
-    try child.collectOutput(allocator, &server_stdout, &server_stderr, 1024 * 1024);
-    const term = try child.wait();
+    const term = harness.terminateChildWithDeadline(&child, context, shutdown_timeout_ms) catch |err| {
+        if (err == error.HarnessDeadlineExceeded or err == error.AlreadyTerminated) {
+            child_running = false;
+            harness.closeChildStreams(&child);
+        }
+        return err;
+    };
     child_running = false;
+    try child.collectOutput(allocator, &server_stdout, &server_stderr, 1024 * 1024);
+    harness.closeChildStreams(&child);
     switch (term) {
         .Exited => |code| if (code != 0) return error.ServerShutdownFailed,
         else => return error.ServerShutdownFailed,
@@ -160,26 +184,36 @@ fn chooseAvailablePort() !u16 {
     return listener.listen_address.getPort();
 }
 
-fn waitForServer(allocator: std.mem.Allocator, endpoint: [:0]const u8) !void {
-    const deadline = std.time.milliTimestamp() + 5_000;
-    while (std.time.milliTimestamp() < deadline) {
-        if (request(allocator, endpoint, "PING")) |response| {
+fn waitForServer(allocator: std.mem.Allocator, endpoint: [:0]const u8, context: harness.Context, whole_deadline: harness.Deadline) !void {
+    const startup_deadline = harness.Deadline.init(startup_timeout_ms);
+    while (true) {
+        try whole_deadline.ensure("whole_harness", context);
+        if (startup_deadline.expiredAt(std.time.milliTimestamp())) {
+            harness.reportTimeout("server_startup", context, startup_deadline, std.time.milliTimestamp());
+            return error.HarnessDeadlineExceeded;
+        }
+        if (request(allocator, endpoint, "PING", context, whole_deadline, false)) |response| {
             defer allocator.free(response);
             if (std.mem.eql(u8, response, "PONG")) return;
         } else |_| {}
         std.Thread.sleep(100 * std.time.ns_per_ms);
     }
-    return error.ServerDidNotStart;
 }
 
-fn runSustainedClients(allocator: std.mem.Allocator, endpoint: [:0]const u8, clients: usize, requests: usize) !void {
+fn runSustainedClients(allocator: std.mem.Allocator, endpoint: [:0]const u8, clients: usize, requests: usize, context: harness.Context, deadline: harness.Deadline) !void {
     const workers = try allocator.alloc(ClientWorker, clients);
     defer allocator.free(workers);
     var threads = try allocator.alloc(std.Thread, clients);
     defer allocator.free(threads);
 
     for (workers, 0..) |*worker, client_id| {
-        worker.* = .{ .endpoint = endpoint, .client_id = client_id, .requests = requests };
+        worker.* = .{
+            .endpoint = endpoint,
+            .client_id = client_id,
+            .requests = requests,
+            .context = context,
+            .deadline = deadline,
+        };
         threads[client_id] = try std.Thread.spawn(.{}, runClientWorker, .{ allocator, worker });
     }
 
@@ -190,68 +224,81 @@ fn runSustainedClients(allocator: std.mem.Allocator, endpoint: [:0]const u8, cli
 }
 
 fn runClientWorker(allocator: std.mem.Allocator, worker: *ClientWorker) void {
-    runClientRequests(allocator, worker.endpoint, worker.client_id, worker.requests) catch |err| {
+    runClientRequests(allocator, worker) catch |err| {
         worker.err = err;
         return;
     };
     worker.err = null;
 }
 
-fn runClientRequests(allocator: std.mem.Allocator, endpoint: [:0]const u8, client_id: usize, requests: usize) !void {
+fn runClientRequests(allocator: std.mem.Allocator, worker: *ClientWorker) !void {
     const ctx: *zimq.Context = try .init();
     defer ctx.deinit();
 
     const client: *zimq.Socket = try .init(ctx, .req);
     defer client.deinit();
     try client.set(.linger, @as(c_int, 0));
-    try client.set(.sndtimeo, @as(c_int, 1_000));
-    try client.set(.rcvtimeo, @as(c_int, 1_000));
-    try client.connect(endpoint);
+    try client.set(.sndtimeo, @as(c_int, request_timeout_ms));
+    try client.set(.rcvtimeo, @as(c_int, request_timeout_ms));
+    try worker.deadline.ensure("client_connect", worker.context);
+    try client.connect(worker.endpoint);
 
-    for (0..requests) |request_index| {
+    for (0..worker.requests) |request_index| {
+        try worker.deadline.ensure("whole_harness", worker.context);
         var command_buf: [128]u8 = undefined;
         var expected_buf: [64]u8 = undefined;
         const pattern = request_index % 4;
         const command = switch (pattern) {
             0 => "PING",
-            1 => try std.fmt.bufPrint(&command_buf, "SET sustained:{d}:{d} value-{d}-{d}", .{ client_id, request_index, client_id, request_index }),
-            2 => try std.fmt.bufPrint(&command_buf, "GET sustained:{d}:{d}", .{ client_id, request_index - 1 }),
-            else => try std.fmt.bufPrint(&command_buf, "DELETE sustained:{d}:{d}", .{ client_id, request_index - 2 }),
+            1 => try std.fmt.bufPrint(&command_buf, "SET sustained:{d}:{d} value-{d}-{d}", .{ worker.client_id, request_index, worker.client_id, request_index }),
+            2 => try std.fmt.bufPrint(&command_buf, "GET sustained:{d}:{d}", .{ worker.client_id, request_index - 1 }),
+            else => try std.fmt.bufPrint(&command_buf, "DELETE sustained:{d}:{d}", .{ worker.client_id, request_index - 2 }),
         };
         const expected = switch (pattern) {
             0 => "PONG",
             1 => "OK",
-            2 => try std.fmt.bufPrint(&expected_buf, "value-{d}-{d}", .{ client_id, request_index - 1 }),
+            2 => try std.fmt.bufPrint(&expected_buf, "value-{d}-{d}", .{ worker.client_id, request_index - 1 }),
             else => "OK",
         };
 
-        const response = try requestWithSocket(allocator, client, command);
+        const response = try requestWithSocket(allocator, client, command, worker.context, worker.deadline, true);
         defer allocator.free(response);
         if (!std.mem.eql(u8, expected, response)) {
-            std.debug.print("client {} request {} command '{s}' expected '{s}' got '{s}'\n", .{ client_id, request_index, command, expected, response });
+            std.debug.print("client {} request {} command '{s}' expected '{s}' got '{s}'\n", .{ worker.client_id, request_index, command, expected, response });
             return error.UnexpectedResponse;
         }
     }
 }
 
-fn request(allocator: std.mem.Allocator, endpoint: [:0]const u8, command: []const u8) ![]u8 {
+fn request(allocator: std.mem.Allocator, endpoint: [:0]const u8, command: []const u8, context: harness.Context, deadline: harness.Deadline, report_operation_timeout: bool) ![]u8 {
     const ctx: *zimq.Context = try .init();
     defer ctx.deinit();
 
     const client: *zimq.Socket = try .init(ctx, .req);
     defer client.deinit();
     try client.set(.linger, @as(c_int, 0));
-    try client.set(.sndtimeo, @as(c_int, 500));
-    try client.set(.rcvtimeo, @as(c_int, 500));
+    try client.set(.sndtimeo, @as(c_int, request_timeout_ms));
+    try client.set(.rcvtimeo, @as(c_int, request_timeout_ms));
+    try deadline.ensure("client_connect", context);
     try client.connect(endpoint);
-    return requestWithSocket(allocator, client, command);
+    return requestWithSocket(allocator, client, command, context, deadline, report_operation_timeout);
 }
 
-fn requestWithSocket(allocator: std.mem.Allocator, client: *zimq.Socket, command: []const u8) ![]u8 {
-    try client.sendConstSlice(command, .{});
+fn requestWithSocket(allocator: std.mem.Allocator, client: *zimq.Socket, command: []const u8, context: harness.Context, deadline: harness.Deadline, report_operation_timeout: bool) ![]u8 {
+    try deadline.ensure("whole_harness", context);
+    const send_deadline = harness.Deadline.init(@as(i64, request_timeout_ms));
+    client.sendConstSlice(command, .{}) catch |err| {
+        if (report_operation_timeout) harness.reportTimeout("request_send", context, send_deadline, std.time.milliTimestamp());
+        return err;
+    };
+    try deadline.ensure("whole_harness", context);
+    const receive_deadline = harness.Deadline.init(@as(i64, request_timeout_ms));
     var msg: zimq.Message = .empty();
     defer msg.deinit();
-    _ = try client.recvMsg(&msg, .{});
+    _ = client.recvMsg(&msg, .{}) catch |err| {
+        if (report_operation_timeout) harness.reportTimeout("response_receive", context, receive_deadline, std.time.milliTimestamp());
+        return err;
+    };
     return try allocator.dupe(u8, std.mem.trimRight(u8, msg.slice(), "\r\n"));
 }
 
@@ -292,15 +339,5 @@ fn validateTmpDbPath(db_path: []const u8) !void {
 }
 
 fn cleanupStoreFiles(db_path: []const u8) !void {
-    std.fs.cwd().deleteFile(db_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-
-    var wal_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const wal_path = try std.fmt.bufPrint(&wal_path_buf, "{s}.wal", .{db_path});
-    std.fs.cwd().deleteFile(wal_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
+    try harness.cleanupStoreFiles(db_path);
 }

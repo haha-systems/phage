@@ -1,10 +1,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zimq = @import("zimq");
+const harness = @import("harness.zig");
 
 const max_clients = 32;
 const max_total_requests = 2_000;
 const runtime_model = "multi-client-serialized-req-rep";
+const whole_harness_timeout_ms: i64 = 60_000;
+const startup_timeout_ms: i64 = 5_000;
+const shutdown_timeout_ms: i64 = 5_000;
+const request_timeout_ms: i32 = 1_000;
 
 const OutputFormat = enum { human, json };
 const CleanupStatus = enum { clean, artifacts_remaining };
@@ -78,6 +83,8 @@ const ClientWorker = struct {
     client_id: usize,
     requests: usize,
     latencies_ns: []u64,
+    context: harness.Context,
+    deadline: harness.Deadline,
     command_counts: CommandCounts = .{},
     error_count: usize = 0,
     err: ?anyerror = null,
@@ -113,6 +120,14 @@ pub fn main() !void {
     };
 
     const port = try chooseAvailablePort();
+    const context = harness.Context{
+        .name = "server-load",
+        .db_path = db_path,
+        .port = port,
+        .clients = config.clients,
+        .requests_per_client = config.requests,
+    };
+    const whole_deadline = harness.Deadline.init(whole_harness_timeout_ms);
     const endpoint = try std.fmt.allocPrintSentinel(allocator, "tcp://127.0.0.1:{}", .{port}, 0);
     defer allocator.free(endpoint);
     const port_arg = try std.fmt.allocPrint(allocator, "{}", .{port});
@@ -139,25 +154,33 @@ pub fn main() !void {
     try child.spawn();
     var child_running = true;
     defer if (child_running) {
-        if (child.kill()) |_| {
+        if (harness.terminateChildWithDeadline(&child, context, shutdown_timeout_ms)) |_| {
             child_running = false;
+            harness.closeChildStreams(&child);
         } else |err| {
             child_running = false;
+            harness.closeChildStreams(&child);
             std.debug.print("warning: failed to terminate server: {s}\n", .{@errorName(err)});
         }
     };
 
-    try waitForServer(allocator, endpoint);
+    try waitForServer(allocator, endpoint, context, whole_deadline);
 
     const start_ns = std.time.nanoTimestamp();
-    var run_stats = try runLoadClients(allocator, endpoint, config.clients, config.requests);
+    var run_stats = try runLoadClients(allocator, endpoint, config.clients, config.requests, context, whole_deadline);
     defer run_stats.deinit(allocator);
     const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start_ns);
 
-    try std.posix.kill(child.id, std.posix.SIG.TERM);
-    try child.collectOutput(allocator, &server_stdout, &server_stderr, 1024 * 1024);
-    const term = try child.wait();
+    const term = harness.terminateChildWithDeadline(&child, context, shutdown_timeout_ms) catch |err| {
+        if (err == error.HarnessDeadlineExceeded or err == error.AlreadyTerminated) {
+            child_running = false;
+            harness.closeChildStreams(&child);
+        }
+        return err;
+    };
     child_running = false;
+    try child.collectOutput(allocator, &server_stdout, &server_stderr, 1024 * 1024);
+    harness.closeChildStreams(&child);
     switch (term) {
         .Exited => |code| if (code != 0) return error.ServerShutdownFailed,
         else => return error.ServerShutdownFailed,
@@ -260,7 +283,7 @@ const LoadRunStats = struct {
     }
 };
 
-fn runLoadClients(allocator: std.mem.Allocator, endpoint: [:0]const u8, clients: usize, requests: usize) !LoadRunStats {
+fn runLoadClients(allocator: std.mem.Allocator, endpoint: [:0]const u8, clients: usize, requests: usize, context: harness.Context, deadline: harness.Deadline) !LoadRunStats {
     const workers = try allocator.alloc(ClientWorker, clients);
     defer allocator.free(workers);
     var threads = try allocator.alloc(std.Thread, clients);
@@ -268,7 +291,14 @@ fn runLoadClients(allocator: std.mem.Allocator, endpoint: [:0]const u8, clients:
 
     for (workers, 0..) |*worker, client_id| {
         const latencies = try allocator.alloc(u64, requests);
-        worker.* = .{ .endpoint = endpoint, .client_id = client_id, .requests = requests, .latencies_ns = latencies };
+        worker.* = .{
+            .endpoint = endpoint,
+            .client_id = client_id,
+            .requests = requests,
+            .latencies_ns = latencies,
+            .context = context,
+            .deadline = deadline,
+        };
         threads[client_id] = try std.Thread.spawn(.{}, runClientWorker, .{ allocator, worker });
     }
     defer for (workers) |worker| allocator.free(worker.latencies_ns);
@@ -306,18 +336,20 @@ fn runClientRequests(allocator: std.mem.Allocator, worker: *ClientWorker) !void 
     const client: *zimq.Socket = try .init(ctx, .req);
     defer client.deinit();
     try client.set(.linger, @as(c_int, 0));
-    try client.set(.sndtimeo, @as(c_int, 1_000));
-    try client.set(.rcvtimeo, @as(c_int, 1_000));
+    try client.set(.sndtimeo, @as(c_int, request_timeout_ms));
+    try client.set(.rcvtimeo, @as(c_int, request_timeout_ms));
+    try worker.deadline.ensure("client_connect", worker.context);
     try client.connect(worker.endpoint);
 
     for (0..worker.requests) |request_index| {
+        try worker.deadline.ensure("whole_harness", worker.context);
         var command_buf: [128]u8 = undefined;
         var expected_buf: [64]u8 = undefined;
         const spec = try requestSpec(worker.client_id, request_index, &command_buf, &expected_buf);
         worker.command_counts.increment(spec.kind);
 
         const start_ns = std.time.nanoTimestamp();
-        const response = requestWithSocket(allocator, client, spec.command) catch |err| {
+        const response = requestWithSocket(allocator, client, spec.command, worker.context, worker.deadline, true) catch |err| {
             worker.error_count += 1;
             return err;
         };
@@ -456,36 +488,51 @@ fn chooseAvailablePort() !u16 {
     return listener.listen_address.getPort();
 }
 
-fn waitForServer(allocator: std.mem.Allocator, endpoint: [:0]const u8) !void {
-    const deadline = std.time.milliTimestamp() + 5_000;
-    while (std.time.milliTimestamp() < deadline) {
-        if (request(allocator, endpoint, "PING")) |response| {
+fn waitForServer(allocator: std.mem.Allocator, endpoint: [:0]const u8, context: harness.Context, whole_deadline: harness.Deadline) !void {
+    const startup_deadline = harness.Deadline.init(startup_timeout_ms);
+    while (true) {
+        try whole_deadline.ensure("whole_harness", context);
+        if (startup_deadline.expiredAt(std.time.milliTimestamp())) {
+            harness.reportTimeout("server_startup", context, startup_deadline, std.time.milliTimestamp());
+            return error.HarnessDeadlineExceeded;
+        }
+        if (request(allocator, endpoint, "PING", context, whole_deadline, false)) |response| {
             defer allocator.free(response);
             if (std.mem.eql(u8, response, "PONG")) return;
         } else |_| {}
         std.Thread.sleep(100 * std.time.ns_per_ms);
     }
-    return error.ServerDidNotStart;
 }
 
-fn request(allocator: std.mem.Allocator, endpoint: [:0]const u8, command: []const u8) ![]u8 {
+fn request(allocator: std.mem.Allocator, endpoint: [:0]const u8, command: []const u8, context: harness.Context, deadline: harness.Deadline, report_operation_timeout: bool) ![]u8 {
     const ctx: *zimq.Context = try .init();
     defer ctx.deinit();
 
     const client: *zimq.Socket = try .init(ctx, .req);
     defer client.deinit();
     try client.set(.linger, @as(c_int, 0));
-    try client.set(.sndtimeo, @as(c_int, 500));
-    try client.set(.rcvtimeo, @as(c_int, 500));
+    try client.set(.sndtimeo, @as(c_int, request_timeout_ms));
+    try client.set(.rcvtimeo, @as(c_int, request_timeout_ms));
+    try deadline.ensure("client_connect", context);
     try client.connect(endpoint);
-    return requestWithSocket(allocator, client, command);
+    return requestWithSocket(allocator, client, command, context, deadline, report_operation_timeout);
 }
 
-fn requestWithSocket(allocator: std.mem.Allocator, client: *zimq.Socket, command: []const u8) ![]u8 {
-    try client.sendConstSlice(command, .{});
+fn requestWithSocket(allocator: std.mem.Allocator, client: *zimq.Socket, command: []const u8, context: harness.Context, deadline: harness.Deadline, report_operation_timeout: bool) ![]u8 {
+    try deadline.ensure("whole_harness", context);
+    const send_deadline = harness.Deadline.init(@as(i64, request_timeout_ms));
+    client.sendConstSlice(command, .{}) catch |err| {
+        if (report_operation_timeout) harness.reportTimeout("request_send", context, send_deadline, std.time.milliTimestamp());
+        return err;
+    };
+    try deadline.ensure("whole_harness", context);
+    const receive_deadline = harness.Deadline.init(@as(i64, request_timeout_ms));
     var msg: zimq.Message = .empty();
     defer msg.deinit();
-    _ = try client.recvMsg(&msg, .{});
+    _ = client.recvMsg(&msg, .{}) catch |err| {
+        if (report_operation_timeout) harness.reportTimeout("response_receive", context, receive_deadline, std.time.milliTimestamp());
+        return err;
+    };
     return try allocator.dupe(u8, std.mem.trimRight(u8, msg.slice(), "\r\n"));
 }
 
@@ -519,40 +566,11 @@ fn validateTmpDbPath(db_path: []const u8) !void {
 }
 
 fn cleanupStoreFiles(db_path: []const u8) !void {
-    try deleteIfExists(db_path);
-
-    var wal_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const wal_path = try std.fmt.bufPrint(&wal_path_buf, "{s}.wal", .{db_path});
-    try deleteIfExists(wal_path);
-
-    var compact_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const compact_path = try std.fmt.bufPrint(&compact_path_buf, "{s}.compact.tmp", .{db_path});
-    try deleteIfExists(compact_path);
-}
-
-fn deleteIfExists(path: []const u8) !void {
-    std.fs.cwd().deleteFile(path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
+    try harness.cleanupStoreFiles(db_path);
 }
 
 fn storeArtifactsClean(allocator: std.mem.Allocator, db_path: []const u8) !bool {
-    if (try fileExists(db_path)) return false;
-    const wal_path = try std.fmt.allocPrint(allocator, "{s}.wal", .{db_path});
-    defer allocator.free(wal_path);
-    if (try fileExists(wal_path)) return false;
-    const compact_path = try std.fmt.allocPrint(allocator, "{s}.compact.tmp", .{db_path});
-    defer allocator.free(compact_path);
-    return !(try fileExists(compact_path));
-}
-
-fn fileExists(path: []const u8) !bool {
-    std.fs.cwd().access(path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return err,
-    };
-    return true;
+    return try harness.storeArtifactsClean(allocator, db_path);
 }
 
 test "load args support bounded JSON measurements" {
@@ -628,4 +646,41 @@ test "load JSON output is parseable and names measurement fields" {
     try std.testing.expect(root.get("throughput").?.object.get("requests_per_second") != null);
     try std.testing.expect(root.get("latency_us").?.object.get("p95") != null);
     try std.testing.expectEqualStrings("clean", root.get("cleanup_status").?.string);
+}
+
+test "harness timeout report names actionable load context" {
+    const context = harness.Context{
+        .name = "server-load",
+        .db_path = "/tmp/phage-load-timeout-test",
+        .port = 49152,
+        .clients = 2,
+        .requests_per_client = 100,
+    };
+    const deadline = harness.Deadline{ .started_ms = 1_000, .deadline_ms = 6_000 };
+    var output = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer output.deinit();
+    var writer = output.writer().any();
+
+    try harness.writeTimeoutReport(&writer, "response_receive", context, deadline, 6_250);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, output.items, 1, "error: server harness timeout"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output.items, 1, "phase=response_receive"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output.items, 1, "harness=server-load"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output.items, 1, "clients=2"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output.items, 1, "requests_per_client=100"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output.items, 1, "port=49152"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output.items, 1, "db_path=/tmp/phage-load-timeout-test"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output.items, 1, "elapsed_ms=5250"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output.items, 1, "deadline_ms=5000"));
+}
+
+test "harness cleanup removes compact temp artifact with db and wal" {
+    const db_path = "/tmp/phage-load-cleanup-test";
+    try std.fs.cwd().writeFile(.{ .sub_path = db_path, .data = "db" });
+    try std.fs.cwd().writeFile(.{ .sub_path = "/tmp/phage-load-cleanup-test.wal", .data = "wal" });
+    try std.fs.cwd().writeFile(.{ .sub_path = "/tmp/phage-load-cleanup-test.compact.tmp", .data = "compact" });
+
+    try harness.cleanupStoreFiles(db_path);
+
+    try std.testing.expect(!(try harness.storeArtifactsExist(std.testing.allocator, db_path)));
 }

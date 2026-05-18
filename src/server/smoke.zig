@@ -1,5 +1,11 @@
 const std = @import("std");
 const zimq = @import("zimq");
+const harness = @import("harness.zig");
+
+const whole_harness_timeout_ms: i64 = 30_000;
+const startup_timeout_ms: i64 = 5_000;
+const shutdown_timeout_ms: i64 = 5_000;
+const request_timeout_ms: i32 = 1_000;
 
 const SmokeConfig = struct {
     server_exe: ?[]const u8 = null,
@@ -48,6 +54,14 @@ pub fn main() !void {
     };
 
     const port = try chooseAvailablePort();
+    const context = harness.Context{
+        .name = "server-smoke",
+        .db_path = db_path,
+        .port = port,
+        .clients = 1,
+        .requests_per_client = smokeCaseCount(),
+    };
+    const whole_deadline = harness.Deadline.init(whole_harness_timeout_ms);
     const endpoint = try std.fmt.allocPrintSentinel(allocator, "tcp://127.0.0.1:{}", .{port}, 0);
     defer allocator.free(endpoint);
     const port_arg = try std.fmt.allocPrint(allocator, "{}", .{port});
@@ -69,7 +83,7 @@ pub fn main() !void {
     try child.spawn();
     var child_running = true;
     defer if (child_running) {
-        if (child.kill()) |term| {
+        if (harness.terminateChildWithDeadline(&child, context, shutdown_timeout_ms)) |term| {
             child_running = false;
             switch (term) {
                 .Exited => |code| if (code != 0) std.debug.print("warning: server exited with code {} during smoke shutdown\n", .{code}),
@@ -82,10 +96,13 @@ pub fn main() !void {
         }
     };
 
-    try waitForServer(allocator, endpoint);
-    try runSmokeCases(allocator, endpoint);
+    try waitForServer(allocator, endpoint, context, whole_deadline);
+    try runSmokeCases(allocator, endpoint, context, whole_deadline);
 
-    const term = try child.kill();
+    const term = harness.terminateChildWithDeadline(&child, context, shutdown_timeout_ms) catch |err| {
+        if (err == error.HarnessDeadlineExceeded or err == error.AlreadyTerminated) child_running = false;
+        return err;
+    };
     child_running = false;
     switch (term) {
         .Exited => |code| if (code != 0) return error.ServerShutdownFailed,
@@ -145,19 +162,27 @@ fn chooseAvailablePort() !u16 {
     return listener.listen_address.getPort();
 }
 
-fn waitForServer(allocator: std.mem.Allocator, endpoint: [:0]const u8) !void {
-    const deadline = std.time.milliTimestamp() + 5_000;
-    while (std.time.milliTimestamp() < deadline) {
-        if (request(allocator, endpoint, "PING")) |response| {
+fn waitForServer(allocator: std.mem.Allocator, endpoint: [:0]const u8, context: harness.Context, whole_deadline: harness.Deadline) !void {
+    const startup_deadline = harness.Deadline.init(startup_timeout_ms);
+    while (true) {
+        try whole_deadline.ensure("whole_harness", context);
+        if (startup_deadline.expiredAt(std.time.milliTimestamp())) {
+            harness.reportTimeout("server_startup", context, startup_deadline, std.time.milliTimestamp());
+            return error.HarnessDeadlineExceeded;
+        }
+        if (request(allocator, endpoint, "PING", context, whole_deadline, false)) |response| {
             defer allocator.free(response);
             if (std.mem.eql(u8, response, "PONG")) return;
         } else |_| {}
         std.Thread.sleep(100 * std.time.ns_per_ms);
     }
-    return error.ServerDidNotStart;
 }
 
-fn runSmokeCases(allocator: std.mem.Allocator, endpoint: [:0]const u8) !void {
+fn smokeCaseCount() usize {
+    return 15;
+}
+
+fn runSmokeCases(allocator: std.mem.Allocator, endpoint: [:0]const u8, context: harness.Context, deadline: harness.Deadline) !void {
     const all_keys = [_][]const u8{ "alpha", "user:1", "user:2" };
     const user_present = [_][]const u8{ "user:1", "user:2" };
     const user_absent = [_][]const u8{"alpha"};
@@ -180,27 +205,39 @@ fn runSmokeCases(allocator: std.mem.Allocator, endpoint: [:0]const u8) !void {
     };
 
     for (cases) |case| {
-        const response = try request(allocator, endpoint, case.command);
+        try deadline.ensure("whole_harness", context);
+        const response = try request(allocator, endpoint, case.command, context, deadline, true);
         defer allocator.free(response);
         try assertResponse(case.command, response, case.expectation);
     }
 }
 
-fn request(allocator: std.mem.Allocator, endpoint: [:0]const u8, command: []const u8) ![]u8 {
+fn request(allocator: std.mem.Allocator, endpoint: [:0]const u8, command: []const u8, context: harness.Context, deadline: harness.Deadline, report_operation_timeout: bool) ![]u8 {
     const ctx: *zimq.Context = try .init();
     defer ctx.deinit();
 
     const client: *zimq.Socket = try .init(ctx, .req);
     defer client.deinit();
     try client.set(.linger, @as(c_int, 0));
-    try client.set(.sndtimeo, @as(c_int, 500));
-    try client.set(.rcvtimeo, @as(c_int, 500));
+    try client.set(.sndtimeo, @as(c_int, request_timeout_ms));
+    try client.set(.rcvtimeo, @as(c_int, request_timeout_ms));
+    try deadline.ensure("client_connect", context);
     try client.connect(endpoint);
 
-    try client.sendConstSlice(command, .{});
+    try deadline.ensure("whole_harness", context);
+    const send_deadline = harness.Deadline.init(@as(i64, request_timeout_ms));
+    client.sendConstSlice(command, .{}) catch |err| {
+        if (report_operation_timeout) harness.reportTimeout("request_send", context, send_deadline, std.time.milliTimestamp());
+        return err;
+    };
+    try deadline.ensure("whole_harness", context);
+    const receive_deadline = harness.Deadline.init(@as(i64, request_timeout_ms));
     var msg: zimq.Message = .empty();
     defer msg.deinit();
-    _ = try client.recvMsg(&msg, .{});
+    _ = client.recvMsg(&msg, .{}) catch |err| {
+        if (report_operation_timeout) harness.reportTimeout("response_receive", context, receive_deadline, std.time.milliTimestamp());
+        return err;
+    };
     return try allocator.dupe(u8, std.mem.trimRight(u8, msg.slice(), "\r\n"));
 }
 
@@ -256,15 +293,5 @@ fn validateTmpDbPath(db_path: []const u8) !void {
 }
 
 fn cleanupStoreFiles(db_path: []const u8) !void {
-    std.fs.cwd().deleteFile(db_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-
-    var wal_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const wal_path = try std.fmt.bufPrint(&wal_path_buf, "{s}.wal", .{db_path});
-    std.fs.cwd().deleteFile(wal_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
+    try harness.cleanupStoreFiles(db_path);
 }
