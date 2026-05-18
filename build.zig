@@ -64,6 +64,41 @@ pub fn build(b: *std.Build) void {
     const benchmark_step = b.step("benchmark", "Run the local Phage benchmark");
     benchmark_step.dependOn(&run_benchmark_cmd.step);
 
+    // The ZeroMQ server is intentionally exposed through explicit build/run
+    // steps rather than the default install step so core tests and native
+    // benchmarks stay independent of a live network runtime. The zimq package
+    // is pinned in build.zig.zon to a Zig 0.15-compatible revision.
+    const zimq_dep = b.dependency("zimq", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zimq_mod = zimq_dep.module("zimq");
+
+    const server_mod = b.createModule(.{
+        .root_source_file = b.path("src/zserver.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_mod.addImport("phage", lib_mod);
+    server_mod.addImport("zimq", zimq_mod);
+    addPhageImports(server_mod, colored_logger_mod, chameleon_mod, mvzr_mod);
+
+    const server_exe = b.addExecutable(.{
+        .name = "phage-server",
+        .root_module = server_mod,
+    });
+    const install_server = b.addInstallArtifact(server_exe, .{});
+
+    const server_step = b.step("phage-server", "Build the ZeroMQ Phage server executable");
+    server_step.dependOn(&install_server.step);
+
+    const run_server_cmd = b.addRunArtifact(server_exe);
+    if (b.args) |args| {
+        run_server_cmd.addArgs(args);
+    }
+    const run_server_step = b.step("run-server", "Run the ZeroMQ Phage server; pass args after --");
+    run_server_step.dependOn(&run_server_cmd.step);
+
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_mod,
         .test_runner = .{ .mode = .simple, .path = b.path("src/test_runner.zig") },

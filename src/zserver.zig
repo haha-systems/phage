@@ -129,7 +129,7 @@ pub fn main() !void {
     defer server_rep.deinit();
 
     // Use configured port
-    const bind_address = try std.fmt.allocPrintZ(allocator_ptr, "tcp://*:{}", .{config.port});
+    const bind_address = try std.fmt.allocPrintSentinel(allocator_ptr, "tcp://*:{}", .{config.port}, 0);
     defer allocator_ptr.free(bind_address);
 
     try server_rep.bind(bind_address);
@@ -157,7 +157,6 @@ pub fn main() !void {
                 error.MissingBenchmarkOperations => "ERR Missing benchmark operation count\n",
                 error.EmptyKey => "ERR Key cannot be empty\n",
                 error.EmptyPattern => "ERR Pattern cannot be empty\n",
-                else => "ERR Invalid command\n",
             };
             try server_rep.sendConstSlice(error_msg, .{});
             continue;
