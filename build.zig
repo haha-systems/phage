@@ -143,6 +143,28 @@ pub fn build(b: *std.Build) void {
     const server_sustained_smoke_step = b.step("server-sustained-smoke", "Run a bounded multi-client sustained smoke against the Phage server; pass args after --");
     server_sustained_smoke_step.dependOn(&run_server_sustained_smoke_cmd.step);
 
+    const server_load_mod = b.createModule(.{
+        .root_source_file = b.path("src/server/load_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_load_mod.addImport("zimq", zimq_mod);
+
+    const server_load_exe = b.addExecutable(.{
+        .name = "phage-server-load",
+        .root_module = server_load_mod,
+    });
+
+    const run_server_load_cmd = b.addRunArtifact(server_load_exe);
+    run_server_load_cmd.step.dependOn(&server_exe.step);
+    run_server_load_cmd.addArg("--server-exe");
+    run_server_load_cmd.addArtifactArg(server_exe);
+    if (b.args) |args| {
+        run_server_load_cmd.addArgs(args);
+    }
+    const server_load_step = b.step("server-load", "Run a bounded multi-client load smoke against the Phage server; pass args after --");
+    server_load_step.dependOn(&run_server_load_cmd.step);
+
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_mod,
         .test_runner = .{ .mode = .simple, .path = b.path("src/test_runner.zig") },
@@ -206,6 +228,18 @@ pub fn build(b: *std.Build) void {
     });
     const run_server_runtime_tests = b.addRunArtifact(server_runtime_tests);
 
+    const server_load_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/server/load_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_load_tests_mod.addImport("zimq", zimq_mod);
+    const server_load_tests = b.addTest(.{
+        .root_module = server_load_tests_mod,
+        .test_runner = .{ .mode = .simple, .path = b.path("src/test_runner.zig") },
+    });
+    const run_server_load_tests = b.addRunArtifact(server_load_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_benchmark_unit_tests.step);
@@ -214,6 +248,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_protocol_command_tests.step);
     test_step.dependOn(&run_server_config_tests.step);
     test_step.dependOn(&run_server_runtime_tests.step);
+    test_step.dependOn(&run_server_load_tests.step);
 }
 
 fn addPhageImports(
