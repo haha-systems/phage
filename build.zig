@@ -79,9 +79,23 @@ pub fn build(b: *std.Build) void {
     benchmark_unit_tests.root_module.addImport("phage", lib_mod);
     const run_benchmark_unit_tests = b.addRunArtifact(benchmark_unit_tests);
 
+    const compaction_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/test_wal_compaction_correctness.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addPhageImports(compaction_tests_mod, colored_logger_mod, chameleon_mod, mvzr_mod);
+    const compaction_unit_tests = b.addTest(.{
+        .root_module = compaction_tests_mod,
+        .test_runner = .{ .mode = .simple, .path = b.path("src/test_runner.zig") },
+    });
+    addPhageImports(compaction_unit_tests.root_module, colored_logger_mod, chameleon_mod, mvzr_mod);
+    const run_compaction_unit_tests = b.addRunArtifact(compaction_unit_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_benchmark_unit_tests.step);
+    test_step.dependOn(&run_compaction_unit_tests.step);
 }
 
 fn addPhageImports(
