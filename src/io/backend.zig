@@ -155,6 +155,11 @@ fn writeManyWithRing(comptime Ring: type, ring: *Ring, pending_ops: *std.atomic.
 }
 
 fn readWithRing(comptime Ring: type, ring: *Ring, pending_ops: *std.atomic.Value(u32), fd: std.posix.fd_t, buf: []u8, offset: u64) !usize {
+    // A zero-length read is already complete. Avoid submitting it to io_uring:
+    // some kernels reject empty read SQEs even though POSIX pread treats them as
+    // successful no-ops, and Phage uses empty reads for zero-length values.
+    if (buf.len == 0) return 1;
+
     var staged: u32 = 0;
     errdefer rollbackQueuedSqes(Ring, ring, staged);
 
@@ -487,6 +492,19 @@ test "linux writeMany rolls back queued SQEs when submit returns zero" {
     };
 
     try std.testing.expectError(error.WriteError, writeManyWithRing(FakeRing, &ring, &pending_ops, &writes));
+    try std.testing.expectEqual(@as(u32, 0), ring.queued);
+    try std.testing.expectEqual(@as(u32, 0), pending_ops.load(.acquire));
+}
+
+test "linux read treats empty buffers as completed no-ops" {
+    var ring = FakeRing{};
+    var pending_ops = std.atomic.Value(u32).init(0);
+    const empty: []u8 = &.{};
+
+    const submitted = try readWithRing(FakeRing, &ring, &pending_ops, 1, empty, 0);
+
+    try std.testing.expectEqual(@as(usize, 1), submitted);
+    try std.testing.expectEqual(@as(usize, 0), ring.submit_calls);
     try std.testing.expectEqual(@as(u32, 0), ring.queued);
     try std.testing.expectEqual(@as(u32, 0), pending_ops.load(.acquire));
 }
