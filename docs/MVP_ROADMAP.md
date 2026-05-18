@@ -1,11 +1,11 @@
 # Phage MVP Roadmap
 
 **Last Updated**: 2026-05-18
-**Status**: Core storage, recovery, benchmark, protocol-command, server build/run, live command smoke, and serialized multi-client server smoke slices reviewed or in progress
+**Status**: Core storage, recovery, benchmark, protocol-command, server build/run, live command smoke, serialized multi-client server smoke, and server workflow docs are implemented for review
 
 ## Executive Summary
 
-Phage's currently supported development surface is the Zig core key/value store, persistence/WAL layer, sharded index, metrics counters, protocol command execution tests, native benchmark runner, and explicit ZeroMQ server build/smoke steps. The overnight S1-S8 implementation/review pass verified core areas with `zig build test` and benchmark smokes; the server runtime PRD adds `phage-server`, `run-server`, `server-smoke`, and `server-sustained-smoke` workflows.
+Phage's currently supported development surface is the Zig core key/value store, persistence/WAL layer, sharded index, metrics counters, protocol command execution tests, native benchmark runner, and explicit ZeroMQ server build/run/smoke steps. The overnight S1-S8 implementation/review pass verified core areas with `zig build test` and benchmark smokes; the server runtime PRD adds `phage-server`, `run-server`, `server-smoke`, and `server-sustained-smoke` workflows.
 
 The ZeroMQ server source in `src/zserver.zig` contains structured lifecycle logging plus SIGINT/SIGTERM shutdown-state wiring. Runtime claims should distinguish between verified serialized multi-client REQ/REP behavior and unclaimed parallel command execution or throughput scaling.
 
@@ -27,7 +27,7 @@ The ZeroMQ server source in `src/zserver.zig` contains structured lifecycle logg
 | Command execution smoke | Implemented / unit-tested | `zig build test` covers deterministic execution/response mapping for `PING`, `SET`, `GET`, `DELETE`/`DEL`, `KEYS`, and `BENCHMARK 1`. |
 | KEYS command | Implemented in store/protocol path | `KEYS *` matches all; other patterns are regex-style (for example `user:.*`). |
 | BENCHMARK command | Implemented separately from native runner | Protocol benchmark mutates the active store and does not delegate to `src/benchmark.zig`. Use the native benchmark step for reproducible measurements. |
-| ZeroMQ server build | Implemented / explicit build steps | `zig build --help` lists `phage-server` and `run-server`; server build depends on the pinned Zig 0.15-compatible `zimq` dependency. |
+| ZeroMQ server build/run | Implemented / explicit build steps | `zig build --help` lists `phage-server` and `run-server`; manual runs should use `zig build run-server -- --db-path /tmp/phage-roadmap-server --port 5555`; server build/run depends on the pinned Zig 0.15-compatible `zimq` dependency and a working ZeroMQ/libzmq environment. |
 | Live server smoke | Implemented / explicit smoke step | `zig build server-smoke -- --db-path /tmp/phage-server-smoke` starts the built server and verifies the MVP command set over ZeroMQ. |
 | Server shutdown/logging source | Implemented / smoke-verified | Shutdown state is unit-tested and wired into the server loop; `server-sustained-smoke` asserts the shutdown metrics log line after repeated checked requests. |
 | External Demon client | Not part of this repository | User-facing docs should not require it for the supported workflow. |
@@ -52,8 +52,8 @@ The ZeroMQ server source in `src/zserver.zig` contains structured lifecycle logg
 | Keep KEYS behavior truthful | Complete for current slice | Docs describe regex-style patterns and special `*` behavior. |
 | Document BENCHMARK split | Complete for current slice | Protocol `BENCHMARK` is separate from native benchmarking and mutates the active store. |
 | Command execution smoke | Active / reviewed | Unit coverage exercises command execution and `payloadToString` response mapping for the MVP command set. |
-| Wire server into build graph | Active / reviewed | Use `zig build phage-server` and `zig build run-server -- --help`; the default `zig build run` step is still not the server workflow. |
-| Add live server smoke | Active / reviewed | Use `zig build server-smoke -- --db-path /tmp/phage-server-smoke` for MVP command coverage. |
+| Wire server into build graph | Active / reviewed | Use `zig build phage-server`, `zig build run-server -- --help`, or `zig build run-server -- --db-path /tmp/phage-roadmap-server --port 5555`; the default `zig build run` step is still not the server workflow. |
+| Add live server smoke | Active / reviewed | Use `zig build server-smoke -- --db-path /tmp/phage-server-smoke` for MVP command coverage; it requires server ZeroMQ/`zimq` dependencies but not the external Demon client. |
 
 ### Phase 3: Production readiness
 
@@ -96,12 +96,15 @@ Server status check:
 
 ```sh
 zig build --help
+zig build run-server -- --help
 # Server steps include phage-server, run-server, server-smoke, and server-sustained-smoke.
+# To start a manual server, use a disposable path: zig build run-server -- --db-path /tmp/phage-roadmap-server --port 5555
 ```
 
 ## Documentation rules for MVP claims
 
 - Use explicit server workflow names: `phage-server`, `run-server`, `server-smoke`, and `server-sustained-smoke`; do not imply that the default `zig build run` step launches the server.
+- State that server build/run/smoke steps require the pinned `zimq` package and a working ZeroMQ/libzmq environment, while core tests and native benchmark smokes do not start a live network server.
 - Describe the verified server runtime model as serialized multi-client REQ/REP handling, not parallel command execution.
 - Do not require the external Demon client for repository-local workflows.
 - Describe `KEYS` as regex-style matching with special `*` all-key behavior.

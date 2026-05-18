@@ -16,6 +16,7 @@ Phage is a Zig key/value store with:
 
 - Zig 0.15.x (the current local project has been verified with Zig 0.15.2).
 - macOS or Linux for tests and the native benchmark runner.
+- Server build/run/smoke steps require the pinned Zig 0.15-compatible `zimq` package from `build.zig.zon` and a working ZeroMQ/libzmq environment. Use `zig build --fetch` when dependencies need to be fetched before offline builds.
 - Linux for final measurements of the intended `io_uring` backend fast path.
 
 ## Build and test
@@ -75,7 +76,7 @@ The protocol `BENCHMARK` command is separate from this native benchmark runner. 
 
 ## Server/protocol status
 
-`src/zserver.zig` contains a ZeroMQ REP server implementation with command-line options for port, database path, and requested log level. Use explicit `/tmp/...` database paths for smoke runs so generated store/WAL files stay disposable.
+`src/zserver.zig` contains a ZeroMQ REP server implementation with command-line options for port, database path, and requested log level. The supported server workflow uses explicit `phage-server` and `run-server` build steps rather than the default `zig build run` step. Use explicit `/tmp/...` database paths for manual runs and smoke runs so generated store/WAL files stay disposable.
 
 ```sh
 # Build the server executable
@@ -83,6 +84,9 @@ zig build phage-server
 
 # Print server help without opening a socket or database
 zig build run-server -- --help
+
+# Start a local server with a disposable store path; press Ctrl-C to stop
+zig build run-server -- --db-path /tmp/phage-getting-started-server --port 5555
 
 # Live MVP command smoke over ZeroMQ
 zig build server-smoke -- --db-path /tmp/phage-server-smoke
@@ -151,6 +155,7 @@ The sustained server smoke starts the built server, opens multiple REQ clients, 
 
 ## Current limitations
 
+- Server build/run/smoke steps require ZeroMQ/`zimq` dependencies; core tests and the native benchmark runner do not start a live network server.
 - Server command execution is serialized through a single ZeroMQ REP loop; multi-client smokes verify request/reply interoperability across multiple client connections, not concurrent in-process store access.
 - The old external Demon client examples are not part of this repository and are not required for the supported test/benchmark workflow.
 - Server log-level configuration is parsed and printed, but Zig log filtering is still compile-time constrained.
@@ -160,6 +165,10 @@ The sustained server smoke starts the built server, opens multiple REQ clients, 
 ### `zig build run` fails
 
 The server workflow uses explicit build steps rather than the default `run` step. Use `zig build run-server -- --help` for server help, `zig build server-smoke -- --db-path /tmp/phage-server-smoke` for MVP command smoke, and `zig build server-sustained-smoke -- --db-path /tmp/phage-server-sustained-smoke --clients 2 --requests 100` for repeated multi-client smoke.
+
+### Server dependency fetch or link errors
+
+The core library, tests, and native benchmark runner are independent of a live server, but server steps need the pinned `zimq` package and a working ZeroMQ/libzmq environment. Run `zig build --fetch` if the Zig package cache is empty, then rerun the server step. If linking fails, check that ZeroMQ/libzmq is installed for your platform.
 
 ### Benchmark artifacts appear locally
 

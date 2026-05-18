@@ -14,7 +14,7 @@ zig build server-sustained-smoke -- --db-path /tmp/phage-server-sustained-smoke 
 zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16 --batch-size 16 --read-api get-into
 ```
 
-The live server smoke starts the built `phage-server` executable on an available localhost port, uses the supplied disposable `/tmp/...` database path, verifies the documented MVP command set over ZeroMQ, terminates the server, and removes the generated database/WAL files. It requires the same ZeroMQ/`zimq` dependencies as the server build and does not require the external Demon client.
+The live server smoke starts the built `phage-server` executable on an available localhost port, uses the supplied disposable `/tmp/...` database path, verifies the documented MVP command set over ZeroMQ, terminates the server, and removes the generated database/WAL files. Server build/run/smoke steps require the pinned Zig 0.15-compatible `zimq` package from `build.zig.zon` and a working ZeroMQ/libzmq environment; use `zig build --fetch` when dependencies need to be fetched before offline builds. These repository-local workflows do not require the external Demon client.
 
 The sustained server smoke starts the same built executable, opens multiple ZeroMQ REQ client connections, sends bounded repeated checked commands from each client, terminates the server, verifies the shutdown metrics log line, and removes the generated database/WAL files. The verified runtime model is multi-client serialized REQ/REP handling: multiple clients can connect and issue request/reply traffic, but `src/zserver.zig` runs a single REP receive/execute/send loop, so commands are processed one at a time and this smoke does not claim parallel command execution.
 
@@ -82,10 +82,17 @@ zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16
 
 JSON output includes workload and measurement fields such as mode, operation count, value size, batch size, read API, throughput, and p50/p95/p99 latencies.
 
-## Server configuration implemented in `src/zserver.zig`
+## Server configuration and run command implemented in `src/zserver.zig`
 
 ```sh
 phage-server [OPTIONS]
+```
+
+Use the `run-server` build step to start the server from the repository. Pass an explicit disposable database path for examples and local smoke runs so generated store/WAL files stay out of the repo:
+
+```sh
+# Press Ctrl-C to stop the server after testing.
+zig build run-server -- --db-path /tmp/phage-api-server --port 5555
 ```
 
 | Option | Description | Default |
@@ -97,7 +104,7 @@ phage-server [OPTIONS]
 
 The log-level flag is currently reported at startup; it does not dynamically reconfigure Zig's compile-time log filtering.
 
-Server source includes SIGINT/SIGTERM shutdown-state handling and key/value-style lifecycle logs. Live server behavior is verified by explicit smoke steps rather than by the default `zig build test` or native `benchmark` workflow. Use `server-smoke` for MVP command coverage and `server-sustained-smoke` for repeated multi-client serialized REQ/REP coverage.
+Server source includes SIGINT/SIGTERM shutdown-state handling and key/value-style lifecycle logs. Live server behavior is verified by explicit smoke steps rather than by the default `zig build test` or native `benchmark` workflow. Use `server-smoke` for MVP command coverage and `server-sustained-smoke` for repeated multi-client serialized REQ/REP coverage. The protocol `BENCHMARK` command is a server command that mutates the active store; it is not the same as the native benchmark build step.
 
 ### Verified runtime/client model
 
