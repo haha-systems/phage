@@ -40,6 +40,27 @@ fn executeCommandResponse(allocator: std.mem.Allocator, store: *Phage, command_l
     return try result.payloadToString(allocator);
 }
 
+test "result payload exposes borrowed slices for allocation-free server responses" {
+    const ping = protocol.Result{ .id = 1, .status = .Ok, .payload = .{ .Ping = .{ .response = "PONG" } } };
+    try std.testing.expectEqualStrings("PONG", ping.borrowedPayloadSlice().?);
+
+    const set = protocol.Result{ .id = 2, .status = .Ok, .payload = .{ .Set = .{ .value = "ignored" } } };
+    try std.testing.expectEqualStrings("OK", set.borrowedPayloadSlice().?);
+
+    const get = protocol.Result{ .id = 3, .status = .Ok, .payload = .{ .Get = .{ .value = "value" } } };
+    try std.testing.expectEqualStrings("value", get.borrowedPayloadSlice().?);
+
+    const delete = protocol.Result{ .id = 4, .status = .Ok, .payload = .{ .Delete = .{ .success = true } } };
+    try std.testing.expectEqualStrings("OK", delete.borrowedPayloadSlice().?);
+
+    const empty_keys = protocol.Result{ .id = 5, .status = .Ok, .payload = .{ .Keys = .{ .keys = &[_][]const u8{} } } };
+    try std.testing.expectEqualStrings("(empty)", empty_keys.borrowedPayloadSlice().?);
+
+    const keys = [_][]const u8{ "alpha", "beta" };
+    const non_empty_keys = protocol.Result{ .id = 6, .status = .Ok, .payload = .{ .Keys = .{ .keys = @constCast(&keys) } } };
+    try std.testing.expectEqual(@as(?[]const u8, null), non_empty_keys.borrowedPayloadSlice());
+}
+
 test "protocol command execution maps core commands to response payloads" {
     const allocator = std.testing.allocator;
     var store = try initProtocolTestStore(protocol_command_test_path);

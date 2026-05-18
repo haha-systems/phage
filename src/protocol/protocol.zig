@@ -267,27 +267,28 @@ pub const Result = struct {
     status: Status,
     payload: ResultPayload,
 
+    /// Returns a response payload slice that is already owned by the result or
+    /// is a static protocol constant. Callers must not free this slice.
+    pub fn borrowedPayloadSlice(self: Result) ?[]const u8 {
+        return switch (self.payload) {
+            .Set => "OK",
+            .Get => |get_result| get_result.value,
+            .Delete => "OK",
+            .Keys => |keys_result| if (keys_result.keys.len == 0) "(empty)" else null,
+            .Ping => |ping_result| ping_result.response,
+            .Benchmark, .Unknown => null,
+        };
+    }
+
     /// Converts the result payload to a string that can be sent over the wire.
     pub fn payloadToString(self: Result, allocator: std.mem.Allocator) ![]const u8 {
+        if (self.borrowedPayloadSlice()) |payload| {
+            return try allocator.dupe(u8, payload);
+        }
+
         switch (self.payload) {
-            .Set => {
-                return try std.fmt.allocPrint(allocator, "OK", .{});
-            },
-            .Get => |get_result| {
-                return try std.fmt.allocPrint(allocator, "{s}", .{get_result.value});
-            },
-            .Delete => {
-                return try std.fmt.allocPrint(allocator, "OK", .{});
-            },
             .Keys => |keys_result| {
-                if (keys_result.keys.len > 0) {
-                    return try std.mem.join(allocator, "\n", keys_result.keys);
-                } else {
-                    return try std.fmt.allocPrint(allocator, "(empty)", .{});
-                }
-            },
-            .Ping => |ping_result| {
-                return try std.fmt.allocPrint(allocator, "{s}", .{ping_result.response});
+                return try std.mem.join(allocator, "\n", keys_result.keys);
             },
             .Benchmark => |benchmark_result| {
                 const write_time_ms = @as(f64, @floatFromInt(benchmark_result.write_time_ns)) / 1_000_000.0;
@@ -299,6 +300,7 @@ pub const Result = struct {
             .Unknown => |unknown_result| {
                 return try std.fmt.allocPrint(allocator, "ERR: {s}", .{unknown_result.errors});
             },
+            .Set, .Get, .Delete, .Ping => unreachable,
         }
     }
 };
