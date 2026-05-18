@@ -124,10 +124,13 @@ pub fn main() !void {
             },
         }
 
-        const response_payload = try result.payloadToString(allocator_ptr);
-        defer allocator_ptr.free(response_payload);
-        try server_rep.sendSlice(response_payload, .{});
-        std.debug.print("Sent: {}\n", .{result});
+        if (result.borrowedPayloadSlice()) |response_payload| {
+            try server_rep.sendSlice(response_payload, .{});
+        } else {
+            const response_payload = try result.payloadToString(allocator_ptr);
+            defer allocator_ptr.free(response_payload);
+            try server_rep.sendSlice(response_payload, .{});
+        }
     }
 
     const snapshot = store.metrics.snapshot();
