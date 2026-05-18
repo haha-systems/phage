@@ -121,6 +121,28 @@ pub fn build(b: *std.Build) void {
     const server_smoke_step = b.step("server-smoke", "Run a live ZeroMQ smoke against the Phage server; pass args after --");
     server_smoke_step.dependOn(&run_server_smoke_cmd.step);
 
+    const server_sustained_smoke_mod = b.createModule(.{
+        .root_source_file = b.path("src/server/sustained_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_sustained_smoke_mod.addImport("zimq", zimq_mod);
+
+    const server_sustained_smoke_exe = b.addExecutable(.{
+        .name = "phage-server-sustained-smoke",
+        .root_module = server_sustained_smoke_mod,
+    });
+
+    const run_server_sustained_smoke_cmd = b.addRunArtifact(server_sustained_smoke_exe);
+    run_server_sustained_smoke_cmd.step.dependOn(&server_exe.step);
+    run_server_sustained_smoke_cmd.addArg("--server-exe");
+    run_server_sustained_smoke_cmd.addArtifactArg(server_exe);
+    if (b.args) |args| {
+        run_server_sustained_smoke_cmd.addArgs(args);
+    }
+    const server_sustained_smoke_step = b.step("server-sustained-smoke", "Run a bounded multi-client sustained smoke against the Phage server; pass args after --");
+    server_sustained_smoke_step.dependOn(&run_server_sustained_smoke_cmd.step);
+
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_mod,
         .test_runner = .{ .mode = .simple, .path = b.path("src/test_runner.zig") },
