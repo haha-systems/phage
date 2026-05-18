@@ -31,11 +31,19 @@ const BenchmarkRunOptions = struct {
     value_size: usize = 16,
 };
 
+const LatencySummary = struct {
+    p50_ns: u64 = 0,
+    p95_ns: u64 = 0,
+    p99_ns: u64 = 0,
+};
+
 const BenchmarkStats = struct {
     num_ops: u32,
     write_time_ns: u64,
     read_time_ns: u64,
     total_time_ns: u64,
+    write_latency: LatencySummary = .{},
+    read_latency: LatencySummary = .{},
 
     fn writeOpsPerSec(self: BenchmarkStats) f64 {
         return opsPerSec(self.num_ops, self.write_time_ns);
@@ -172,7 +180,28 @@ fn makeValue(allocator: std.mem.Allocator, value_size: usize) ![]u8 {
     return value;
 }
 
+fn nearestRank(sorted_samples: []const u64, percentile: u8) u64 {
+    if (sorted_samples.len == 0) return 0;
+    const rank = (@as(usize, percentile) * sorted_samples.len + 99) / 100;
+    const index = @max(@as(usize, 1), rank) - 1;
+    return sorted_samples[@min(index, sorted_samples.len - 1)];
+}
+
+fn summarizeLatencies(samples: []u64) LatencySummary {
+    std.sort.heap(u64, samples, {}, std.sort.asc(u64));
+    return .{
+        .p50_ns = nearestRank(samples, 50),
+        .p95_ns = nearestRank(samples, 95),
+        .p99_ns = nearestRank(samples, 99),
+    };
+}
+
 fn runBenchmark(store: anytype, options: BenchmarkRunOptions) !BenchmarkStats {
+    const write_latencies = try store.allocator.alloc(u64, options.ops);
+    defer store.allocator.free(write_latencies);
+    const read_latencies = try store.allocator.alloc(u64, options.ops);
+    defer store.allocator.free(read_latencies);
+
     const write_start = std.time.nanoTimestamp();
     for (0..options.ops) |i| {
         const key = try std.fmt.allocPrint(store.allocator, "key{d}", .{i});
@@ -181,7 +210,10 @@ fn runBenchmark(store: anytype, options: BenchmarkRunOptions) !BenchmarkStats {
         const value = try makeValue(store.allocator, options.value_size);
         defer store.allocator.free(value);
 
+        const op_start = std.time.nanoTimestamp();
         try store.put(key, value);
+        const op_end = std.time.nanoTimestamp();
+        write_latencies[i] = @intCast(op_end - op_start);
     }
     const write_end = std.time.nanoTimestamp();
 
@@ -191,8 +223,11 @@ fn runBenchmark(store: anytype, options: BenchmarkRunOptions) !BenchmarkStats {
         const key = try std.fmt.allocPrint(store.allocator, "key{d}", .{i});
         defer store.allocator.free(key);
 
+        const op_start = std.time.nanoTimestamp();
         const value = try store.get(key);
+        const op_end = std.time.nanoTimestamp();
         defer store.allocator.free(value);
+        read_latencies[i] = @intCast(op_end - op_start);
         checksum +%= value.len;
     }
     const read_end = std.time.nanoTimestamp();
@@ -203,7 +238,13 @@ fn runBenchmark(store: anytype, options: BenchmarkRunOptions) !BenchmarkStats {
         .write_time_ns = @intCast(write_end - write_start),
         .read_time_ns = @intCast(read_end - read_start),
         .total_time_ns = @intCast(read_end - write_start),
+        .write_latency = summarizeLatencies(write_latencies),
+        .read_latency = summarizeLatencies(read_latencies),
     };
+}
+
+fn nsToUs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1000.0;
 }
 
 fn printBenchmarkStats(stats: BenchmarkStats, writer: *std.io.AnyWriter) !void {
@@ -213,6 +254,8 @@ fn printBenchmarkStats(stats: BenchmarkStats, writer: *std.io.AnyWriter) !void {
     try writer.print("Write throughput: {d:.2} ops/sec\n", .{stats.writeOpsPerSec()});
     try writer.print("Read throughput: {d:.2} ops/sec\n", .{stats.readOpsPerSec()});
     try writer.print("Total throughput: {d:.2} ops/sec\n", .{stats.totalOpsPerSec()});
+    try writer.print("Write latency p50/p95/p99: {d:.2}/{d:.2}/{d:.2} us\n", .{ nsToUs(stats.write_latency.p50_ns), nsToUs(stats.write_latency.p95_ns), nsToUs(stats.write_latency.p99_ns) });
+    try writer.print("Read latency p50/p95/p99: {d:.2}/{d:.2}/{d:.2} us\n", .{ nsToUs(stats.read_latency.p50_ns), nsToUs(stats.read_latency.p95_ns), nsToUs(stats.read_latency.p99_ns) });
 }
 
 fn runPersistedBenchmark(allocator: std.mem.Allocator, config: Config) !void {
@@ -308,4 +351,33 @@ test "benchmark runner writes configured payload bytes" {
 
     try std.testing.expectEqual(@as(usize, 3), store.puts);
     try std.testing.expectEqual(@as(u32, 3), stats.num_ops);
+}
+
+test "benchmark latency summary uses nearest-rank percentiles" {
+    var samples = [_]u64{ 50, 10, 40, 20, 30 };
+    const summary = summarizeLatencies(&samples);
+
+    try std.testing.expectEqual(@as(u64, 30), summary.p50_ns);
+    try std.testing.expectEqual(@as(u64, 50), summary.p95_ns);
+    try std.testing.expectEqual(@as(u64, 50), summary.p99_ns);
+}
+
+test "benchmark output includes write and read latency percentiles" {
+    const stats = BenchmarkStats{
+        .num_ops = 3,
+        .write_time_ns = 3000,
+        .read_time_ns = 6000,
+        .total_time_ns = 9000,
+        .write_latency = .{ .p50_ns = 1000, .p95_ns = 2000, .p99_ns = 3000 },
+        .read_latency = .{ .p50_ns = 4000, .p95_ns = 5000, .p99_ns = 6000 },
+    };
+
+    var output = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer output.deinit();
+    var writer = output.writer().any();
+
+    try printBenchmarkStats(stats, &writer);
+
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "Write latency p50/p95/p99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "Read latency p50/p95/p99") != null);
 }
