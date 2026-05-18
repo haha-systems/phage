@@ -15,6 +15,11 @@ const OutputFormat = enum {
     json,
 };
 
+const ReadApi = enum {
+    get,
+    get_into,
+};
+
 const Config = struct {
     ops: u32 = 10_000,
     value_size: usize = 16,
@@ -24,6 +29,7 @@ const Config = struct {
     fresh: bool = true,
     mode: BenchmarkMode = .persisted,
     output_format: OutputFormat = .human,
+    read_api: ReadApi = .get,
 
     fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.owned_db_path) |db_path| {
@@ -37,6 +43,7 @@ const BenchmarkRunOptions = struct {
     ops: u32,
     value_size: usize = 16,
     batch_size: usize = 1,
+    read_api: ReadApi = .get,
 };
 
 const LatencySummary = struct {
@@ -109,11 +116,18 @@ const MemoryBenchmarkStore = struct {
         const value = self.map.get(key) orelse return error.KeyNotFound;
         return try self.allocator.dupe(u8, value);
     }
+
+    fn getInto(self: *MemoryBenchmarkStore, key: []const u8, buffer: []u8) ![]u8 {
+        const value = self.map.get(key) orelse return error.KeyNotFound;
+        if (buffer.len < value.len) return error.InsufficientBuffer;
+        @memcpy(buffer[0..value.len], value);
+        return buffer[0..value.len];
+    }
 };
 
 fn usage(program_name: []const u8) void {
     std.debug.print(
-        \\Usage: {s} [OPS] [--mode persisted|memory] [--value-size BYTES] [--batch-size N] [--db-path PATH] [--reuse] [--json]
+        \\Usage: {s} [OPS] [--mode persisted|memory] [--value-size BYTES] [--batch-size N] [--read-api get|get-into] [--db-path PATH] [--reuse] [--json]
         \\
         \\Runs the built-in BENCHMARK command locally without requiring the ZMQ server.
         \\
@@ -123,6 +137,8 @@ fn usage(program_name: []const u8) void {
         \\                              without filesystem or WAL I/O (default: persisted)
         \\  --value-size BYTES          Value payload size to write for each operation (default: 16)
         \\  --batch-size N              Number of writes to group before waiting (default: 1)
+        \\  --read-api get|get-into     Read API to measure: allocating get or caller-buffer getInto (default: get)
+        \\  --buffered-reads            Alias for --read-api get-into
         \\  --db-path PATH              Database path for persisted mode (default: phage_benchmark_store)
         \\  --reuse                     Reuse an existing database instead of deleting it first
         \\  --json                      Emit machine-readable JSON instead of human text
@@ -135,6 +151,12 @@ fn parseMode(value: []const u8) !BenchmarkMode {
     if (std.mem.eql(u8, value, "persisted")) return .persisted;
     if (std.mem.eql(u8, value, "memory")) return .memory;
     return error.InvalidBenchmarkMode;
+}
+
+fn parseReadApi(value: []const u8) !ReadApi {
+    if (std.mem.eql(u8, value, "get")) return .get;
+    if (std.mem.eql(u8, value, "get-into") or std.mem.eql(u8, value, "getInto")) return .get_into;
+    return error.InvalidReadApi;
 }
 
 fn parseArgSlice(allocator: std.mem.Allocator, args: []const []const u8) !Config {
@@ -169,6 +191,12 @@ fn parseArgSlice(allocator: std.mem.Allocator, args: []const []const u8) !Config
             if (i >= args.len) return error.MissingBatchSize;
             config.batch_size = try std.fmt.parseInt(usize, args[i], 10);
             if (config.batch_size == 0) return error.InvalidBatchSize;
+        } else if (std.mem.eql(u8, arg, "--read-api")) {
+            i += 1;
+            if (i >= args.len) return error.MissingReadApi;
+            config.read_api = try parseReadApi(args[i]);
+        } else if (std.mem.eql(u8, arg, "--buffered-reads")) {
+            config.read_api = .get_into;
         } else if (std.mem.eql(u8, arg, "--reuse")) {
             config.fresh = false;
         } else if (std.mem.eql(u8, arg, "--json")) {
@@ -264,6 +292,12 @@ fn runBenchmark(store: anytype, options: BenchmarkRunOptions) !BenchmarkStats {
     }
     const write_end = std.time.nanoTimestamp();
 
+    var reusable_read_buffer: ?[]u8 = null;
+    if (options.read_api == .get_into) {
+        reusable_read_buffer = try store.allocator.alloc(u8, options.value_size);
+    }
+    defer if (reusable_read_buffer) |buffer| store.allocator.free(buffer);
+
     var checksum: usize = 0;
     const read_start = std.time.nanoTimestamp();
     for (0..options.ops) |i| {
@@ -271,11 +305,21 @@ fn runBenchmark(store: anytype, options: BenchmarkRunOptions) !BenchmarkStats {
         defer store.allocator.free(key);
 
         const op_start = std.time.nanoTimestamp();
-        const value = try store.get(key);
+        const value = switch (options.read_api) {
+            .get => blk: {
+                const allocated = try store.get(key);
+                defer store.allocator.free(allocated);
+                break :blk allocated.len;
+            },
+            .get_into => blk: {
+                const read_buffer = reusable_read_buffer.?;
+                const buffered = try store.getInto(key, read_buffer);
+                break :blk buffered.len;
+            },
+        };
         const op_end = std.time.nanoTimestamp();
-        defer store.allocator.free(value);
         read_latencies[i] = @intCast(op_end - op_start);
-        checksum +%= value.len;
+        checksum +%= value;
     }
     const read_end = std.time.nanoTimestamp();
     std.mem.doNotOptimizeAway(checksum);
@@ -301,6 +345,13 @@ fn benchmarkModeName(mode: BenchmarkMode) []const u8 {
     };
 }
 
+fn readApiName(read_api: ReadApi) []const u8 {
+    return switch (read_api) {
+        .get => "get",
+        .get_into => "getInto",
+    };
+}
+
 fn printBenchmarkJson(config: Config, stats: BenchmarkStats, writer: *std.io.AnyWriter) !void {
     try writer.writeAll("{\"mode\":\"");
     try writer.writeAll(benchmarkModeName(config.mode));
@@ -310,6 +361,9 @@ fn printBenchmarkJson(config: Config, stats: BenchmarkStats, writer: *std.io.Any
         config.value_size,
         config.batch_size,
     });
+    try writer.writeAll(",\"read_api\":\"");
+    try writer.writeAll(readApiName(config.read_api));
+    try writer.writeAll("\"");
     try writer.writeAll(",\"throughput\":{");
     try writer.print("\"write_ops_per_sec\":{d:.2},\"read_ops_per_sec\":{d:.2},\"total_ops_per_sec\":{d:.2}", .{
         stats.writeOpsPerSec(),
@@ -331,7 +385,8 @@ fn printBenchmarkJson(config: Config, stats: BenchmarkStats, writer: *std.io.Any
     try writer.writeAll("}}}\n");
 }
 
-fn printBenchmarkStats(stats: BenchmarkStats, writer: *std.io.AnyWriter) !void {
+fn printBenchmarkStats(config: Config, stats: BenchmarkStats, writer: *std.io.AnyWriter) !void {
+    try writer.print("Read API: {s}\n", .{readApiName(config.read_api)});
     try writer.print("Write time: {d} ms\n", .{stats.write_time_ns / 1_000_000});
     try writer.print("Read time: {d} ms\n", .{stats.read_time_ns / 1_000_000});
     try writer.print("Total time: {d} ms\n", .{stats.total_time_ns / 1_000_000});
@@ -361,10 +416,10 @@ fn runPersistedBenchmark(allocator: std.mem.Allocator, config: Config) !void {
     var store = try phage.Phage.init(allocator, config.db_path);
     defer store.deinit();
 
-    const stats = try runBenchmark(&store, .{ .ops = config.ops, .value_size = config.value_size, .batch_size = config.batch_size });
+    const stats = try runBenchmark(&store, .{ .ops = config.ops, .value_size = config.value_size, .batch_size = config.batch_size, .read_api = config.read_api });
     switch (config.output_format) {
         .human => {
-            try printBenchmarkStats(stats, &stdout);
+            try printBenchmarkStats(config, stats, &stdout);
             try stdout.print("Benchmark completed.\n", .{});
         },
         .json => try printBenchmarkJson(config, stats, &stdout),
@@ -383,10 +438,10 @@ fn runMemoryBenchmark(allocator: std.mem.Allocator, config: Config) !void {
     var store = MemoryBenchmarkStore.init(allocator);
     defer store.deinit();
 
-    const stats = try runBenchmark(&store, .{ .ops = config.ops, .value_size = config.value_size, .batch_size = config.batch_size });
+    const stats = try runBenchmark(&store, .{ .ops = config.ops, .value_size = config.value_size, .batch_size = config.batch_size, .read_api = config.read_api });
     switch (config.output_format) {
         .human => {
-            try printBenchmarkStats(stats, &stdout);
+            try printBenchmarkStats(config, stats, &stdout);
             try stdout.print("Benchmark completed.\n", .{});
         },
         .json => try printBenchmarkJson(config, stats, &stdout),
@@ -458,6 +513,13 @@ test "benchmark runner writes configured payload bytes" {
             _ = key;
             return try self.allocator.alloc(u8, self.expected_value_size);
         }
+
+        fn getInto(self: *@This(), key: []const u8, buffer: []u8) ![]u8 {
+            _ = key;
+            try std.testing.expect(buffer.len >= self.expected_value_size);
+            @memset(buffer[0..self.expected_value_size], 'v');
+            return buffer[0..self.expected_value_size];
+        }
     };
 
     var store = FakeStore{ .allocator = std.testing.allocator, .expected_value_size = 128 };
@@ -490,6 +552,13 @@ test "benchmark runner groups writes by configured batch size" {
         fn get(self: *@This(), key: []const u8) ![]u8 {
             _ = key;
             return try self.allocator.dupe(u8, "value");
+        }
+
+        fn getInto(self: *@This(), key: []const u8, buffer: []u8) ![]u8 {
+            _ = self;
+            _ = key;
+            @memcpy(buffer[0..5], "value");
+            return buffer[0..5];
         }
     };
 
@@ -526,8 +595,9 @@ test "benchmark output includes write and read latency percentiles" {
     defer output.deinit();
     var writer = output.writer().any();
 
-    try printBenchmarkStats(stats, &writer);
+    try printBenchmarkStats(.{ .ops = 3, .read_api = .get }, stats, &writer);
 
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "Read API: get") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items, "Write latency p50/p95/p99") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items, "Read latency p50/p95/p99") != null);
 }
@@ -537,6 +607,90 @@ test "benchmark args support json output" {
     defer config.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(OutputFormat.json, config.output_format);
+}
+
+test "benchmark args support buffered read API mode" {
+    var config = try parseArgSlice(std.testing.allocator, &.{ "phage-benchmark", "7", "--read-api", "get-into" });
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(ReadApi.get_into, config.read_api);
+}
+
+test "benchmark json output labels the measured read API" {
+    const stats = BenchmarkStats{
+        .num_ops = 3,
+        .write_time_ns = 3000,
+        .read_time_ns = 6000,
+        .total_time_ns = 9000,
+        .write_latency = .{ .p50_ns = 1000, .p95_ns = 2000, .p99_ns = 3000 },
+        .read_latency = .{ .p50_ns = 4000, .p95_ns = 5000, .p99_ns = 6000 },
+    };
+    const config = Config{
+        .ops = 3,
+        .value_size = 16,
+        .batch_size = 2,
+        .mode = .memory,
+        .output_format = .json,
+        .read_api = .get_into,
+    };
+
+    var output = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer output.deinit();
+    var writer = output.writer().any();
+
+    try printBenchmarkJson(config, stats, &writer);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("getInto", parsed.value.object.get("read_api").?.string);
+}
+
+test "benchmark runner can use one reusable read buffer" {
+    const FakeStore = struct {
+        allocator: std.mem.Allocator,
+        get_calls: usize = 0,
+        get_into_calls: usize = 0,
+        first_buffer_ptr: ?[*]u8 = null,
+        reused_buffer: bool = true,
+
+        fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            _ = self;
+            _ = key;
+            _ = value;
+        }
+
+        fn putBatch(self: *@This(), pairs: []const phage.Phage.BatchPair) !void {
+            for (pairs) |pair| {
+                try self.put(pair.key, pair.value);
+            }
+        }
+
+        fn get(self: *@This(), key: []const u8) ![]u8 {
+            _ = key;
+            self.get_calls += 1;
+            return try self.allocator.dupe(u8, "value-16-bytes!!");
+        }
+
+        fn getInto(self: *@This(), key: []const u8, buffer: []u8) ![]u8 {
+            _ = key;
+            self.get_into_calls += 1;
+            if (self.first_buffer_ptr) |ptr| {
+                self.reused_buffer = self.reused_buffer and ptr == buffer.ptr;
+            } else {
+                self.first_buffer_ptr = buffer.ptr;
+            }
+            @memset(buffer[0..16], 'r');
+            return buffer[0..16];
+        }
+    };
+
+    var store = FakeStore{ .allocator = std.testing.allocator };
+    const stats = try runBenchmark(&store, .{ .ops = 3, .value_size = 16, .read_api = .get_into });
+
+    try std.testing.expectEqual(@as(u32, 3), stats.num_ops);
+    try std.testing.expectEqual(@as(usize, 0), store.get_calls);
+    try std.testing.expectEqual(@as(usize, 3), store.get_into_calls);
+    try std.testing.expect(store.reused_buffer);
 }
 
 test "benchmark json output is parseable and includes reproducibility fields" {
