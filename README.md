@@ -62,7 +62,13 @@ zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16
 
 # Persisted smoke with a disposable path
 zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode persisted --value-size 16 --batch-size 16 --db-path /tmp/phage-readme-bench --json
+
+# Comparable quick matrix: JSON Lines rows plus a compact summary JSON
+bench/benchmark-matrix.sh --quick --output /tmp/phage-benchmark-matrix.jsonl
+python3 -m json.tool /tmp/phage-benchmark-matrix-summary.json >/dev/null
 ```
+
+For matrix runs, use `--profile full` for the fuller local profile and keep raw JSONL/summary artifacts under `/tmp` unless a ticket explicitly approves a small curated summary. The current macOS POSIX-fallback quick baseline is documented in [docs/benchmarks/2026-05-18-macos-fallback-baseline.md](docs/benchmarks/2026-05-18-macos-fallback-baseline.md); it must not be treated as Linux `io_uring` performance evidence.
 
 The protocol `BENCHMARK` command is separate from this native benchmark runner. It runs through the server command path and writes benchmark keys into the active store; use the native benchmark command above for reproducible local checks.
 

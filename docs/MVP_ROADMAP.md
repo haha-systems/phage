@@ -18,7 +18,7 @@ The ZeroMQ server source in `src/zserver.zig` contains structured lifecycle logg
 - `zig build test` is the standard correctness gate and includes storage, protocol command, compaction, benchmark, metrics, and server-runtime unit tests.
 - `zig build -Doptimize=ReleaseFast benchmark -- ...` is the supported local one-shot benchmark path, with human or JSON output, memory or persisted modes, configurable value/batch sizes, and `get` vs `getInto` read-path selection.
 - `bench/benchmark-matrix.sh` runs repeatable quick/full benchmark profiles and emits JSON Lines rows plus a compact summary with git, Zig, OS/platform, profile, timestamp, and backend-status metadata.
-- macOS POSIX fallback remains useful for development and tests while Linux `io_uring` remains the intended high-performance backend.
+- macOS POSIX fallback remains useful for development and tests while Linux `io_uring` remains the intended high-performance backend; the 2026-05-18 quick-profile fallback baseline is recorded under `docs/benchmarks/`.
 
 ### Protocol/server status
 
@@ -43,7 +43,7 @@ The ZeroMQ server source in `src/zserver.zig` contains structured lifecycle logg
 | WAL path ownership and test artifact isolation | Complete for current slice | Store-owned WAL path lifetime and ignored test artifact paths were reviewed in S1. |
 | WAL/recovery hardening | Complete for current slice | Empty values at data offset 0, invalid op tags, delete replay, helper-based WAL clearing, and missing-data WAL replay are covered. |
 | Native benchmark runner | Active | Supports cheap memory and persisted one-shot smoke runs through the `benchmark` build step. |
-| Benchmark matrix workflow | Active / implemented for review | `bench/benchmark-matrix.sh --quick --output /tmp/phage-benchmark-matrix.jsonl` emits row-level JSON Lines and `/tmp/phage-benchmark-matrix-summary.json`; `--profile full` covers memory/persisted, batch sizes `1/16/64`, value sizes `16/256`, and `get`/`get-into` read APIs. |
+| Benchmark matrix workflow | Active / implemented for review | `bench/benchmark-matrix.sh --quick --output /tmp/phage-benchmark-matrix.jsonl` emits row-level JSON Lines and `/tmp/phage-benchmark-matrix-summary.json`; `--profile full` covers memory/persisted, batch sizes `1/16/64`, value sizes `16/256`, and `get`/`get-into` read APIs. Current macOS fallback quick baseline: memory `11.90M` total ops/sec, persisted `1.16M` total ops/sec; see [macOS POSIX-fallback benchmark baseline](benchmarks/2026-05-18-macos-fallback-baseline.md). |
 | Benchmark output/reporting | Active / reviewed | Human output remains default for one-shot runs; `--json` emits machine-readable mode/count/value/batch/latency/throughput fields, and matrix summaries add reproducibility metadata without replacing one-shot JSON. |
 | Linux io_uring verification | Blocked waiting for Linux host | Current worker evidence is macOS POSIX fallback only. Use the Linux verification runbook to collect quick and fuller `linux-io-uring` matrix artifacts on a Linux host before making final backend performance claims. |
 
@@ -95,9 +95,14 @@ zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16
 # macOS/Linux: cheap comparable matrix output for audits/reviews
 bench/benchmark-matrix.sh --quick --output /tmp/phage-benchmark-matrix.jsonl
 python3 -m json.tool /tmp/phage-benchmark-matrix-summary.json >/dev/null
+
+# Fuller comparable matrix profile; keep raw outputs in /tmp unless a ticket
+# explicitly approves committing a small curated summary.
+bench/benchmark-matrix.sh --profile full --output /tmp/phage-benchmark-matrix-full.jsonl
+python3 -m json.tool /tmp/phage-benchmark-matrix-full-summary.json >/dev/null
 ```
 
-Backend note: macOS runs the POSIX fallback path. Linux is the target platform for `io_uring` fast-path performance and should be used for final Linux backend benchmarking; see [Linux io_uring benchmark verification runbook](benchmarks/2026-05-18-linux-io-uring-verification.md) for the required Linux commands and expected `/tmp` artifacts.
+Backend note: macOS runs the POSIX fallback path. Linux is the target platform for `io_uring` fast-path performance and should be used for final Linux backend benchmarking; see [Linux io_uring benchmark verification runbook](benchmarks/2026-05-18-linux-io-uring-verification.md) for the required Linux commands and expected `/tmp` artifacts. The current macOS quick-profile fallback baseline is recorded in [macOS POSIX-fallback benchmark baseline](benchmarks/2026-05-18-macos-fallback-baseline.md).
 
 Server status check:
 

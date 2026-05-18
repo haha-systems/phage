@@ -54,6 +54,11 @@ zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16
 # Cheap benchmark matrix smoke: writes JSON Lines rows and a compact summary JSON
 bench/benchmark-matrix.sh --quick --output /tmp/phage-benchmark-matrix.jsonl
 python3 -m json.tool /tmp/phage-benchmark-matrix-summary.json >/dev/null
+
+# Fuller comparable matrix profile; keep raw outputs in /tmp unless a ticket
+# explicitly approves committing a small curated summary.
+bench/benchmark-matrix.sh --profile full --output /tmp/phage-benchmark-matrix-full.jsonl
+python3 -m json.tool /tmp/phage-benchmark-matrix-full-summary.json >/dev/null
 ```
 
 Benchmark options currently include:
@@ -74,7 +79,7 @@ The protocol `BENCHMARK` command is separate from this native benchmark runner. 
 
 ### Benchmark matrix workflow
 
-Use `bench/benchmark-matrix.sh` when you need comparable row-level results across a small matrix. The quick profile is intended for reviewer and final-audit smoke checks; it runs one memory row and one persisted row with `--read-api get-into`, value size `16`, batch size `16`, and 1,000 operations per row. Persisted rows use unique temporary database paths and the runner removes generated store/WAL files after each row.
+Use `bench/benchmark-matrix.sh` when you need comparable row-level results across a small matrix. The quick profile is intended for reviewer and final-audit smoke checks; it runs one memory row and one persisted row with `--read-api get-into`, value size `16`, batch size `16`, and 1,000 operations per row. Persisted rows use unique temporary database paths and the runner removes generated store/WAL files after each row. Keep raw JSONL/summary outputs under `/tmp` unless a ticket explicitly approves committing a small curated summary.
 
 ```sh
 # Cheap local matrix smoke
@@ -93,7 +98,7 @@ Matrix row JSON Lines include stable automation fields from the one-shot benchma
 
 ### Platform notes
 
-- macOS uses the POSIX fallback backend. It is suitable for correctness tests and local smoke checks, including persisted smokes with an explicit `/tmp/...` path.
+- macOS uses the POSIX fallback backend. It is suitable for correctness tests and local smoke checks, including persisted smokes with an explicit `/tmp/...` path. The current quick-profile fallback baseline is recorded in [macOS POSIX-fallback benchmark baseline](benchmarks/2026-05-18-macos-fallback-baseline.md).
 - Linux is the intended high-performance target for the `io_uring` backend. Linux-only backend changes should still keep macOS tests green, but final `io_uring` performance claims need a Linux host; see the [Linux io_uring benchmark verification runbook](benchmarks/2026-05-18-linux-io-uring-verification.md) for required commands and artifacts.
 - Memory-mode benchmark examples are portable and avoid generated database/WAL artifacts.
 
