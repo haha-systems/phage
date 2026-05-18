@@ -34,30 +34,41 @@ class MatrixRow:
     batch_size: int
     read_api: str
     db_path: Optional[str] = None
+    workload_profile: str = "standard"
+    update_rounds: int = 0
+
+    @property
+    def expected_operation_count(self) -> int:
+        if self.workload_profile == "compaction":
+            return self.ops * (self.update_rounds + 1)
+        return self.ops
 
 
 def profile_rows(profile: str, ops: Optional[int] = None, tmp_root: Optional[str] = None) -> List[MatrixRow]:
     if profile == "quick":
         profile_ops = 1000 if ops is None else ops
         dimensions = [
-            ("memory", 16, 16, "get-into"),
-            ("persisted", 16, 16, "get-into"),
+            ("memory", 16, 16, "get-into", "standard", 0),
+            ("persisted", 16, 16, "get-into", "standard", 0),
         ]
     elif profile in ("full", "linux-io-uring"):
         profile_ops = 10000 if ops is None else ops
         dimensions = [
-            (mode, value_size, batch_size, read_api)
+            (mode, value_size, batch_size, read_api, "standard", 0)
             for mode in ("memory", "persisted")
             for value_size in (16, 256)
             for batch_size in (1, 16, 64)
             for read_api in ("get", "get-into")
         ]
+    elif profile == "compaction":
+        profile_ops = 128 if ops is None else ops
+        dimensions = [("persisted", 64, 1, "get-into", "compaction", 2)]
     else:
         raise ValueError(f"unknown benchmark matrix profile: {profile}")
 
     root = tmp_root or make_tmp_root()
     rows: List[MatrixRow] = []
-    for index, (mode, value_size, batch_size, read_api) in enumerate(dimensions):
+    for index, (mode, value_size, batch_size, read_api, workload_profile, update_rounds) in enumerate(dimensions):
         db_path = None
         if mode == "persisted":
             db_path = os.path.join(
@@ -73,6 +84,8 @@ def profile_rows(profile: str, ops: Optional[int] = None, tmp_root: Optional[str
                 batch_size=batch_size,
                 read_api=read_api,
                 db_path=db_path,
+                workload_profile=workload_profile,
+                update_rounds=update_rounds,
             )
         )
     return rows
@@ -81,7 +94,7 @@ def profile_rows(profile: str, ops: Optional[int] = None, tmp_root: Optional[str
 def cleanup_targets(row: MatrixRow) -> List[str]:
     if row.db_path is None:
         return []
-    return [row.db_path, row.db_path + ".wal"]
+    return [row.db_path, row.db_path + ".wal", row.db_path + ".compact.tmp"]
 
 
 def cleanup_row(row: MatrixRow) -> None:
@@ -110,6 +123,10 @@ def benchmark_command(row: MatrixRow) -> List[str]:
         row.read_api,
         "--json",
     ]
+    if row.workload_profile != "standard":
+        command.extend(["--profile", row.workload_profile])
+    if row.update_rounds:
+        command.extend(["--update-rounds", str(row.update_rounds)])
     if row.db_path is not None:
         command.extend(["--db-path", row.db_path])
     return command
@@ -124,7 +141,7 @@ def enrich_row(row: MatrixRow, benchmark_stdout: str, metadata: Dict[str, Any]) 
     mismatches = []
     if parsed.get("mode") != row.mode:
         mismatches.append("mode")
-    if parsed.get("operation_count") != row.ops:
+    if parsed.get("operation_count") != row.expected_operation_count:
         mismatches.append("operation_count")
     if parsed.get("value_size") != row.value_size:
         mismatches.append("value_size")
@@ -132,6 +149,15 @@ def enrich_row(row: MatrixRow, benchmark_stdout: str, metadata: Dict[str, Any]) 
         mismatches.append("batch_size")
     if not _read_api_matches(row.read_api, parsed.get("read_api")):
         mismatches.append("read_api")
+    if parsed.get("workload_profile", "standard") != row.workload_profile:
+        mismatches.append("workload_profile")
+    if row.workload_profile == "compaction":
+        if parsed.get("live_key_count") != row.ops:
+            mismatches.append("live_key_count")
+        if parsed.get("update_rounds") != row.update_rounds:
+            mismatches.append("update_rounds")
+        if parsed.get("backend_status") != metadata["backend_status"]:
+            mismatches.append("backend_status")
     if mismatches:
         raise ValueError(f"benchmark row {row.index} output did not match command fields: {', '.join(mismatches)}")
 
@@ -151,10 +177,17 @@ def enrich_row(row: MatrixRow, benchmark_stdout: str, metadata: Dict[str, Any]) 
     return enriched
 
 
+def throughput_score(row: Dict[str, Any]) -> float:
+    throughput = row["throughput"]
+    if "total_ops_per_sec" in throughput:
+        return float(throughput["total_ops_per_sec"])
+    return float(throughput.get("write_ops_per_sec", 0.0))
+
+
 def build_summary(metadata: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     best = None
     if rows:
-        best = max(rows, key=lambda row: row["throughput"]["total_ops_per_sec"])
+        best = max(rows, key=throughput_score)
     by_mode: Dict[str, int] = {}
     for row in rows:
         by_mode[row["mode"]] = by_mode.get(row["mode"], 0) + 1
@@ -165,7 +198,7 @@ def build_summary(metadata: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[
         "rows_by_mode": by_mode,
         "best_total_ops_per_sec": best,
         "schema_notes": [
-            "Stable automation fields: type, row_count, metadata.profile, metadata.git_revision, metadata.os_platform, metadata.zig_version, metadata.backend_status, metadata.timestamp, mode, operation_count, value_size, batch_size, read_api, throughput, latency_us.",
+            "Stable automation fields: type, row_count, metadata.profile, metadata.git_revision, metadata.os_platform, metadata.zig_version, metadata.backend_status, metadata.timestamp, workload_profile, mode, operation_count, value_size, batch_size, read_api, throughput, latency_us. Compaction profile rows additionally include live_key_count, update_rounds, backend_status, and compaction metrics.",
             "Informational metadata fields such as command and platform strings may vary across machines and shells.",
         ],
     }
@@ -244,7 +277,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Phage benchmark matrix profiles and emit JSONL plus summary JSON.")
     profile = parser.add_mutually_exclusive_group()
     profile.add_argument("--quick", action="store_true", help="Run the cheap reviewer/audit profile.")
-    profile.add_argument("--profile", choices=("quick", "full", "linux-io-uring"), help="Benchmark profile to run.")
+    profile.add_argument("--profile", choices=("quick", "full", "linux-io-uring", "compaction"), help="Benchmark profile to run.")
     parser.add_argument("--ops", type=int, help="Override operation count for every matrix row.")
     parser.add_argument("--output", required=True, help="JSON Lines output path for row-level benchmark data.")
     parser.add_argument("--summary-output", help="Compact summary JSON path; defaults to OUTPUT with -summary.json suffix.")

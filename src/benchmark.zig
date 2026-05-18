@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const phage = @import("phage");
 
 pub const std_options: std.Options = .{
@@ -20,6 +21,13 @@ const ReadApi = enum {
     get_into,
 };
 
+const WorkloadProfile = enum {
+    standard,
+    compaction,
+};
+
+const DEFAULT_COMPACTION_UPDATE_ROUNDS: u32 = 2;
+
 const Config = struct {
     ops: u32 = 10_000,
     value_size: usize = 16,
@@ -30,6 +38,8 @@ const Config = struct {
     mode: BenchmarkMode = .persisted,
     output_format: OutputFormat = .human,
     read_api: ReadApi = .get,
+    workload_profile: WorkloadProfile = .standard,
+    update_rounds: u32 = DEFAULT_COMPACTION_UPDATE_ROUNDS,
 
     fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.owned_db_path) |db_path| {
@@ -75,6 +85,27 @@ const BenchmarkStats = struct {
     fn opsPerSec(num_ops: u64, elapsed_ns: u64) f64 {
         if (num_ops == 0 or elapsed_ns == 0) return 0.0;
         return @as(f64, @floatFromInt(num_ops)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0);
+    }
+};
+
+const CompactionBenchmarkStats = struct {
+    live_key_count: u32,
+    update_rounds: u32,
+    value_size: usize,
+    operation_count: u32,
+    write_time_ns: u64,
+    write_latency: LatencySummary = .{},
+    compaction_triggered: bool = false,
+    compaction_trigger_count: u32 = 0,
+    waste_ratio_before: f64 = 0.0,
+    waste_ratio_after: f64 = 0.0,
+    file_size_before: u64 = 0,
+    file_size_after: u64 = 0,
+    file_size_reduction_bytes: u64 = 0,
+    trigger_latency_ns: u64 = 0,
+
+    fn writeOpsPerSec(self: CompactionBenchmarkStats) f64 {
+        return BenchmarkStats.opsPerSec(self.operation_count, self.write_time_ns);
     }
 };
 
@@ -127,17 +158,22 @@ const MemoryBenchmarkStore = struct {
 
 fn usage(program_name: []const u8) void {
     std.debug.print(
-        \\Usage: {s} [OPS] [--mode persisted|memory] [--value-size BYTES] [--batch-size N] [--read-api get|get-into] [--db-path PATH] [--reuse] [--json]
+        \\Usage: {s} [OPS] [--mode persisted|memory] [--profile standard|compaction] [--value-size BYTES] [--batch-size N] [--read-api get|get-into] [--update-rounds N] [--db-path PATH] [--reuse] [--json]
         \\
         \\Runs the built-in BENCHMARK command locally without requiring the ZMQ server.
         \\
         \\Options:
-        \\  OPS                         Number of write/read operations (default: 10000)
+        \\  OPS                         Number of write/read operations for standard profile;
+        \\                              live-key count for compaction profile (default: 10000)
         \\  --mode persisted|memory     persisted uses Phage storage; memory uses a HashMap baseline
         \\                              without filesystem or WAL I/O (default: persisted)
+        \\  --profile standard|compaction
+        \\                              standard runs ordinary put/get; compaction runs update-heavy
+        \\                              persisted puts and reports compaction metrics (default: standard)
         \\  --value-size BYTES          Value payload size to write for each operation (default: 16)
         \\  --batch-size N              Number of writes to group before waiting (default: 1)
         \\  --read-api get|get-into     Read API to measure: allocating get or caller-buffer getInto (default: get)
+        \\  --update-rounds N           Compaction profile update rounds after initial live-key load (default: 2)
         \\  --buffered-reads            Alias for --read-api get-into
         \\  --db-path PATH              Database path for persisted mode (default: phage_benchmark_store)
         \\  --reuse                     Reuse an existing database instead of deleting it first
@@ -157,6 +193,12 @@ fn parseReadApi(value: []const u8) !ReadApi {
     if (std.mem.eql(u8, value, "get")) return .get;
     if (std.mem.eql(u8, value, "get-into") or std.mem.eql(u8, value, "getInto")) return .get_into;
     return error.InvalidReadApi;
+}
+
+fn parseWorkloadProfile(value: []const u8) !WorkloadProfile {
+    if (std.mem.eql(u8, value, "standard")) return .standard;
+    if (std.mem.eql(u8, value, "compaction")) return .compaction;
+    return error.InvalidWorkloadProfile;
 }
 
 fn parseArgSlice(allocator: std.mem.Allocator, args: []const []const u8) !Config {
@@ -181,6 +223,10 @@ fn parseArgSlice(allocator: std.mem.Allocator, args: []const []const u8) !Config
             i += 1;
             if (i >= args.len) return error.MissingBenchmarkMode;
             config.mode = try parseMode(args[i]);
+        } else if (std.mem.eql(u8, arg, "--profile")) {
+            i += 1;
+            if (i >= args.len) return error.MissingWorkloadProfile;
+            config.workload_profile = try parseWorkloadProfile(args[i]);
         } else if (std.mem.eql(u8, arg, "--value-size")) {
             i += 1;
             if (i >= args.len) return error.MissingValueSize;
@@ -195,6 +241,11 @@ fn parseArgSlice(allocator: std.mem.Allocator, args: []const []const u8) !Config
             i += 1;
             if (i >= args.len) return error.MissingReadApi;
             config.read_api = try parseReadApi(args[i]);
+        } else if (std.mem.eql(u8, arg, "--update-rounds")) {
+            i += 1;
+            if (i >= args.len) return error.MissingUpdateRounds;
+            config.update_rounds = try std.fmt.parseInt(u32, args[i], 10);
+            if (config.update_rounds == 0) return error.InvalidUpdateRounds;
         } else if (std.mem.eql(u8, arg, "--buffered-reads")) {
             config.read_api = .get_into;
         } else if (std.mem.eql(u8, arg, "--reuse")) {
@@ -352,8 +403,25 @@ fn readApiName(read_api: ReadApi) []const u8 {
     };
 }
 
+fn workloadProfileName(profile: WorkloadProfile) []const u8 {
+    return switch (profile) {
+        .standard => "standard",
+        .compaction => "compaction",
+    };
+}
+
+fn backendStatusName() []const u8 {
+    return switch (builtin.os.tag) {
+        .macos => "macos-posix-fallback",
+        .linux => "linux-io-uring-intended",
+        else => "posix-fallback",
+    };
+}
+
 fn printBenchmarkJson(config: Config, stats: BenchmarkStats, writer: *std.io.AnyWriter) !void {
-    try writer.writeAll("{\"mode\":\"");
+    try writer.writeAll("{\"workload_profile\":\"");
+    try writer.writeAll(workloadProfileName(config.workload_profile));
+    try writer.writeAll("\",\"mode\":\"");
     try writer.writeAll(benchmarkModeName(config.mode));
     try writer.writeAll("\"");
     try writer.print(",\"operation_count\":{d},\"value_size\":{d},\"batch_size\":{d}", .{
@@ -363,6 +431,9 @@ fn printBenchmarkJson(config: Config, stats: BenchmarkStats, writer: *std.io.Any
     });
     try writer.writeAll(",\"read_api\":\"");
     try writer.writeAll(readApiName(config.read_api));
+    try writer.writeAll("\"");
+    try writer.writeAll(",\"backend_status\":\"");
+    try writer.writeAll(backendStatusName());
     try writer.writeAll("\"");
     try writer.writeAll(",\"throughput\":{");
     try writer.print("\"write_ops_per_sec\":{d:.2},\"read_ops_per_sec\":{d:.2},\"total_ops_per_sec\":{d:.2}", .{
@@ -395,6 +466,170 @@ fn printBenchmarkStats(config: Config, stats: BenchmarkStats, writer: *std.io.An
     try writer.print("Total throughput: {d:.2} ops/sec\n", .{stats.totalOpsPerSec()});
     try writer.print("Write latency p50/p95/p99: {d:.2}/{d:.2}/{d:.2} us\n", .{ nsToUs(stats.write_latency.p50_ns), nsToUs(stats.write_latency.p95_ns), nsToUs(stats.write_latency.p99_ns) });
     try writer.print("Read latency p50/p95/p99: {d:.2}/{d:.2}/{d:.2} us\n", .{ nsToUs(stats.read_latency.p50_ns), nsToUs(stats.read_latency.p95_ns), nsToUs(stats.read_latency.p99_ns) });
+}
+
+fn printCompactionBenchmarkJson(config: Config, stats: CompactionBenchmarkStats, writer: *std.io.AnyWriter) !void {
+    try writer.writeAll("{\"workload_profile\":\"compaction\",\"mode\":\"persisted\"");
+    try writer.print(",\"operation_count\":{d},\"live_key_count\":{d},\"value_size\":{d},\"update_rounds\":{d},\"batch_size\":{d}", .{
+        stats.operation_count,
+        stats.live_key_count,
+        stats.value_size,
+        stats.update_rounds,
+        config.batch_size,
+    });
+    try writer.writeAll(",\"read_api\":\"");
+    try writer.writeAll(readApiName(config.read_api));
+    try writer.writeAll("\",\"backend_status\":\"");
+    try writer.writeAll(backendStatusName());
+    try writer.writeAll("\",\"throughput\":{");
+    try writer.print("\"write_ops_per_sec\":{d:.2}", .{stats.writeOpsPerSec()});
+    try writer.writeAll("},\"latency_us\":{\"write\":{");
+    try writer.print("\"p50\":{d:.2},\"p95\":{d:.2},\"p99\":{d:.2}", .{
+        nsToUs(stats.write_latency.p50_ns),
+        nsToUs(stats.write_latency.p95_ns),
+        nsToUs(stats.write_latency.p99_ns),
+    });
+    try writer.writeAll("},\"trigger\":");
+    try writer.print("{d:.2}", .{nsToUs(stats.trigger_latency_ns)});
+    try writer.writeAll("}");
+    try writer.writeAll(",\"compaction\":{");
+    try writer.print("\"triggered\":{},\"trigger_count\":{d},\"waste_ratio_before\":{d:.6},\"waste_ratio_after\":{d:.6},\"file_size_before\":{d},\"file_size_after\":{d},\"file_size_reduction_bytes\":{d}", .{
+        stats.compaction_triggered,
+        stats.compaction_trigger_count,
+        stats.waste_ratio_before,
+        stats.waste_ratio_after,
+        stats.file_size_before,
+        stats.file_size_after,
+        stats.file_size_reduction_bytes,
+    });
+    try writer.writeAll("}}\n");
+}
+
+fn printCompactionBenchmarkStats(stats: CompactionBenchmarkStats, writer: *std.io.AnyWriter) !void {
+    try writer.print("Compaction benchmark profile\n", .{});
+    try writer.print("Mode: persisted\n", .{});
+    try writer.print("Backend status: {s}\n", .{backendStatusName()});
+    try writer.print("Operation count: {d}\n", .{stats.operation_count});
+    try writer.print("Live key count: {d}\n", .{stats.live_key_count});
+    try writer.print("Value size: {d} bytes\n", .{stats.value_size});
+    try writer.print("Update rounds: {d}\n", .{stats.update_rounds});
+    try writer.print("Compaction triggered: {}\n", .{stats.compaction_triggered});
+    try writer.print("Compaction trigger count: {d}\n", .{stats.compaction_trigger_count});
+    try writer.print("Waste ratio before/after: {d:.4}/{d:.4}\n", .{ stats.waste_ratio_before, stats.waste_ratio_after });
+    try writer.print("File size before/after/reduction: {d}/{d}/{d} bytes\n", .{ stats.file_size_before, stats.file_size_after, stats.file_size_reduction_bytes });
+    try writer.print("Write throughput: {d:.2} ops/sec\n", .{stats.writeOpsPerSec()});
+    try writer.print("Write latency p50/p95/p99: {d:.2}/{d:.2}/{d:.2} us\n", .{ nsToUs(stats.write_latency.p50_ns), nsToUs(stats.write_latency.p95_ns), nsToUs(stats.write_latency.p99_ns) });
+    try writer.print("Compaction trigger latency: {d:.2} us\n", .{nsToUs(stats.trigger_latency_ns)});
+}
+
+fn removeStoreArtifacts(allocator: std.mem.Allocator, db_path: []const u8) void {
+    removeIfExists(db_path);
+    const wal_path = std.fmt.allocPrint(allocator, "{s}.wal", .{db_path}) catch return;
+    defer allocator.free(wal_path);
+    removeIfExists(wal_path);
+    const compact_path = std.fmt.allocPrint(allocator, "{s}.compact.tmp", .{db_path}) catch return;
+    defer allocator.free(compact_path);
+    removeIfExists(compact_path);
+}
+
+fn requireTmpPath(db_path: []const u8) !void {
+    if (!std.mem.startsWith(u8, db_path, "/tmp/")) return error.CompactionDbPathMustBeUnderTmp;
+}
+
+fn runCompactionWorkload(allocator: std.mem.Allocator, store: *phage.Phage, config: Config) !CompactionBenchmarkStats {
+    if (config.ops == 0) return error.InvalidOperationCount;
+    const operation_count_u64 = @as(u64, config.ops) * (@as(u64, config.update_rounds) + 1);
+    if (operation_count_u64 > std.math.maxInt(u32)) return error.OperationCountTooLarge;
+    const operation_count: u32 = @intCast(operation_count_u64);
+
+    const write_latencies = try allocator.alloc(u64, operation_count);
+    defer allocator.free(write_latencies);
+
+    const value = try makeValue(allocator, config.value_size);
+    defer allocator.free(value);
+
+    var op_index: usize = 0;
+    var compaction_triggered = false;
+    var compaction_trigger_count: u32 = 0;
+    var peak_waste_before: f64 = 0.0;
+    var file_size_before: u64 = store.file_size.load(.monotonic);
+    var file_size_reduction_bytes: u64 = 0;
+    var trigger_latency_ns: u64 = 0;
+
+    const write_start = std.time.nanoTimestamp();
+    for (0..config.ops) |key_index| {
+        const key = try std.fmt.allocPrint(allocator, "key{d}", .{key_index});
+        defer allocator.free(key);
+
+        const op_start = std.time.nanoTimestamp();
+        try store.put(key, value);
+        const op_end = std.time.nanoTimestamp();
+        write_latencies[op_index] = @intCast(op_end - op_start);
+        op_index += 1;
+    }
+
+    for (0..config.update_rounds) |_| {
+        for (0..config.ops) |key_index| {
+            const key = try std.fmt.allocPrint(allocator, "key{d}", .{key_index});
+            defer allocator.free(key);
+
+            const before_size = store.file_size.load(.monotonic);
+            const before_waste = store.calculateMainFileWasteRatio();
+            peak_waste_before = @max(peak_waste_before, before_waste);
+
+            const op_start = std.time.nanoTimestamp();
+            try store.put(key, value);
+            const op_end = std.time.nanoTimestamp();
+            const elapsed_ns: u64 = @intCast(op_end - op_start);
+            write_latencies[op_index] = elapsed_ns;
+            op_index += 1;
+
+            const after_size = store.file_size.load(.monotonic);
+            if (after_size < before_size) {
+                compaction_triggered = true;
+                compaction_trigger_count += 1;
+                file_size_before = @max(file_size_before, before_size);
+                file_size_reduction_bytes += before_size - after_size;
+                trigger_latency_ns = @max(trigger_latency_ns, elapsed_ns);
+            }
+        }
+    }
+    const write_end = std.time.nanoTimestamp();
+
+    return .{
+        .live_key_count = config.ops,
+        .update_rounds = config.update_rounds,
+        .value_size = config.value_size,
+        .operation_count = operation_count,
+        .write_time_ns = @intCast(write_end - write_start),
+        .write_latency = summarizeLatencies(write_latencies),
+        .compaction_triggered = compaction_triggered,
+        .compaction_trigger_count = compaction_trigger_count,
+        .waste_ratio_before = peak_waste_before,
+        .waste_ratio_after = store.calculateMainFileWasteRatio(),
+        .file_size_before = file_size_before,
+        .file_size_after = store.file_size.load(.monotonic),
+        .file_size_reduction_bytes = file_size_reduction_bytes,
+        .trigger_latency_ns = trigger_latency_ns,
+    };
+}
+
+fn runCompactionBenchmark(allocator: std.mem.Allocator, config: Config) !void {
+    if (config.mode != .persisted) return error.CompactionRequiresPersistedMode;
+    try requireTmpPath(config.db_path);
+
+    var stdout = std.fs.File.stdout().deprecatedWriter().any();
+    if (config.fresh) removeStoreArtifacts(allocator, config.db_path);
+    defer if (config.fresh) removeStoreArtifacts(allocator, config.db_path);
+
+    var store = try phage.Phage.init(allocator, config.db_path);
+    defer store.deinit();
+
+    const stats = try runCompactionWorkload(allocator, &store, config);
+    switch (config.output_format) {
+        .human => try printCompactionBenchmarkStats(stats, &stdout),
+        .json => try printCompactionBenchmarkJson(config, stats, &stdout),
+    }
 }
 
 fn runPersistedBenchmark(allocator: std.mem.Allocator, config: Config) !void {
@@ -460,9 +695,12 @@ pub fn main() !void {
     };
     defer config.deinit(allocator);
 
-    switch (config.mode) {
-        .persisted => try runPersistedBenchmark(allocator, config),
-        .memory => try runMemoryBenchmark(allocator, config),
+    switch (config.workload_profile) {
+        .standard => switch (config.mode) {
+            .persisted => try runPersistedBenchmark(allocator, config),
+            .memory => try runMemoryBenchmark(allocator, config),
+        },
+        .compaction => try runCompactionBenchmark(allocator, config),
     }
 }
 
@@ -600,6 +838,59 @@ test "benchmark output includes write and read latency percentiles" {
     try std.testing.expect(std.mem.indexOf(u8, output.items, "Read API: get") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items, "Write latency p50/p95/p99") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items, "Read latency p50/p95/p99") != null);
+}
+
+test "benchmark args support compaction workload profile" {
+    var config = try parseArgSlice(std.testing.allocator, &.{ "phage-benchmark", "128", "--profile", "compaction", "--update-rounds", "2", "--db-path", "/tmp/phage-compaction-test" });
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(WorkloadProfile.compaction, config.workload_profile);
+    try std.testing.expectEqual(@as(u32, 128), config.ops);
+    try std.testing.expectEqual(@as(u32, 2), config.update_rounds);
+    try std.testing.expectEqualStrings("/tmp/phage-compaction-test", config.db_path);
+}
+
+test "compaction benchmark json output names profile and compaction metrics" {
+    const stats = CompactionBenchmarkStats{
+        .live_key_count = 128,
+        .update_rounds = 2,
+        .value_size = 64,
+        .operation_count = 384,
+        .write_time_ns = 12000,
+        .write_latency = .{ .p50_ns = 1000, .p95_ns = 2000, .p99_ns = 3000 },
+        .compaction_triggered = true,
+        .compaction_trigger_count = 2,
+        .waste_ratio_before = 0.49,
+        .waste_ratio_after = 0.0,
+        .file_size_before = 20480,
+        .file_size_after = 10240,
+        .file_size_reduction_bytes = 10240,
+        .trigger_latency_ns = 25000,
+    };
+
+    var output = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer output.deinit();
+    var writer = output.writer().any();
+
+    try printCompactionBenchmarkJson(.{ .ops = 128, .value_size = 64, .batch_size = 1, .read_api = .get_into, .workload_profile = .compaction, .update_rounds = 2 }, stats, &writer);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.items, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    try std.testing.expectEqualStrings("compaction", root.get("workload_profile").?.string);
+    try std.testing.expectEqualStrings("persisted", root.get("mode").?.string);
+    try std.testing.expectEqual(@as(i64, 384), root.get("operation_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 128), root.get("live_key_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), root.get("update_rounds").?.integer);
+    try std.testing.expect(root.get("backend_status") != null);
+    try std.testing.expect(root.get("throughput").?.object.get("write_ops_per_sec") != null);
+    try std.testing.expect(root.get("latency_us").?.object.get("write").?.object.get("p95") != null);
+    try std.testing.expect(root.get("latency_us").?.object.get("trigger") != null);
+    const compaction = root.get("compaction").?.object;
+    try std.testing.expect(compaction.get("triggered").?.bool);
+    try std.testing.expectEqual(@as(i64, 2), compaction.get("trigger_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 10240), compaction.get("file_size_reduction_bytes").?.integer);
 }
 
 test "benchmark args support json output" {

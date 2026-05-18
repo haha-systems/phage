@@ -17,6 +17,7 @@ spec.loader.exec_module(benchmark_matrix)
 
 SAMPLE_BENCHMARK_JSON = json.dumps(
     {
+        "workload_profile": "standard",
         "mode": "memory",
         "operation_count": 1000,
         "value_size": 16,
@@ -30,6 +31,31 @@ SAMPLE_BENCHMARK_JSON = json.dumps(
         "latency_us": {
             "write": {"p50": 1.0, "p95": 2.0, "p99": 3.0},
             "read": {"p50": 0.5, "p95": 0.8, "p99": 1.1},
+        },
+    }
+)
+
+SAMPLE_COMPACTION_JSON = json.dumps(
+    {
+        "workload_profile": "compaction",
+        "mode": "persisted",
+        "operation_count": 384,
+        "live_key_count": 128,
+        "value_size": 64,
+        "update_rounds": 2,
+        "batch_size": 1,
+        "read_api": "getInto",
+        "backend_status": "macos-posix-fallback",
+        "throughput": {"write_ops_per_sec": 3210.0},
+        "latency_us": {"write": {"p50": 3.0, "p95": 5.0, "p99": 8.0}, "trigger": 25.0},
+        "compaction": {
+            "triggered": True,
+            "trigger_count": 2,
+            "waste_ratio_before": 0.49,
+            "waste_ratio_after": 0.0,
+            "file_size_before": 20480,
+            "file_size_after": 10240,
+            "file_size_reduction_bytes": 10240,
         },
     }
 )
@@ -55,7 +81,7 @@ class BenchmarkMatrixTests(unittest.TestCase):
             self.assertEqual(len({row.db_path for row in persisted}), len(persisted))
             for row in persisted:
                 self.assertTrue(row.db_path.startswith(tmp_root))
-                self.assertEqual([row.db_path, row.db_path + ".wal"], benchmark_matrix.cleanup_targets(row))
+                self.assertEqual([row.db_path, row.db_path + ".wal", row.db_path + ".compact.tmp"], benchmark_matrix.cleanup_targets(row))
 
     def test_default_persisted_rows_use_tmp_root_contract(self):
         rows = benchmark_matrix.profile_rows("quick", ops=1000)
@@ -107,6 +133,94 @@ class BenchmarkMatrixTests(unittest.TestCase):
         self.assertEqual("getInto", enriched["read_api"])
         self.assertEqual(150.0, enriched["throughput"]["total_ops_per_sec"])
         self.assertEqual(2.0, enriched["latency_us"]["write"]["p95"])
+
+    def test_compaction_profile_uses_tmp_persisted_row_and_cleanup_contract(self):
+        with tempfile.TemporaryDirectory(prefix="phage-matrix-test-") as tmp_root:
+            rows = benchmark_matrix.profile_rows("compaction", ops=128, tmp_root=tmp_root)
+
+            self.assertEqual(1, len(rows))
+            row = rows[0]
+            self.assertEqual("persisted", row.mode)
+            self.assertEqual("compaction", row.workload_profile)
+            self.assertEqual(128, row.ops)
+            self.assertEqual(2, row.update_rounds)
+            self.assertEqual(64, row.value_size)
+            self.assertTrue(row.db_path.startswith(tmp_root))
+            self.assertEqual(
+                [row.db_path, row.db_path + ".wal", row.db_path + ".compact.tmp"],
+                benchmark_matrix.cleanup_targets(row),
+            )
+            command = benchmark_matrix.benchmark_command(row)
+            self.assertIn("--profile", command)
+            self.assertIn("compaction", command)
+            self.assertIn("--update-rounds", command)
+            self.assertIn("2", command)
+
+    def test_enrich_row_preserves_compaction_fields(self):
+        row = benchmark_matrix.MatrixRow(
+            index=0,
+            mode="persisted",
+            ops=128,
+            value_size=64,
+            batch_size=1,
+            read_api="get-into",
+            db_path="/tmp/phage-test-compaction",
+            workload_profile="compaction",
+            update_rounds=2,
+        )
+        metadata = {
+            "profile": "compaction",
+            "git_revision": "abc123",
+            "os_platform": "Darwin-25.0.0-arm64-arm-64bit",
+            "zig_version": "0.15.2",
+            "backend_status": "macos-posix-fallback",
+            "timestamp": "2026-05-18T00:00:00Z",
+            "command": "bench/benchmark-matrix.sh --profile compaction --output /tmp/out.jsonl",
+        }
+
+        enriched = benchmark_matrix.enrich_row(row, SAMPLE_COMPACTION_JSON, metadata)
+
+        self.assertEqual("benchmark_row", enriched["type"])
+        self.assertEqual("compaction", enriched["profile"])
+        self.assertEqual("compaction", enriched["workload_profile"])
+        self.assertEqual(384, enriched["operation_count"])
+        self.assertEqual(128, enriched["live_key_count"])
+        self.assertEqual(2, enriched["update_rounds"])
+        self.assertEqual("macos-posix-fallback", enriched["backend_status"])
+        self.assertTrue(enriched["compaction"]["triggered"])
+        self.assertEqual(2, enriched["compaction"]["trigger_count"])
+        self.assertEqual(10240, enriched["compaction"]["file_size_reduction_bytes"])
+        self.assertEqual(3210.0, enriched["throughput"]["write_ops_per_sec"])
+        self.assertEqual(25.0, enriched["latency_us"]["trigger"])
+
+    def test_summary_handles_compaction_write_throughput_rows(self):
+        metadata = {
+            "profile": "compaction",
+            "git_revision": "abc123",
+            "os_platform": "Darwin-25.0.0-arm64-arm-64bit",
+            "zig_version": "0.15.2",
+            "backend_status": "macos-posix-fallback",
+            "timestamp": "2026-05-18T00:00:00Z",
+            "command": "bench/benchmark-matrix.sh --profile compaction --output /tmp/out.jsonl",
+        }
+        row = benchmark_matrix.MatrixRow(
+            index=0,
+            mode="persisted",
+            ops=128,
+            value_size=64,
+            batch_size=1,
+            read_api="get-into",
+            db_path="/tmp/phage-test-compaction",
+            workload_profile="compaction",
+            update_rounds=2,
+        )
+        enriched = benchmark_matrix.enrich_row(row, SAMPLE_COMPACTION_JSON, metadata)
+
+        summary = benchmark_matrix.build_summary(metadata, [enriched])
+
+        self.assertEqual("benchmark_summary", summary["type"])
+        self.assertEqual(1, summary["row_count"])
+        self.assertEqual(3210.0, summary["best_total_ops_per_sec"]["throughput"]["write_ops_per_sec"])
 
     def test_summary_is_machine_readable_and_names_stable_metadata(self):
         metadata = {
