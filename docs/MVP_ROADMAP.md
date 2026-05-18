@@ -1,13 +1,13 @@
 # Phage MVP Roadmap
 
 **Last Updated**: 2026-05-18
-**Status**: Core storage, recovery, benchmark, benchmark matrix, protocol-command, server build/run, live command smoke, serialized multi-client server smoke, and server workflow docs are implemented for review
+**Status**: Core storage, recovery, benchmark, benchmark matrix, protocol-command, server build/run, live command smoke, serialized multi-client server smoke, bounded server-load measurement, and server workflow docs are implemented for review
 
 ## Executive Summary
 
-Phage's currently supported development surface is the Zig core key/value store, persistence/WAL layer, sharded index, metrics counters, protocol command execution tests, native benchmark runner, and explicit ZeroMQ server build/run/smoke steps. The overnight S1-S8 implementation/review pass verified core areas with `zig build test` and benchmark smokes; the server runtime PRD adds `phage-server`, `run-server`, `server-smoke`, and `server-sustained-smoke` workflows.
+Phage's currently supported development surface is the Zig core key/value store, persistence/WAL layer, sharded index, metrics counters, protocol command execution tests, native benchmark runner, and explicit ZeroMQ server build/run/smoke/load steps. The overnight S1-S8 implementation/review pass verified core areas with `zig build test` and benchmark smokes; the server runtime PRD adds `phage-server`, `run-server`, `server-smoke`, `server-sustained-smoke`, and `server-load` workflows.
 
-The ZeroMQ server source in `src/zserver.zig` contains structured lifecycle logging plus SIGINT/SIGTERM shutdown-state wiring. Runtime claims should distinguish between verified serialized multi-client REQ/REP behavior and unclaimed parallel command execution or throughput scaling.
+The ZeroMQ server source in `src/zserver.zig` contains structured lifecycle logging plus SIGINT/SIGTERM shutdown-state wiring. Runtime claims should distinguish between verified serialized multi-client REQ/REP behavior, bounded server-load throughput/latency evidence, and unclaimed parallel command execution or throughput scaling.
 
 ## Current Status Assessment
 
@@ -30,6 +30,8 @@ The ZeroMQ server source in `src/zserver.zig` contains structured lifecycle logg
 | BENCHMARK command | Implemented separately from native runner | Protocol benchmark mutates the active store and does not delegate to `src/benchmark.zig`. Use the native benchmark step for reproducible measurements. |
 | ZeroMQ server build/run | Implemented / explicit build steps | `zig build --help` lists `phage-server` and `run-server`; manual runs should use `zig build run-server -- --db-path /tmp/phage-roadmap-server --port 5555`; server build/run depends on the pinned Zig 0.15-compatible `zimq` dependency and a working ZeroMQ/libzmq environment. |
 | Live server smoke | Implemented / explicit smoke step | `zig build server-smoke -- --db-path /tmp/phage-server-smoke` starts the built server and verifies the MVP command set over ZeroMQ. |
+| Server load harness | Implemented / evidence documented | `zig build -Doptimize=ReleaseFast server-load -- --db-path /tmp/phage-server-load --clients 2 --requests 100 --json` starts the built server, drives bounded REQ clients, reports throughput and p50/p95/p99 latency, captures shutdown metrics, and cleans generated store artifacts. Curated rows are in [server throughput baseline evidence](benchmarks/2026-05-18-server-throughput.md). |
+| Server response-path optimization | Implemented / tested | Common constant or borrowed protocol responses now use the server send path without avoidable response allocation; protocol output and the serialized REP loop are unchanged. |
 | Server shutdown/logging source | Implemented / smoke-verified | Shutdown state is unit-tested and wired into the server loop; `server-sustained-smoke` asserts the shutdown metrics log line after repeated checked requests. |
 | External Demon client | Not part of this repository | User-facing docs should not require it for the supported workflow. |
 
@@ -68,7 +70,8 @@ The ZeroMQ server source in `src/zserver.zig` contains structured lifecycle logg
 | Structured logging | Source-present / documented | Server source logs start, bind, receive-error, and shutdown paths with key/value-style messages. |
 | Graceful shutdown | Active / smoke-verified | `src/server/runtime.zig` covers SIGINT/SIGTERM shutdown state and `src/zserver.zig` checks it; sustained smoke captures `server lifecycle event=shutdown` metrics after SIGTERM. |
 | Sustained smoke/leak checks | Active / explicit server smoke | Use `zig build server-sustained-smoke -- --db-path /tmp/phage-server-sustained-smoke --clients 2 --requests 100` for a bounded live repeated-request smoke that cleans `/tmp` store/WAL files. |
-| Multi-client behavior | Active / serialized model verified | Multiple ZeroMQ REQ clients can connect and complete repeated request/reply commands; the single REP loop serializes command execution and does not claim parallel store access. |
+| Server load checks | Active / explicit bounded load step | Use `zig build -Doptimize=ReleaseFast server-load -- --db-path /tmp/phage-server-load --clients 2 --requests 100 --json > /tmp/phage-server-load.json` for local throughput/latency evidence; validate JSON under `/tmp` and commit only curated docs. |
+| Multi-client behavior | Active / serialized model verified | Multiple ZeroMQ REQ clients can connect and complete repeated request/reply commands; the single REP loop serializes command execution and does not claim parallel store access or throughput scaling with client count. |
 
 ## Verification commands
 
@@ -111,22 +114,24 @@ bench/benchmark-matrix.sh --profile full --output /tmp/phage-benchmark-matrix-fu
 python3 -m json.tool /tmp/phage-benchmark-matrix-full-summary.json >/dev/null
 ```
 
-Backend note: macOS runs the POSIX fallback path. Linux is the target platform for `io_uring` fast-path performance. OrbStack NixOS now provides post-remediation Linux correctness and matrix evidence for the optimized WAL write path: Linux `zig build test` passes after `bc23f18`, and the quick/profile summaries report `metadata.backend_status=linux-io-uring-intended`; see [Linux io_uring benchmark verification](benchmarks/2026-05-18-linux-io-uring-verification.md) for representative rows, required commands, and artifact hygiene. The current macOS quick-profile fallback baseline is recorded in [macOS POSIX-fallback benchmark baseline](benchmarks/2026-05-18-macos-fallback-baseline.md). The current compaction evidence note records macOS POSIX-fallback compaction rows separately from S4 Linux `io_uring` compaction verification rows; see [compaction benchmark and status evidence](benchmarks/2026-05-18-compaction-performance.md).
+Backend note: macOS runs the POSIX fallback path. Linux is the target platform for `io_uring` fast-path performance. OrbStack NixOS now provides post-remediation Linux correctness and matrix evidence for the optimized WAL write path: Linux `zig build test` passes after `bc23f18`, and the quick/profile summaries report `metadata.backend_status=linux-io-uring-intended`; see [Linux io_uring benchmark verification](benchmarks/2026-05-18-linux-io-uring-verification.md) for representative rows, required commands, and artifact hygiene. The current macOS quick-profile fallback baseline is recorded in [macOS POSIX-fallback benchmark baseline](benchmarks/2026-05-18-macos-fallback-baseline.md). The current compaction evidence note records macOS POSIX-fallback compaction rows separately from S4 Linux `io_uring` compaction verification rows; see [compaction benchmark and status evidence](benchmarks/2026-05-18-compaction-performance.md). Current server-load evidence is curated in [server throughput baseline evidence](benchmarks/2026-05-18-server-throughput.md), with macOS POSIX-fallback baseline rows separated from an OrbStack Linux row reporting `backend_status=linux-io-uring-intended`.
 
 Server status check:
 
 ```sh
 zig build --help
 zig build run-server -- --help
-# Server steps include phage-server, run-server, server-smoke, and server-sustained-smoke.
+# Server steps include phage-server, run-server, server-smoke, server-sustained-smoke, and server-load.
 # To start a manual server, use a disposable path: zig build run-server -- --db-path /tmp/phage-roadmap-server --port 5555
+# To collect bounded load evidence: zig build -Doptimize=ReleaseFast server-load -- --db-path /tmp/phage-roadmap-server-load --clients 2 --requests 100 --json > /tmp/phage-roadmap-server-load.json
 ```
 
 ## Documentation rules for MVP claims
 
-- Use explicit server workflow names: `phage-server`, `run-server`, `server-smoke`, and `server-sustained-smoke`; do not imply that the default `zig build run` step launches the server.
+- Use explicit server workflow names: `phage-server`, `run-server`, `server-smoke`, `server-sustained-smoke`, and `server-load`; do not imply that the default `zig build run` step launches the server.
 - State that server build/run/smoke steps require the pinned `zimq` package and a working ZeroMQ/libzmq environment, while core tests and native benchmark smokes do not start a live network server.
-- Describe the verified server runtime model as serialized multi-client REQ/REP handling, not parallel command execution.
+- Describe the verified server runtime model as serialized multi-client REQ/REP handling, not parallel command execution or throughput scaling with client count.
+- Link server performance claims to [server throughput baseline evidence](benchmarks/2026-05-18-server-throughput.md), and keep macOS POSIX-fallback rows separate from Linux `io_uring` rows.
 - Do not require the external Demon client for repository-local workflows.
 - Describe `KEYS` as regex-style matching with special `*` all-key behavior.
 - Describe protocol `BENCHMARK` as separate from the native benchmark runner and mutating the active store.
@@ -140,4 +145,5 @@ zig build run-server -- --help
 - [API Reference](API_REFERENCE.md)
 - [WAL write-path optimization evidence](benchmarks/2026-05-18-wal-write-path-optimization.md)
 - [Compaction benchmark and status evidence](benchmarks/2026-05-18-compaction-performance.md)
+- [Server throughput baseline evidence](benchmarks/2026-05-18-server-throughput.md)
 - [Linux io_uring benchmark verification runbook](benchmarks/2026-05-18-linux-io-uring-verification.md)

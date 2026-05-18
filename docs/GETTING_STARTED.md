@@ -9,14 +9,14 @@ Phage is a Zig key/value store with:
 - Allocation-owning and caller-buffer read APIs (`get` and `getInto`).
 - Basic in-process metrics for storage operation counts, errors, and total latency.
 - A native benchmark runner for local performance checks, plus a repository-local matrix runner for comparable JSONL/summary artifacts.
-- Protocol and a supported ZeroMQ server workflow under `src/protocol/` and `src/zserver.zig`.
+- Protocol plus supported ZeroMQ server build/run/smoke/load workflows under `src/protocol/`, `src/zserver.zig`, and `src/server/`.
 - Linux `io_uring` as the intended high-performance backend, with a POSIX fallback that lets tests and memory/persisted benchmark smokes run on macOS.
 
 ## Prerequisites
 
 - Zig 0.15.x (the current local project has been verified with Zig 0.15.2).
 - macOS or Linux for tests and the native benchmark runner.
-- Server build/run/smoke steps require the pinned Zig 0.15-compatible `zimq` package from `build.zig.zon` and a working ZeroMQ/libzmq environment. Use `zig build --fetch` when dependencies need to be fetched before offline builds.
+- Server build/run/smoke/load steps require the pinned Zig 0.15-compatible `zimq` package from `build.zig.zon` and a working ZeroMQ/libzmq environment. Use `zig build --fetch` when dependencies need to be fetched before offline builds.
 - Linux for final measurements of the intended `io_uring` backend fast path.
 
 ## Build and test
@@ -31,7 +31,7 @@ Current `build.zig` steps are:
 
 ```sh
 zig build --help
-# Steps include: install, uninstall, benchmark, test, phage-server, run-server, server-smoke, server-sustained-smoke
+# Steps include: install, uninstall, benchmark, test, phage-server, run-server, server-smoke, server-sustained-smoke, server-load
 ```
 
 ## Run local benchmarks
@@ -108,7 +108,7 @@ Matrix row JSON Lines include stable automation fields from the one-shot benchma
 ### Platform notes
 
 - macOS uses the POSIX fallback backend. It is suitable for correctness tests and local smoke checks, including persisted smokes with an explicit `/tmp/...` path. The current quick-profile fallback baseline is recorded in [macOS POSIX-fallback benchmark baseline](benchmarks/2026-05-18-macos-fallback-baseline.md). The macOS compaction-profile evidence is recorded separately from Linux in [compaction benchmark and status evidence](benchmarks/2026-05-18-compaction-performance.md). Do not treat macOS POSIX-fallback rows as Linux `io_uring` evidence.
-- Linux is the intended high-performance target for the `io_uring` backend. The current Linux verification note records OrbStack Linux evidence after remediation: Kanban card `t_c54e96cd` and commit `bc23f18` fixed the WAL empty-read path, the S4 WAL rerun verified Linux `zig build test`, quick matrix evidence, and a cheap `linux-io-uring --ops 1000` profile with `metadata.backend_status=linux-io-uring-intended`, and the S4 compaction rerun verified direct and matrix compaction smokes with `backend_status=linux-io-uring-intended`, `triggered=true`, `trigger_count=2`, and waste reduced to `0.0`; see the [Linux io_uring benchmark verification note](benchmarks/2026-05-18-linux-io-uring-verification.md) for commands, representative rows, and reproduction guidance.
+- Linux is the intended high-performance target for the `io_uring` backend. The current Linux verification note records OrbStack Linux evidence after remediation: Kanban card `t_c54e96cd` and commit `bc23f18` fixed the WAL empty-read path, the S4 WAL rerun verified Linux `zig build test`, quick matrix evidence, and a cheap `linux-io-uring --ops 1000` profile with `metadata.backend_status=linux-io-uring-intended`, and the S4 compaction rerun verified direct and matrix compaction smokes with `backend_status=linux-io-uring-intended`, `triggered=true`, `trigger_count=2`, and waste reduced to `0.0`; see the [Linux io_uring benchmark verification note](benchmarks/2026-05-18-linux-io-uring-verification.md) for commands, representative rows, and reproduction guidance. Server-load evidence is curated separately in [server throughput baseline evidence](benchmarks/2026-05-18-server-throughput.md): macOS rows are POSIX-fallback local evidence, while the Linux row was collected on OrbStack with `backend_status=linux-io-uring-intended`.
 - Memory-mode benchmark examples are portable and avoid generated database/WAL artifacts.
 
 ## Server/protocol status
@@ -130,6 +130,10 @@ zig build server-smoke -- --db-path /tmp/phage-server-smoke
 
 # Bounded repeated multi-client smoke over ZeroMQ
 zig build server-sustained-smoke -- --db-path /tmp/phage-server-sustained-smoke --clients 2 --requests 100
+
+# Bounded server load measurement with JSON output for local review
+zig build -Doptimize=ReleaseFast server-load -- --db-path /tmp/phage-server-load --clients 2 --requests 100 --json > /tmp/phage-server-load.json
+python3 -m json.tool /tmp/phage-server-load.json >/dev/null
 ```
 
 Runtime readiness notes:
@@ -137,7 +141,8 @@ Runtime readiness notes:
 - `src/server/runtime.zig` provides the server shutdown state used by `src/zserver.zig` for SIGINT/SIGTERM handling. The sustained server smoke sends SIGTERM after repeated checked requests and asserts that the shutdown log includes read/write/delete and error counters.
 - Lifecycle logs use structured key/value-style messages for server start, bind, receive errors, and shutdown.
 - Core storage exposes `store.metrics.snapshot()` with read/write/delete operation counts, error counts, and accumulated latency nanoseconds. `putBatch` records one write per key/value pair.
-- Verified client model: multiple ZeroMQ REQ clients can connect and complete repeated request/reply commands, but the server uses a single REP loop that serializes receive/execute/send handling. The current smoke does not claim parallel command execution or throughput scaling with client count.
+- Verified client model: multiple ZeroMQ REQ clients can connect and complete repeated request/reply commands, but the server uses a single REP loop that serializes receive/execute/send handling. The sustained smoke and load harness do not claim parallel command execution or throughput scaling with client count.
+- `server-load` reports bounded request counts, request mix, throughput, p50/p95/p99 latency, command/error counts, runtime model, backend status, shutdown-metrics capture, and cleanup status. Current curated evidence is in [server throughput baseline evidence](benchmarks/2026-05-18-server-throughput.md); it records macOS POSIX-fallback rows separately from the OrbStack Linux server-load row.
 
 The parser accepts these commands:
 
@@ -181,14 +186,16 @@ DELETE greeting
 
 ## Sustained smoke/readiness checks
 
-Use the full test suite plus the bounded live sustained server smoke before making server runtime-readiness claims:
+Use the full test suite plus bounded live sustained-smoke and load checks before making server runtime-readiness claims:
 
 ```sh
 zig build test
 zig build server-sustained-smoke -- --db-path /tmp/phage-server-sustained-smoke --clients 2 --requests 100
+zig build -Doptimize=ReleaseFast server-load -- --db-path /tmp/phage-server-load --clients 2 --requests 100 --json > /tmp/phage-server-load.json
+python3 -m json.tool /tmp/phage-server-load.json >/dev/null
 ```
 
-The sustained server smoke starts the built server, opens multiple REQ clients, sends repeated checked commands from each client, captures the shutdown metrics log line, and removes `/tmp` store/WAL artifacts. It verifies serialized multi-client REQ/REP behavior, not parallel command execution.
+The sustained server smoke starts the built server, opens multiple REQ clients, sends repeated checked commands from each client, captures the shutdown metrics log line, and removes `/tmp` store/WAL artifacts. The `server-load` step uses the same serialized server runtime for bounded throughput and latency measurement; keep raw JSON under `/tmp` unless a later ticket approves committing a curated artifact. Both checks verify serialized multi-client REQ/REP behavior, not parallel command execution.
 
 ## Current limitations
 
@@ -222,4 +229,5 @@ Use `KEYS *` for all keys. For prefixes, prefer regex-style patterns such as `KE
 - [API Reference](API_REFERENCE.md)
 - [MVP Roadmap](MVP_ROADMAP.md)
 - [Compaction benchmark and status evidence](benchmarks/2026-05-18-compaction-performance.md)
+- [Server throughput baseline evidence](benchmarks/2026-05-18-server-throughput.md)
 - [Linux io_uring benchmark verification runbook](benchmarks/2026-05-18-linux-io-uring-verification.md)

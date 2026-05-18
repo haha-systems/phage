@@ -11,12 +11,13 @@ zig build phage-server
 zig build run-server -- --help
 zig build server-smoke -- --db-path /tmp/phage-server-smoke
 zig build server-sustained-smoke -- --db-path /tmp/phage-server-sustained-smoke --clients 2 --requests 100
+zig build -Doptimize=ReleaseFast server-load -- --db-path /tmp/phage-server-load --clients 2 --requests 100 --json > /tmp/phage-server-load.json
 zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16 --batch-size 16 --read-api get-into
 ```
 
-The live server smoke starts the built `phage-server` executable on an available localhost port, uses the supplied disposable `/tmp/...` database path, verifies the documented MVP command set over ZeroMQ, terminates the server, and removes the generated database/WAL files. Server build/run/smoke steps require the pinned Zig 0.15-compatible `zimq` package from `build.zig.zon` and a working ZeroMQ/libzmq environment; use `zig build --fetch` when dependencies need to be fetched before offline builds. These repository-local workflows do not require the external Demon client.
+The live server smoke starts the built `phage-server` executable on an available localhost port, uses the supplied disposable `/tmp/...` database path, verifies the documented MVP command set over ZeroMQ, terminates the server, and removes the generated database/WAL files. Server build/run/smoke/load steps require the pinned Zig 0.15-compatible `zimq` package from `build.zig.zon` and a working ZeroMQ/libzmq environment; use `zig build --fetch` when dependencies need to be fetched before offline builds. These repository-local workflows do not require the external Demon client.
 
-The sustained server smoke starts the same built executable, opens multiple ZeroMQ REQ client connections, sends bounded repeated checked commands from each client, terminates the server, verifies the shutdown metrics log line, and removes the generated database/WAL files. The verified runtime model is multi-client serialized REQ/REP handling: multiple clients can connect and issue request/reply traffic, but `src/zserver.zig` runs a single REP receive/execute/send loop, so commands are processed one at a time and this smoke does not claim parallel command execution.
+The sustained server smoke starts the same built executable, opens multiple ZeroMQ REQ client connections, sends bounded repeated checked commands from each client, terminates the server, verifies the shutdown metrics log line, and removes the generated database/WAL files. The accepted `server-load` step extends that workflow into bounded throughput/latency measurement with human or JSON output. The verified runtime model is multi-client serialized REQ/REP handling: multiple clients can connect and issue request/reply traffic, but `src/zserver.zig` runs a single REP receive/execute/send loop, so commands are processed one at a time and these checks do not claim parallel command execution. Curated macOS and Linux server-load evidence is recorded in [server throughput baseline evidence](benchmarks/2026-05-18-server-throughput.md) instead of committed raw JSON artifacts.
 
 ## Core store API
 
@@ -104,15 +105,27 @@ zig build run-server -- --db-path /tmp/phage-api-server --port 5555
 
 The log-level flag is currently reported at startup; it does not dynamically reconfigure Zig's compile-time log filtering.
 
-Server source includes SIGINT/SIGTERM shutdown-state handling and key/value-style lifecycle logs. Live server behavior is verified by explicit smoke steps rather than by the default `zig build test` or native `benchmark` workflow. Use `server-smoke` for MVP command coverage and `server-sustained-smoke` for repeated multi-client serialized REQ/REP coverage. The protocol `BENCHMARK` command is a server command that mutates the active store; it is not the same as the native benchmark build step.
+Server source includes SIGINT/SIGTERM shutdown-state handling and key/value-style lifecycle logs. Live server behavior is verified by explicit smoke/load steps rather than by the default `zig build test` or native `benchmark` workflow. Use `server-smoke` for MVP command coverage, `server-sustained-smoke` for repeated multi-client serialized REQ/REP coverage, and `server-load` for bounded throughput/latency measurement. The protocol `BENCHMARK` command is a server command that mutates the active store; it is not the same as the native benchmark build step or the `server-load` harness.
 
 ### Verified runtime/client model
 
 - Transport: ZeroMQ REP server in `src/zserver.zig` with REQ clients.
 - Client model verified by smoke: multiple REQ client sockets can connect to the server and complete repeated request/reply commands.
 - Execution model: serialized single-server-loop handling. The server receives one message, executes one command against the store, sends one reply, then receives the next message.
-- Not claimed: parallel command execution, concurrent store access inside the server process, throughput scaling with client count, or a general-purpose load-test result.
+- Response path status: common constant/borrowed responses now avoid avoidable allocation in the server send path; protocol responses are unchanged.
+- Not claimed: parallel command execution, concurrent store access inside the server process, throughput scaling with client count, or Linux performance from macOS POSIX-fallback rows.
 - Shutdown behavior: the sustained smoke sends SIGTERM after the checked requests finish and asserts that stderr includes `server lifecycle event=shutdown` with read/write/delete and error counters.
+
+## Server load harness
+
+Use the repository-local `server-load` build step for bounded live server throughput and latency checks:
+
+```sh
+zig build -Doptimize=ReleaseFast server-load -- --db-path /tmp/phage-api-server-load --clients 2 --requests 100 --json > /tmp/phage-api-server-load.json
+python3 -m json.tool /tmp/phage-api-server-load.json >/dev/null
+```
+
+The harness starts the built `phage-server` on an available localhost port, drives deterministic `PING`/`SET`/`GET`/`DELETE` request mixes from one or more REQ clients, captures shutdown metrics, reports `runtime_model=multi-client-serialized-req-rep`, reports backend/platform status, and removes generated `/tmp` store/WAL artifacts. Treat macOS output as POSIX-fallback local evidence; Linux `io_uring` server status must come from a Linux run. See [server throughput baseline evidence](benchmarks/2026-05-18-server-throughput.md) for curated rows and artifact hygiene.
 
 ## Wire protocol
 
@@ -244,3 +257,4 @@ Common parser/server errors:
 
 - [Getting Started](GETTING_STARTED.md)
 - [MVP Roadmap](MVP_ROADMAP.md)
+- [Server throughput baseline evidence](benchmarks/2026-05-18-server-throughput.md)
