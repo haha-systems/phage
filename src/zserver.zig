@@ -3,15 +3,8 @@ const std = @import("std");
 const phage = @import("phage");
 const zimq = @import("zimq");
 const server_config = @import("server/config.zig");
+const server_handler = @import("server/handler.zig");
 const server_runtime = @import("server/runtime.zig");
-
-fn freeResultPayload(allocator: std.mem.Allocator, result: phage.protocol.Result) void {
-    switch (result.payload) {
-        .Get => |get_result| allocator.free(get_result.value),
-        .Keys => |keys_result| allocator.free(keys_result.keys),
-        else => {},
-    }
-}
 
 pub fn main() !void {
     var allocator = std.heap.GeneralPurposeAllocator(.{}){};
@@ -72,65 +65,9 @@ pub fn main() !void {
             return err;
         };
 
-        // Parse the command received from the client using Phage lib
-        const command_str: []const u8 = buf.slice();
-        // std.debug.print("Received: {s}\n", .{command_str});
-
-        var command = phage.protocol.parseCommandSlice(command_str) catch |err| {
-            std.debug.print("Error parsing command: {s}\n", .{@errorName(err)});
-            const error_msg = switch (err) {
-                error.InvalidCommand => "ERR Unknown command or invalid syntax\n",
-                error.MissingKey => "ERR Missing key\n",
-                error.MissingValue => "ERR Missing value\n",
-                error.MissingPattern => "ERR Missing pattern\n",
-                error.MissingBenchmarkOperations => "ERR Missing benchmark operation count\n",
-                error.EmptyKey => "ERR Key cannot be empty\n",
-                error.EmptyPattern => "ERR Pattern cannot be empty\n",
-            };
-            try server_rep.sendConstSlice(error_msg, .{});
-            continue;
-        };
-
-        const result = command.execute(&store) catch |err| {
-            std.debug.print("Error executing command: {s}\n", .{@errorName(err)});
-            const error_msg = switch (err) {
-                error.OutOfMemory => "ERR Server out of memory\n",
-                error.InvalidPattern => "ERR Invalid pattern for KEYS command\n",
-                error.InvalidRegex => "ERR Invalid regular expression pattern\n",
-                else => "ERR Command execution failed\n",
-            };
-            try server_rep.sendConstSlice(error_msg, .{});
-            continue;
-        };
-        defer freeResultPayload(allocator_ptr, result);
-
-        switch (result.status) {
-            .Ok => {
-                // std.debug.print("Command executed successfully: {s}\n", .{result.payload()});
-            },
-            .Error => {
-                const error_payload = try result.payloadToString(allocator_ptr);
-                defer allocator_ptr.free(error_payload);
-                std.debug.print("Command execution error: {s}\n", .{error_payload});
-                const error_msg: []const u8 = "ERR Execution failed\n";
-                try server_rep.sendConstSlice(error_msg, .{});
-                continue;
-            },
-            else => {
-                std.debug.print("Unexpected result status: {}\n", .{result.status});
-                const error_msg: []const u8 = "ERR Unexpected result status\n";
-                try server_rep.sendConstSlice(error_msg, .{});
-                continue;
-            },
-        }
-
-        if (result.borrowedPayloadSlice()) |response_payload| {
-            try server_rep.sendSlice(response_payload, .{});
-        } else {
-            const response_payload = try result.payloadToString(allocator_ptr);
-            defer allocator_ptr.free(response_payload);
-            try server_rep.sendSlice(response_payload, .{});
-        }
+        const response = try server_handler.handleRequest(allocator_ptr, &store, buf.slice());
+        defer response.deinit(allocator_ptr);
+        try server_rep.sendSlice(response.bytes, .{});
     }
 
     const snapshot = store.metrics.snapshot();
