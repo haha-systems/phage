@@ -36,13 +36,13 @@ fn parseLogLevel(level_str: []const u8) !std.log.Level {
 fn parseArgs(allocator: std.mem.Allocator) !Config {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
-    
+
     var config = Config{};
-    
+
     var i: usize = 1; // Skip program name
     while (i < args.len) {
         const arg = args[i];
-        
+
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             config.help = true;
             return config;
@@ -79,7 +79,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
         }
         i += 1;
     }
-    
+
     return config;
 }
 
@@ -128,7 +128,7 @@ pub fn main() !void {
     // Use configured port
     const bind_address = try std.fmt.allocPrintZ(allocator_ptr, "tcp://*:{}", .{config.port});
     defer allocator_ptr.free(bind_address);
-    
+
     try server_rep.bind(bind_address);
 
     while (true) {
@@ -146,6 +146,9 @@ pub fn main() !void {
                 error.MissingKey => "ERR Missing key\n",
                 error.MissingValue => "ERR Missing value\n",
                 error.MissingPattern => "ERR Missing pattern\n",
+                error.MissingBenchmarkOperations => "ERR Missing benchmark operation count\n",
+                error.EmptyKey => "ERR Key cannot be empty\n",
+                error.EmptyPattern => "ERR Pattern cannot be empty\n",
                 else => "ERR Invalid command\n",
             };
             try server_rep.sendConstSlice(error_msg, .{});

@@ -84,14 +84,15 @@ pub const Command = struct {
 
     /// Returns the command name as a slice.
     pub fn name(self: Command) []const u8 {
-        switch (self.command) {
-            .Set => return "SET",
-            .Get => return "GET",
-            .Delete => return "DELETE",
-            .Keys => return "KEYS",
-            .Ping => return "PING",
-            .Unknown => return "UNKNOWN",
-        }
+        return switch (self.command) {
+            .Set => "SET",
+            .Get => "GET",
+            .Delete => "DELETE",
+            .Keys => "KEYS",
+            .Ping => "PING",
+            .Benchmark => "BENCHMARK",
+            .Unknown => "UNKNOWN",
+        };
     }
 
     /// Creates a new Set command with the given ID and key-value pair,
@@ -292,10 +293,8 @@ pub const Result = struct {
                 const write_time_ms = @as(f64, @floatFromInt(benchmark_result.write_time_ns)) / 1_000_000.0;
                 const read_time_ms = @as(f64, @floatFromInt(benchmark_result.read_time_ns)) / 1_000_000.0;
                 const total_time_ms = @as(f64, @floatFromInt(benchmark_result.total_time_ns)) / 1_000_000.0;
-                
-                return try std.fmt.allocPrint(allocator, 
-                    "Benchmark completed: {d} ops, Write: {d:.2}ms, Read: {d:.2}ms, Total: {d:.2}ms", 
-                    .{benchmark_result.num_ops, write_time_ms, read_time_ms, total_time_ms});
+
+                return try std.fmt.allocPrint(allocator, "Benchmark completed: {d} ops, Write: {d:.2}ms, Read: {d:.2}ms, Total: {d:.2}ms", .{ benchmark_result.num_ops, write_time_ms, read_time_ms, total_time_ms });
             },
             .Unknown => |unknown_result| {
                 return try std.fmt.allocPrint(allocator, "ERR: {s}", .{unknown_result.errors});
@@ -359,19 +358,17 @@ pub const SetRequest = struct {
     /// assert(request.value == "myvalue");
     /// ```
     pub fn fromSlice(slice: []const u8) !SetRequest {
-        var tokens = std.mem.splitSequence(u8, slice, " ");
+        var tokens = std.mem.tokenizeAny(u8, slice, " \t\r\n");
         const cmd = tokens.next() orelse return error.InvalidCommand;
-        const key = tokens.next() orelse return error.MissingKey;
-        const value = tokens.next() orelse return error.MissingValue;
+        if (!std.ascii.eqlIgnoreCase(cmd, "SET")) return error.InvalidCommand;
 
-        if (std.mem.eql(u8, cmd, "SET")) {
-            // Validate key is not empty
-            if (key.len == 0) return error.EmptyKey;
-            // Value can be empty, but let's allow it
-            return SetRequest{ .key = key, .value = value };
-        } else {
-            return error.InvalidCommand;
-        }
+        const key = tokens.next() orelse return error.MissingKey;
+        if (key.len == 0) return error.EmptyKey;
+
+        const value = tokens.next() orelse return error.MissingValue;
+        if (tokens.next() != null) return error.InvalidCommand;
+
+        return SetRequest{ .key = key, .value = value };
     }
 };
 
@@ -416,17 +413,15 @@ pub const GetRequest = struct {
     /// assert(request.key == "mykey");
     /// ```
     pub fn fromSlice(slice: []const u8) !GetRequest {
-        var tokens = std.mem.splitSequence(u8, slice, " ");
+        var tokens = std.mem.tokenizeAny(u8, slice, " \t\r\n");
         const cmd = tokens.next() orelse return error.InvalidCommand;
-        const key = tokens.next() orelse return error.MissingKey;
+        if (!std.ascii.eqlIgnoreCase(cmd, "GET")) return error.InvalidCommand;
 
-        if (std.mem.eql(u8, cmd, "GET")) {
-            // Validate key is not empty
-            if (key.len == 0) return error.EmptyKey;
-            return GetRequest{ .key = key };
-        } else {
-            return error.InvalidCommand;
-        }
+        const key = tokens.next() orelse return error.MissingKey;
+        if (key.len == 0) return error.EmptyKey;
+        if (tokens.next() != null) return error.InvalidCommand;
+
+        return GetRequest{ .key = key };
     }
 };
 
@@ -472,17 +467,15 @@ pub const DeleteRequest = struct {
     /// assert(request.key == "mykey");
     /// ```
     pub fn fromSlice(slice: []const u8) !DeleteRequest {
-        var tokens = std.mem.splitSequence(u8, slice, " ");
+        var tokens = std.mem.tokenizeAny(u8, slice, " \t\r\n");
         const cmd = tokens.next() orelse return error.InvalidCommand;
-        const key = tokens.next() orelse return error.MissingKey;
+        if (!std.ascii.eqlIgnoreCase(cmd, "DELETE") and !std.ascii.eqlIgnoreCase(cmd, "DEL")) return error.InvalidCommand;
 
-        if (std.mem.eql(u8, cmd, "DELETE")) {
-            // Validate key is not empty
-            if (key.len == 0) return error.EmptyKey;
-            return DeleteRequest{ .key = key };
-        } else {
-            return error.InvalidCommand;
-        }
+        const key = tokens.next() orelse return error.MissingKey;
+        if (key.len == 0) return error.EmptyKey;
+        if (tokens.next() != null) return error.InvalidCommand;
+
+        return DeleteRequest{ .key = key };
     }
 };
 
@@ -515,11 +508,11 @@ pub const PingRequest = struct {
     ///
     /// If the command is valid, it returns a PingRequest.
     pub fn fromSlice(slice: []const u8) !PingRequest {
-        if (std.mem.eql(u8, slice, "PING")) {
-            return PingRequest{};
-        } else {
-            return error.InvalidCommand;
-        }
+        var tokens = std.mem.tokenizeAny(u8, slice, " \t\r\n");
+        const cmd = tokens.next() orelse return error.InvalidCommand;
+        if (!std.ascii.eqlIgnoreCase(cmd, "PING")) return error.InvalidCommand;
+        if (tokens.next() != null) return error.InvalidCommand;
+        return PingRequest{};
     }
 };
 
@@ -571,17 +564,15 @@ pub const KeysRequest = struct {
     /// # Note
     /// The `result` field is not set by this function. It should be set by the server when executing the command.
     pub fn fromSlice(slice: []const u8) !KeysRequest {
-        var tokens = std.mem.splitSequence(u8, slice, " ");
+        var tokens = std.mem.tokenizeAny(u8, slice, " \t\r\n");
         const cmd = tokens.next() orelse return error.InvalidCommand;
-        const pattern = tokens.next() orelse return error.MissingPattern;
+        if (!std.ascii.eqlIgnoreCase(cmd, "KEYS")) return error.InvalidCommand;
 
-        if (std.mem.eql(u8, cmd, "KEYS")) {
-            // Validate pattern is not empty
-            if (pattern.len == 0) return error.EmptyPattern;
-            return KeysRequest{ .pattern = pattern };
-        } else {
-            return error.InvalidCommand;
-        }
+        const pattern = tokens.next() orelse return error.MissingPattern;
+        if (pattern.len == 0) return error.EmptyPattern;
+        if (tokens.next() != null) return error.InvalidCommand;
+
+        return KeysRequest{ .pattern = pattern };
     }
 };
 
@@ -596,17 +587,17 @@ pub const BenchmarkRequest = struct {
     /// Executes the benchmark request against the given store.
     pub fn execute(self: BenchmarkRequest, store: *Phage) !BenchmarkResult {
         const start_time = std.time.nanoTimestamp();
-        
+
         // Use batched operations for better performance
         const BATCH_SIZE = 100; // Process in batches to avoid excessive memory usage
-        
+
         // Perform write operations using batching
         const write_start = std.time.nanoTimestamp();
         var i: u32 = 0;
         while (i < self.num_ops) {
             const batch_end = @min(i + BATCH_SIZE, self.num_ops);
             const batch_size = batch_end - i;
-            
+
             // Prepare batch of key-value pairs
             const pairs = try store.allocator.alloc(struct { key: []const u8, value: []const u8 }, batch_size);
             defer {
@@ -616,19 +607,19 @@ pub const BenchmarkRequest = struct {
                 }
                 store.allocator.free(pairs);
             }
-            
+
             for (0..batch_size) |j| {
                 const key = try std.fmt.allocPrint(store.allocator, "bench_key{d}", .{i + j});
                 const value = try std.fmt.allocPrint(store.allocator, "bench_value{d}", .{i + j});
                 pairs[j] = .{ .key = key, .value = value };
             }
-            
+
             // Execute batch PUT
             try store.putBatch(pairs);
             i = batch_end;
         }
         const write_end = std.time.nanoTimestamp();
-        
+
         // Perform read operations (individual reads are still necessary)
         const read_start = std.time.nanoTimestamp();
         for (0..self.num_ops) |j| {
@@ -638,11 +629,11 @@ pub const BenchmarkRequest = struct {
             defer store.allocator.free(value);
         }
         const read_end = std.time.nanoTimestamp();
-        
+
         const total_time_ns: u64 = @intCast(read_end - start_time);
         const write_time_ns: u64 = @intCast(write_end - write_start);
         const read_time_ns: u64 = @intCast(read_end - read_start);
-        
+
         return BenchmarkResult{
             .num_ops = self.num_ops,
             .total_time_ns = total_time_ns,
@@ -653,16 +644,16 @@ pub const BenchmarkRequest = struct {
 
     /// Parses a slice of bytes into a BenchmarkRequest.
     pub fn fromSlice(slice: []const u8) !BenchmarkRequest {
-        var tokens = std.mem.splitSequence(u8, slice, " ");
+        var tokens = std.mem.tokenizeAny(u8, slice, " \t\r\n");
         const cmd = tokens.next() orelse return error.InvalidCommand;
-        const num_ops_str = tokens.next() orelse return error.InvalidCommand;
+        if (!std.ascii.eqlIgnoreCase(cmd, "BENCHMARK")) return error.InvalidCommand;
 
-        if (std.mem.eql(u8, cmd, "BENCHMARK")) {
-            const num_ops = std.fmt.parseInt(u32, num_ops_str, 10) catch return error.InvalidCommand;
-            return BenchmarkRequest{ .num_ops = num_ops };
-        } else {
-            return error.InvalidCommand;
-        }
+        const num_ops_str = tokens.next() orelse return error.MissingBenchmarkOperations;
+        if (tokens.next() != null) return error.InvalidCommand;
+
+        const num_ops = std.fmt.parseInt(u32, num_ops_str, 10) catch return error.InvalidCommand;
+        if (num_ops == 0 or num_ops > 1_000_000) return error.InvalidCommand;
+        return BenchmarkRequest{ .num_ops = num_ops };
     }
 };
 
@@ -697,17 +688,15 @@ pub const UnknownResult = struct {
     errors: []const u8,
 };
 
-/// DeleteRequest defines the request structure for the DELETE command.\npub const DeleteRequest = struct {\n    key: []const u8,\n\n    /// Converts the DeleteRequest to a slice of bytes that can be sent over the wire.\n    pub fn toSlice(self: DeleteRequest, allocator: std.mem.Allocator) ![]const u8 {\n        return try std.fmt.allocPrint(allocator, \"DELETE {s}\", .{self.key});\n    }\n\n    /// Parses a slice of bytes into a DeleteRequest.\n    pub fn fromSlice(slice: []const u8) !DeleteRequest {\n        var tokens = std.mem.splitSequence(u8, slice, \" \");\n        const cmd = tokens.next() orelse return error.InvalidCommand;\n        const key = tokens.next() orelse return error.InvalidCommand;\n\n        if (std.mem.eql(u8, cmd, \"DELETE\")) {\n            return DeleteRequest{ .key = key };\n        } else {\n            return error.InvalidCommand;\n        }\n    }\n};\n\n// CommandMap is a ComptimeStringMap that maps command names to their corresponding CommandType
-// with O(1) lookup time.
-const CommandMap = std.StaticStringMap(CommandType).initComptime(.{
-    .{ "SET", CommandType.Set },
-    .{ "GET", CommandType.Get },
-    .{ "DELETE", CommandType.Delete },
-    .{ "KEYS", CommandType.Keys },
-    .{ "PING", CommandType.Ping },
-    .{ "BENCHMARK", CommandType.Benchmark },
-    .{ "UNKNOWN", CommandType.Unknown },
-});
+fn parseCommandType(cmd: []const u8) ?CommandType {
+    if (std.ascii.eqlIgnoreCase(cmd, "SET")) return .Set;
+    if (std.ascii.eqlIgnoreCase(cmd, "GET")) return .Get;
+    if (std.ascii.eqlIgnoreCase(cmd, "DELETE") or std.ascii.eqlIgnoreCase(cmd, "DEL")) return .Delete;
+    if (std.ascii.eqlIgnoreCase(cmd, "KEYS")) return .Keys;
+    if (std.ascii.eqlIgnoreCase(cmd, "PING")) return .Ping;
+    if (std.ascii.eqlIgnoreCase(cmd, "BENCHMARK")) return .Benchmark;
+    return null;
+}
 
 /// Returns the next unique command ID.
 pub fn nextCommandId() u32 {
@@ -717,13 +706,10 @@ pub fn nextCommandId() u32 {
 
 // Parses a command from a slice of bytes and returns a Command.
 pub fn parseCommandSlice(slice: []const u8) !Command {
-    var tokens = std.mem.splitSequence(u8, slice, " ");
+    var tokens = std.mem.tokenizeAny(u8, slice, " \t\r\n");
     const cmd = tokens.next() orelse return error.InvalidCommand;
 
-    var cmd_upper_buffer: [16]u8 = undefined;
-    const cmd_upper = std.ascii.upperString(cmd_upper_buffer[0..cmd.len], cmd);
-
-    const command_type = CommandMap.get(cmd_upper) orelse return error.InvalidCommand;
+    const command_type = parseCommandType(cmd) orelse return error.InvalidCommand;
 
     switch (command_type) {
         .Set => {
@@ -811,7 +797,7 @@ test "protocol:keys_with_no_args" {
     const command_string = "KEYS";
 
     try std.testing.expectError(
-        error.InvalidCommand,
+        error.MissingPattern,
         KeysRequest.fromSlice(command_string),
     );
 }
@@ -823,4 +809,41 @@ test "protocol:keys_with_too_many_args" {
         error.InvalidCommand,
         KeysRequest.fromSlice(command_string),
     );
+}
+
+test "protocol parser rejects missing arguments with specific errors" {
+    try std.testing.expectError(error.MissingKey, parseCommandSlice("SET"));
+    try std.testing.expectError(error.MissingValue, parseCommandSlice("SET key"));
+    try std.testing.expectError(error.MissingKey, parseCommandSlice("GET"));
+    try std.testing.expectError(error.MissingKey, parseCommandSlice("DELETE"));
+    try std.testing.expectError(error.MissingPattern, parseCommandSlice("KEYS"));
+    try std.testing.expectError(error.MissingBenchmarkOperations, parseCommandSlice("BENCHMARK"));
+}
+
+test "protocol parser rejects malformed extra arguments" {
+    try std.testing.expectError(error.InvalidCommand, parseCommandSlice("GET key extra"));
+    try std.testing.expectError(error.InvalidCommand, parseCommandSlice("DELETE key extra"));
+    try std.testing.expectError(error.InvalidCommand, parseCommandSlice("PING extra"));
+    try std.testing.expectError(error.InvalidCommand, parseCommandSlice("BENCHMARK 10 extra"));
+}
+
+test "protocol parser handles case, aliases, and whitespace without panics" {
+    const set = try parseCommandSlice("  set\talpha beta\r\n");
+    try std.testing.expectEqual(CommandType.Set, set.command);
+    try std.testing.expectEqualStrings("alpha", set.payload.Set.key);
+    try std.testing.expectEqualStrings("beta", set.payload.Set.value);
+
+    const del = try parseCommandSlice("del alpha");
+    try std.testing.expectEqual(CommandType.Delete, del.command);
+    try std.testing.expectEqualStrings("alpha", del.payload.Delete.key);
+
+    try std.testing.expectError(error.InvalidCommand, parseCommandSlice("THIS_COMMAND_NAME_IS_LONGER_THAN_16_BYTES key"));
+}
+
+test "benchmark request validates operation bounds" {
+    try std.testing.expectError(error.InvalidCommand, BenchmarkRequest.fromSlice("BENCHMARK 0"));
+    try std.testing.expectError(error.InvalidCommand, BenchmarkRequest.fromSlice("BENCHMARK 1000001"));
+
+    const request = try BenchmarkRequest.fromSlice("BENCHMARK 1000000");
+    try std.testing.expectEqual(@as(u32, 1_000_000), request.num_ops);
 }
