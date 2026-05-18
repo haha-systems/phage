@@ -6,6 +6,8 @@ Phage is a Zig key/value store with:
 
 - Persistent storage with write-ahead logging and recovery paths.
 - A sharded in-memory index.
+- Allocation-owning and caller-buffer read APIs (`get` and `getInto`).
+- Basic in-process metrics for storage operation counts, errors, and total latency.
 - A native benchmark runner for local performance checks.
 - Protocol and ZeroMQ server source code under `src/protocol/` and `src/zserver.zig`.
 - Linux `io_uring` as the intended high-performance backend, with a POSIX fallback that lets tests and memory/persisted benchmark smokes run on macOS.
@@ -14,7 +16,7 @@ Phage is a Zig key/value store with:
 
 - Zig 0.15.x (the current local project has been verified with Zig 0.15.2).
 - macOS or Linux for tests and the native benchmark runner.
-- Linux for the intended `io_uring` backend performance target.
+- Linux for final measurements of the intended `io_uring` backend fast path.
 
 ## Build and test
 
@@ -33,9 +35,9 @@ zig build --help
 
 There is currently no supported `zig build run` server step in the default build graph.
 
-## Run a local benchmark
+## Run local benchmarks
 
-The supported local performance path is the native benchmark runner:
+The supported local performance path is the native benchmark runner. It does not require the ZeroMQ server.
 
 ```sh
 # Fast in-memory smoke without persistence artifacts
@@ -43,9 +45,35 @@ zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16
 
 # Persisted smoke with an explicit disposable path
 zig build -Doptimize=ReleaseFast benchmark -- 1000 --value-size 16 --batch-size 16 --db-path /tmp/phage-getting-started-bench
+
+# Buffered read-path smoke using getInto instead of allocating get
+zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 256 --batch-size 64 --read-api get-into
+
+# Machine-readable output for automation
+zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16 --batch-size 16 --read-api get-into --json
 ```
 
+Benchmark options currently include:
+
+| Option | Meaning |
+|--------|---------|
+| positional `OPS` | Number of write/read operations; default is `10000`. |
+| `--mode persisted|memory` | `persisted` uses Phage storage; `memory` uses a HashMap baseline without filesystem or WAL I/O. Default is `persisted`. |
+| `--value-size BYTES` | Value payload size; default is `16`. |
+| `--batch-size N` | Number of writes to group before waiting; default is `1`. |
+| `--read-api get|get-into` | Selects allocating `get` or caller-buffer `getInto` for reads. Default is `get`. |
+| `--buffered-reads` | Alias for `--read-api get-into`. |
+| `--db-path PATH` | Database path for persisted mode; default is `phage_benchmark_store`. Prefer `/tmp/...` in docs/smokes. |
+| `--reuse` | Reuse an existing persisted database instead of deleting it first. |
+| `--json` | Emit machine-readable JSON instead of human text. |
+
 The protocol `BENCHMARK` command is separate from this native benchmark runner. It runs through the server command path and writes benchmark keys into the active store; use the native benchmark command above for reproducible local checks.
+
+### Platform notes
+
+- macOS uses the POSIX fallback backend. It is suitable for correctness tests and local smoke checks, including persisted smokes with an explicit `/tmp/...` path.
+- Linux is the intended high-performance target for the `io_uring` backend. Linux-only backend changes should still keep macOS tests green, but final `io_uring` performance claims need a Linux host.
+- Memory-mode benchmark examples are portable and avoid generated database/WAL artifacts.
 
 ## Server/protocol status
 
@@ -123,7 +151,9 @@ This is expected right now: the default build graph has no `run` step. Use `zig 
 
 ### Benchmark artifacts appear locally
 
-Use explicit temporary `--db-path` values for persisted benchmark smoke runs and avoid staging generated `.db`, `.wal`, or benchmark-store artifacts.
+Use memory mode for artifact-free smokes. For persisted smokes, pass an explicit temporary `--db-path` and avoid staging generated `.db`, `.wal`, or benchmark-store artifacts.
+
+The default persisted benchmark path is `phage_benchmark_store`. That local artifact is intentionally ignored by `.gitignore`, but generated files should still be deleted when no longer useful.
 
 ### KEYS pattern surprises
 

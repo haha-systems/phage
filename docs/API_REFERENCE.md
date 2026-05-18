@@ -10,7 +10,71 @@ zig build test
 zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16 --batch-size 16 --read-api get-into
 ```
 
-The ZeroMQ server implementation lives in `src/zserver.zig`, but it is not wired into the default Zig build graph at this time. `zig build --help` lists `install`, `test`, and `benchmark`; there is no supported `zig build run` server step. The command-line options below describe the current `zserver.zig` implementation if/when that executable is built separately.
+The ZeroMQ server implementation lives in `src/zserver.zig`, but it is not wired into the default Zig build graph at this time. `zig build --help` lists `install`, `uninstall`, `benchmark`, and `test`; there is no supported `zig build run` server step. The command-line options below describe the current `zserver.zig` implementation if/when that executable is built separately.
+
+## Core store API
+
+The core Zig store type is `Phage` in `src/root.zig`.
+
+| Method | Ownership and behavior |
+|--------|------------------------|
+| `put(key, value)` | Stores the key/value pair, writes the data/WAL records, updates the index, and records write metrics. |
+| `putBatch(pairs)` | Stores multiple key/value pairs with coalesced data/WAL writes and batched shard index updates. Metrics count one write per pair. |
+| `get(key)` | Returns an allocator-owned copy of the value. The caller must free the returned slice with the store allocator. Existing allocation-owning behavior is preserved. |
+| `getInto(key, buffer)` | Reads the value into caller-provided storage and returns the populated subslice. The returned slice points into `buffer`; no value allocation is performed. Returns `error.InsufficientBuffer` when `buffer.len` is smaller than the stored value, `error.KeyNotFound` for missing keys, and `error.KeyMismatch` if the indexed key does not match the bytes read from storage. |
+| `delete(key)` | Removes the key from the index, records a delete WAL entry, and records delete metrics. |
+| `findKeys(pattern)` | Returns keys matching the regex-style pattern or `null` when none match. |
+
+`getInto` is intended for read paths that can reuse buffers across calls, such as benchmarks or services that already own request/response storage. Use `get` when caller-owned allocation is more convenient.
+
+### Metrics snapshot
+
+Core storage embeds a metrics accumulator at `store.metrics`. Call `store.metrics.snapshot()` to read counters without mutating them.
+
+Snapshot fields include:
+
+- `reads`, `writes`, `deletes`
+- `read_errors`, `write_errors`, `delete_errors`
+- `total_read_latency_ns`, `total_write_latency_ns`, `total_delete_latency_ns`
+
+The metrics are in-process counters for local observation and server shutdown logging; they are not a network API or persistent telemetry format.
+
+## Native benchmark CLI
+
+Use the native benchmark build step for reproducible local performance checks:
+
+```sh
+zig build -Doptimize=ReleaseFast benchmark -- [OPS] [OPTIONS]
+```
+
+Common options:
+
+| Option | Meaning |
+|--------|---------|
+| positional `OPS` | Number of write/read operations; default is `10000`. |
+| `--mode persisted|memory` | `persisted` uses Phage storage; `memory` uses a HashMap baseline without filesystem or WAL I/O. Default is `persisted`. |
+| `--value-size BYTES` | Value payload size; default is `16`. |
+| `--batch-size N` | Number of writes to group before waiting; default is `1`. |
+| `--read-api get|get-into` | Selects allocating `get` or caller-buffer `getInto` for reads. Default is `get`. |
+| `--buffered-reads` | Alias for `--read-api get-into`. |
+| `--db-path PATH` | Database path for persisted mode; default is `phage_benchmark_store`. Prefer explicit `/tmp/...` paths for smoke docs. |
+| `--reuse` | Reuse an existing persisted database instead of deleting it first. |
+| `--json` | Emit machine-readable JSON instead of human text. |
+
+Portable examples:
+
+```sh
+# Artifact-free macOS/Linux smoke
+zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16 --batch-size 16
+
+# Persisted macOS/Linux smoke; macOS uses POSIX fallback, Linux targets io_uring when selected by backend logic
+zig build -Doptimize=ReleaseFast benchmark -- 1000 --value-size 16 --batch-size 16 --db-path /tmp/phage-api-bench
+
+# JSON output for automation and caller-buffer read path
+zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16 --batch-size 16 --read-api get-into --json
+```
+
+JSON output includes workload and measurement fields such as mode, operation count, value size, batch size, read API, throughput, and p50/p95/p99 latencies.
 
 ## Server configuration implemented in `src/zserver.zig`
 
@@ -27,20 +91,7 @@ phage-server [OPTIONS]
 
 The log-level flag is currently reported at startup; it does not dynamically reconfigure Zig's compile-time log filtering.
 
-## Core store API
-
-The core Zig store type is `Phage` in `src/root.zig`.
-
-| Method | Ownership and behavior |
-|--------|------------------------|
-| `put(key, value)` | Stores the key/value pair and updates the WAL and index. |
-| `putBatch(pairs)` | Stores multiple key/value pairs with coalesced data/WAL writes. |
-| `get(key)` | Returns an allocator-owned copy of the value. The caller must free the returned slice with the store allocator. Existing allocation-owning behavior is preserved. |
-| `getInto(key, buffer)` | Reads the value into caller-provided storage and returns the populated subslice. The returned slice points into `buffer`; no value allocation is performed. Returns `error.InsufficientBuffer` when `buffer.len` is smaller than the stored value, `error.KeyNotFound` for missing keys, and `error.KeyMismatch` if the indexed key does not match the bytes read from storage. |
-| `delete(key)` | Removes the key from the index and records a delete WAL entry. |
-| `findKeys(pattern)` | Returns keys matching the regex-style pattern or `null` when none match. |
-
-`getInto` is intended for read paths that can reuse buffers across calls, such as benchmarks or services that already own request/response storage. Use `get` when caller-owned allocation is more convenient.
+Server source includes SIGINT/SIGTERM shutdown-state handling and key/value-style lifecycle logs, but live server behavior is not yet part of the default `zig build test`/`benchmark` workflow because the server executable is not wired into the build graph.
 
 ## Wire protocol
 
