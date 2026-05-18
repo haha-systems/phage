@@ -161,11 +161,13 @@ pub const Wal = struct {
     }
 
     pub fn clear(store: *Phage) !void {
+        if (store.wal_file_size.load(.acquire) == 0) return;
+
         try std.posix.ftruncate(store.wal_fd, 0);
-        try std.posix.lseek_SET(store.wal_fd, 0);
         try std.posix.fsync(store.wal_fd);
 
-        // Make sure we reset the atomic file size to zero
+        // Phage appends WAL entries with positioned writes and tracked offsets, so
+        // clearing does not need to rewind the descriptor cursor.
         store.wal_file_size.store(0, .release);
     }
 
