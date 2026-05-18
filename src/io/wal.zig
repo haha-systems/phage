@@ -137,12 +137,14 @@ pub const Wal = struct {
 
             switch (header.op_type) {
                 .put => {
-                    try store.index.put(store.allocator, key_buf, .{
-                        .offset = header.offset,
-                        .len = @sizeOf(EntryHeader) + header.key_len + header.val_len,
-                        .key_len = header.key_len,
-                        .val_len = header.val_len,
-                    });
+                    if (try Wal.dataEntryAvailable(store, header, key_buf)) {
+                        try store.index.put(store.allocator, key_buf, .{
+                            .offset = header.offset,
+                            .len = @sizeOf(EntryHeader) + header.key_len + header.val_len,
+                            .key_len = header.key_len,
+                            .val_len = header.val_len,
+                        });
+                    }
                 },
                 .delete => {
                     const deleted = try store.index.delete(store.allocator, key_buf);
@@ -182,6 +184,29 @@ pub const Wal = struct {
         return computed == header.checksum;
     }
 
+    fn dataEntryAvailable(store: *Phage, wal_header: WalEntryHeader, key: []const u8) !bool {
+        const data_len = std.math.add(usize, @sizeOf(EntryHeader), wal_header.key_len) catch return false;
+        const full_len = std.math.add(usize, data_len, wal_header.val_len) catch return false;
+        const end_offset = std.math.add(usize, wal_header.offset, full_len) catch return false;
+
+        const data_file_stat = try std.posix.fstat(store.fd);
+        if (end_offset > @as(usize, @intCast(data_file_stat.size))) return false;
+
+        var data_header_buf: [@sizeOf(EntryHeader)]u8 = undefined;
+        const data_header_read = try std.posix.pread(store.fd, &data_header_buf, wal_header.offset);
+        if (data_header_read < @sizeOf(EntryHeader)) return false;
+
+        const data_header: EntryHeader = @bitCast(data_header_buf);
+        if (data_header.key_len != wal_header.key_len or data_header.val_len != wal_header.val_len) return false;
+
+        const key_buf = try store.allocator.alloc(u8, wal_header.key_len);
+        defer store.allocator.free(key_buf);
+        const key_read = try std.posix.pread(store.fd, key_buf, wal_header.offset + @sizeOf(EntryHeader));
+        if (key_read < wal_header.key_len) return false;
+
+        return std.mem.eql(u8, key_buf, key);
+    }
+
     fn parseWalEntryHeader(header_buf: [@sizeOf(WalEntryHeader)]u8) ?WalEntryHeader {
         const raw: RawWalEntryHeader = @bitCast(header_buf);
         const op_type: WalOperation = switch (raw.op_type) {
@@ -212,13 +237,13 @@ test "write_ahead_log:recover" {
 
     // Create a dummy Phage store
     var store = try Phage.init(allocator, path);
-    errdefer store.deinit();
     defer store.deinit();
 
-    // Simulate a WAL entry
+    // Simulate a committed data entry with a matching WAL entry
     const key = "test_key";
     const value = "test_value";
     const offset = 0;
+    _ = try writeDataEntry(store.fd, key, value, offset);
     const checksum = Wal.calculateChecksum(.put, @intCast(key.len), @intCast(value.len), offset, key);
 
     // Write the WAL entry to the file
@@ -258,13 +283,13 @@ test "write_ahead_log:recover_with_provisional_entries" {
 
     // Create a dummy Phage store
     var store = try Phage.init(allocator, path);
-    errdefer store.deinit();
     defer store.deinit();
 
-    // Simulate a WAL entry
+    // Simulate a committed data entry with a matching WAL entry
     const key = "test_key";
     const value = "test_value";
     const offset = 0;
+    _ = try writeDataEntry(store.fd, key, value, offset);
     const checksum = Wal.calculateChecksum(.put, @intCast(key.len), @intCast(value.len), offset, key);
 
     // Write the WAL entry to the file
@@ -323,6 +348,29 @@ test "write_ahead_log:recover_committed_put_entry_reads_value" {
     const recovered = try store.get(key);
     defer allocator.free(recovered);
     try std.testing.expectEqualStrings(value, recovered);
+    try expectWalCleared(&store);
+}
+
+test "write_ahead_log:recover_skips_put_entry_when_data_bytes_are_absent" {
+    const allocator = std.testing.allocator;
+    const path = "test_wal_recover_missing_data.db";
+    const wal_path = "test_wal_recover_missing_data.db.wal";
+
+    cleanupFiles(path, wal_path);
+    defer cleanupFiles(path, wal_path);
+
+    var store = try Phage.init(allocator, path);
+    defer store.deinit();
+
+    const key = "wal-only-key";
+    const value = "wal-only-value";
+    const data_offset: usize = 0;
+    const wal_len = try writeWalEntry(store.wal_fd, .put, key, value.len, data_offset, 0, null);
+    store.wal_file_size.store(wal_len, .release);
+
+    try Wal.recover(&store);
+
+    try std.testing.expectError(error.KeyNotFound, store.get(key));
     try expectWalCleared(&store);
 }
 
