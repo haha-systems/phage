@@ -104,11 +104,23 @@ pub fn build(b: *std.Build) void {
     });
     const run_protocol_command_tests = b.addRunArtifact(protocol_command_tests);
 
+    const server_runtime_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/server/runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const server_runtime_tests = b.addTest(.{
+        .root_module = server_runtime_tests_mod,
+        .test_runner = .{ .mode = .simple, .path = b.path("src/test_runner.zig") },
+    });
+    const run_server_runtime_tests = b.addRunArtifact(server_runtime_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_benchmark_unit_tests.step);
     test_step.dependOn(&run_compaction_unit_tests.step);
     test_step.dependOn(&run_protocol_command_tests.step);
+    test_step.dependOn(&run_server_runtime_tests.step);
 }
 
 fn addPhageImports(

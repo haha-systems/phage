@@ -3,6 +3,7 @@ const mem = @import("std").mem;
 
 const phage = @import("phage");
 const zimq = @import("zimq");
+const server_runtime = @import("server/runtime.zig");
 
 const Config = struct {
     port: u16 = 5555,
@@ -115,6 +116,8 @@ pub fn main() !void {
     std.debug.print("  Port: {}\n", .{config.port});
     std.debug.print("  Database: {s}\n", .{config.db_path});
     std.debug.print("  Log Level: {}\n", .{config.log_level});
+    std.log.info("server lifecycle event=start port={} db_path={s} requested_log_level={}", .{ config.port, config.db_path, config.log_level });
+    server_runtime.installProcessSignalHandlers();
 
     var store: phage.Phage = try .init(allocator_ptr, config.db_path);
     defer store.deinit();
@@ -130,10 +133,15 @@ pub fn main() !void {
     defer allocator_ptr.free(bind_address);
 
     try server_rep.bind(bind_address);
+    std.log.info("server lifecycle event=bound address={s}", .{bind_address});
 
-    while (true) {
+    while (server_runtime.processShouldContinue()) {
         var buf: zimq.Message = .empty();
-        _ = try server_rep.recvMsg(&buf, .{});
+        _ = server_rep.recvMsg(&buf, .{}) catch |err| {
+            if (!server_runtime.processShouldContinue()) break;
+            std.log.err("server receive error={s}", .{@errorName(err)});
+            return err;
+        };
 
         // Parse the command received from the client using Phage lib
         const command_str: []const u8 = buf.slice();
@@ -192,4 +200,10 @@ pub fn main() !void {
         try server_rep.sendConstSlice(response_payload, .{});
         std.debug.print("Sent: {}\n", .{result});
     }
+
+    const snapshot = store.metrics.snapshot();
+    std.log.info(
+        "server lifecycle event=shutdown reads={} writes={} deletes={} read_errors={} write_errors={} delete_errors={}",
+        .{ snapshot.reads, snapshot.writes, snapshot.deletes, snapshot.read_errors, snapshot.write_errors, snapshot.delete_errors },
+    );
 }
