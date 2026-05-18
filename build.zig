@@ -92,10 +92,23 @@ pub fn build(b: *std.Build) void {
     addPhageImports(compaction_unit_tests.root_module, colored_logger_mod, chameleon_mod, mvzr_mod);
     const run_compaction_unit_tests = b.addRunArtifact(compaction_unit_tests);
 
+    const protocol_command_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/command_execution_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    protocol_command_tests_mod.addImport("phage", lib_mod);
+    const protocol_command_tests = b.addTest(.{
+        .root_module = protocol_command_tests_mod,
+        .test_runner = .{ .mode = .simple, .path = b.path("src/test_runner.zig") },
+    });
+    const run_protocol_command_tests = b.addRunArtifact(protocol_command_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_benchmark_unit_tests.step);
     test_step.dependOn(&run_compaction_unit_tests.step);
+    test_step.dependOn(&run_protocol_command_tests.step);
 }
 
 fn addPhageImports(

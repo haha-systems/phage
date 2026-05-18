@@ -596,10 +596,10 @@ pub const BenchmarkRequest = struct {
         var i: u32 = 0;
         while (i < self.num_ops) {
             const batch_end = @min(i + BATCH_SIZE, self.num_ops);
-            const batch_size = batch_end - i;
+            const batch_size: usize = @intCast(batch_end - i);
 
             // Prepare batch of key-value pairs
-            const pairs = try store.allocator.alloc(struct { key: []const u8, value: []const u8 }, batch_size);
+            const pairs = try store.allocator.alloc(Phage.BatchPair, batch_size);
             defer {
                 for (pairs) |pair| {
                     store.allocator.free(pair.key);
@@ -609,8 +609,9 @@ pub const BenchmarkRequest = struct {
             }
 
             for (0..batch_size) |j| {
-                const key = try std.fmt.allocPrint(store.allocator, "bench_key{d}", .{i + j});
-                const value = try std.fmt.allocPrint(store.allocator, "bench_value{d}", .{i + j});
+                const op_index: u32 = i + @as(u32, @intCast(j));
+                const key = try std.fmt.allocPrint(store.allocator, "bench_key{d}", .{op_index});
+                const value = try std.fmt.allocPrint(store.allocator, "bench_value{d}", .{op_index});
                 pairs[j] = .{ .key = key, .value = value };
             }
 
