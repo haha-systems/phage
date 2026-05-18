@@ -10,6 +10,7 @@ const compaction_test_dir = ".zig-cache/phage-tests";
 const compaction_test_path = compaction_test_dir ++ "/compaction_correctness.db";
 const compaction_wal_boundary_path = compaction_test_dir ++ "/compaction_wal_boundary.db";
 const compaction_error_path = compaction_test_dir ++ "/compaction_error_cleanup.db";
+const compaction_serialization_path = compaction_test_dir ++ "/compaction_serialization.db";
 
 test "wal_compaction: repeated updates compact to latest readable index entries" {
     const allocator = std.testing.allocator;
@@ -129,6 +130,102 @@ test "wal_compaction: failed inline compaction resets flag and removes temp file
     try expectIndexEntryReadsValue(&store, late_key, "late-v0");
     try expectIndexEntryReadsValue(&store, early_key, "early-v0");
     try expectIndexEntryReadsValue(&store, "trigger", "trigger-v0");
+}
+
+test "wal_compaction: mutations share compaction serialization lock" {
+    const allocator = std.testing.allocator;
+    try std.fs.cwd().makePath(compaction_test_dir);
+    cleanupPath(compaction_serialization_path);
+    defer cleanupPath(compaction_serialization_path);
+
+    var store = try Phage.init(allocator, compaction_serialization_path);
+    defer store.deinit();
+
+    store.compaction_threshold = 2.0;
+    try store.put("delete-target", "delete-me");
+
+    var put_worker = MutationWorker.init();
+    var batch_worker = MutationWorker.init();
+    var delete_worker = MutationWorker.init();
+    const batch_pairs = [_]Phage.BatchPair{
+        .{ .key = "batch-a", .value = "batch-a-v0" },
+        .{ .key = "batch-b", .value = "batch-b-v0" },
+    };
+
+    store.mutation_mutex.lock();
+    var put_thread = try std.Thread.spawn(.{}, runPutWhileMutationLocked, .{ &store, &put_worker });
+    var batch_thread = try std.Thread.spawn(.{}, runPutBatchWhileMutationLocked, .{ &store, batch_pairs[0..], &batch_worker });
+    var delete_thread = try std.Thread.spawn(.{}, runDeleteWhileMutationLocked, .{ &store, &delete_worker });
+
+    waitForWorkerStart(&put_worker);
+    waitForWorkerStart(&batch_worker);
+    waitForWorkerStart(&delete_worker);
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+
+    try std.testing.expect(!put_worker.done.load(.acquire));
+    try std.testing.expect(!batch_worker.done.load(.acquire));
+    try std.testing.expect(!delete_worker.done.load(.acquire));
+
+    store.mutation_mutex.unlock();
+    put_thread.join();
+    batch_thread.join();
+    delete_thread.join();
+
+    try std.testing.expect(put_worker.done.load(.acquire));
+    try std.testing.expect(batch_worker.done.load(.acquire));
+    try std.testing.expect(delete_worker.done.load(.acquire));
+    try std.testing.expect(!put_worker.failed.load(.acquire));
+    try std.testing.expect(!batch_worker.failed.load(.acquire));
+    try std.testing.expect(!delete_worker.failed.load(.acquire));
+
+    try expectIndexEntryReadsValue(&store, "put-key", "put-v0");
+    try expectIndexEntryReadsValue(&store, "batch-a", "batch-a-v0");
+    try expectIndexEntryReadsValue(&store, "batch-b", "batch-b-v0");
+    try std.testing.expectError(error.KeyNotFound, store.get("delete-target"));
+}
+
+const MutationWorker = struct {
+    started: std.atomic.Value(bool),
+    done: std.atomic.Value(bool),
+    failed: std.atomic.Value(bool),
+
+    fn init() MutationWorker {
+        return .{
+            .started = std.atomic.Value(bool).init(false),
+            .done = std.atomic.Value(bool).init(false),
+            .failed = std.atomic.Value(bool).init(false),
+        };
+    }
+};
+
+fn runPutWhileMutationLocked(store: *Phage, worker: *MutationWorker) void {
+    worker.started.store(true, .release);
+    store.put("put-key", "put-v0") catch {
+        worker.failed.store(true, .release);
+    };
+    worker.done.store(true, .release);
+}
+
+fn runPutBatchWhileMutationLocked(store: *Phage, pairs: []const Phage.BatchPair, worker: *MutationWorker) void {
+    worker.started.store(true, .release);
+    store.putBatch(pairs) catch {
+        worker.failed.store(true, .release);
+    };
+    worker.done.store(true, .release);
+}
+
+fn runDeleteWhileMutationLocked(store: *Phage, worker: *MutationWorker) void {
+    worker.started.store(true, .release);
+    _ = store.delete("delete-target") catch {
+        worker.failed.store(true, .release);
+    };
+    worker.done.store(true, .release);
+}
+
+fn waitForWorkerStart(worker: *MutationWorker) void {
+    while (!worker.started.load(.acquire)) {
+        std.Thread.yield() catch std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
 }
 
 const CompactionFailureKeyRole = enum { early, late, dangling };

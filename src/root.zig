@@ -50,6 +50,9 @@ pub const Phage = struct {
     owns_wal_path: bool = false,
     compaction_threshold: f64 = 0.5, // Trigger compaction at 50% waste
     compaction_in_progress: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Serializes main-file/WAL/index mutations with inline compaction so fd swaps
+    /// and offset publication cannot race concurrent writers or deletes.
+    mutation_mutex: std.Thread.Mutex = .{},
     metrics: runtime_metrics.Metrics = runtime_metrics.Metrics.init(),
 
     pub fn init(
@@ -123,6 +126,7 @@ pub const Phage = struct {
             .owns_wal_path = true,
             .compaction_threshold = 0.5, // Default compaction threshold
             .compaction_in_progress = std.atomic.Value(bool).init(false),
+            .mutation_mutex = .{},
             .metrics = runtime_metrics.Metrics.init(),
         };
         fd_owned_by_store = true;
@@ -182,6 +186,9 @@ pub const Phage = struct {
         const metrics_start = std.time.nanoTimestamp();
         errdefer self.metrics.recordWriteError(elapsedNsSince(metrics_start));
 
+        self.mutation_mutex.lock();
+        defer self.mutation_mutex.unlock();
+
         // Optimized PUT: Batch operations and avoid synchronous waits where possible
 
         // Step 1: Write to main file first to secure the offset
@@ -233,6 +240,9 @@ pub const Phage = struct {
 
         const metrics_start = std.time.nanoTimestamp();
         errdefer self.metrics.recordWriteError(elapsedNsSince(metrics_start));
+
+        self.mutation_mutex.lock();
+        defer self.mutation_mutex.unlock();
 
         var data_batch = try self.formatBatchDataEntries(pairs, 0);
         defer data_batch.deinit(self.allocator);
@@ -377,6 +387,9 @@ pub const Phage = struct {
     pub fn delete(self: *Phage, key: []const u8) !bool {
         const metrics_start = std.time.nanoTimestamp();
         errdefer self.metrics.recordDeleteError(elapsedNsSince(metrics_start));
+
+        self.mutation_mutex.lock();
+        defer self.mutation_mutex.unlock();
 
         const wal_entry = try self.formatWalEntry(.delete, key, null, 0);
         defer self.allocator.free(wal_entry);
