@@ -9,6 +9,7 @@ const Chameleon = @import("chameleon");
 
 pub const regex = @import("mvzr");
 pub const protocol = @import("protocol/protocol.zig");
+pub const runtime_metrics = @import("metrics/metrics.zig");
 
 const index = @import("index.zig");
 const io = @import("io/io.zig");
@@ -49,6 +50,7 @@ pub const Phage = struct {
     owns_wal_path: bool = false,
     compaction_threshold: f64 = 0.5, // Trigger compaction at 50% waste
     compaction_in_progress: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    metrics: runtime_metrics.Metrics = runtime_metrics.Metrics.init(),
 
     pub fn init(
         allocator: Allocator,
@@ -121,6 +123,7 @@ pub const Phage = struct {
             .owns_wal_path = true,
             .compaction_threshold = 0.5, // Default compaction threshold
             .compaction_in_progress = std.atomic.Value(bool).init(false),
+            .metrics = runtime_metrics.Metrics.init(),
         };
         fd_owned_by_store = true;
         wal_fd_owned_by_store = true;
@@ -158,6 +161,12 @@ pub const Phage = struct {
         }
     }
 
+    fn elapsedNsSince(start_ns: i128) u64 {
+        const elapsed = std.time.nanoTimestamp() - start_ns;
+        if (elapsed <= 0) return 1;
+        return @intCast(elapsed);
+    }
+
     /// Writes a key-value pair to the database.
     ///
     /// This function performs the following steps:
@@ -170,6 +179,9 @@ pub const Phage = struct {
     /// freed until the database is closed or the entry is deleted.
     ///
     pub fn put(self: *Phage, key: []const u8, value: []const u8) !void {
+        const metrics_start = std.time.nanoTimestamp();
+        errdefer self.metrics.recordWriteError(elapsedNsSince(metrics_start));
+
         // Optimized PUT: Batch operations and avoid synchronous waits where possible
 
         // Step 1: Write to main file first to secure the offset
@@ -210,12 +222,17 @@ pub const Phage = struct {
         self.checkAndScheduleCompaction() catch |err| {
             std.log.warn("Failed to schedule compaction: {s}", .{@errorName(err)});
         };
+
+        self.metrics.recordWrite(elapsedNsSince(metrics_start));
     }
 
     /// Optimized batch PUT operation for better performance
     /// Batches multiple key-value pairs and minimizes I/O waits
     pub fn putBatch(self: *Phage, pairs: []const BatchPair) !void {
         if (pairs.len == 0) return;
+
+        const metrics_start = std.time.nanoTimestamp();
+        errdefer self.metrics.recordWriteError(elapsedNsSince(metrics_start));
 
         var data_batch = try self.formatBatchDataEntries(pairs, 0);
         defer data_batch.deinit(self.allocator);
@@ -268,6 +285,8 @@ pub const Phage = struct {
         self.checkAndScheduleCompaction() catch |err| {
             std.log.warn("Failed to schedule compaction: {s}", .{@errorName(err)});
         };
+
+        self.metrics.recordWrites(@intCast(pairs.len), elapsedNsSince(metrics_start));
     }
 
     /// Reads a value from the database using the provided key.
@@ -281,9 +300,11 @@ pub const Phage = struct {
     /// The caller is responsible for freeing the returned value.
     /// If the key is not found, an error is returned.
     pub fn get(self: *Phage, key: []const u8) ![]u8 {
+        const metrics_start = std.time.nanoTimestamp();
         const trimmed_key = std.mem.trimRight(u8, key, "\r\n");
         const entry = self.index.get(trimmed_key) orelse {
             std.log.debug("Key not found: {s}", .{key});
+            self.metrics.recordReadError(elapsedNsSince(metrics_start));
             return error.KeyNotFound;
         };
 
@@ -298,6 +319,9 @@ pub const Phage = struct {
     /// it and remains valid until the caller reuses or frees the buffer. The
     /// buffer must be at least as large as the stored value length.
     pub fn getInto(self: *Phage, key: []const u8, buffer: []u8) ![]u8 {
+        const metrics_start = std.time.nanoTimestamp();
+        errdefer self.metrics.recordReadError(elapsedNsSince(metrics_start));
+
         std.log.debug("Getting key into caller buffer: {s}", .{key});
 
         const trimmed_key = std.mem.trimRight(u8, key, "\r\n");
@@ -329,6 +353,7 @@ pub const Phage = struct {
 
         const value = buffer[0..entry.val_len];
         try self.readDataInto(value, entry.offset + header_size + entry.key_len);
+        self.metrics.recordRead(elapsedNsSince(metrics_start));
         return value;
     }
 
@@ -350,6 +375,9 @@ pub const Phage = struct {
     ///
     /// If the key is not found, an error is returned.
     pub fn delete(self: *Phage, key: []const u8) !bool {
+        const metrics_start = std.time.nanoTimestamp();
+        errdefer self.metrics.recordDeleteError(elapsedNsSince(metrics_start));
+
         const wal_entry = try self.formatWalEntry(.delete, key, null, 0);
         defer self.allocator.free(wal_entry);
 
@@ -361,7 +389,9 @@ pub const Phage = struct {
             return error.WriteError;
         }
 
-        return try self.index.delete(self.allocator, key);
+        const deleted = try self.index.delete(self.allocator, key);
+        self.metrics.recordDelete(elapsedNsSince(metrics_start));
+        return deleted;
     }
 
     /// Rebuilds the index from the main database file.
@@ -1088,6 +1118,32 @@ test "root:getInto reports missing keys and key mismatches" {
     try store.index.put(allocator, "alias-key", entry);
 
     try std.testing.expectError(error.KeyMismatch, store.getInto("alias-key", &buffer));
+
+    try testCleanup();
+}
+
+test "root:metrics count storage operations and errors" {
+    const allocator = std.testing.allocator;
+    var store = try Phage.init(allocator, root_test_path);
+    defer store.deinit();
+    errdefer testCleanup() catch unreachable;
+
+    try store.put("metric-key", "metric-value");
+    const metric_value = try store.get("metric-key");
+    defer allocator.free(metric_value);
+    var buffer: [32]u8 = undefined;
+    _ = try store.getInto("metric-key", &buffer);
+    try std.testing.expectError(error.KeyNotFound, store.get("missing-metric-key"));
+    try std.testing.expect(try store.delete("metric-key"));
+
+    const snapshot = store.metrics.snapshot();
+    try std.testing.expectEqual(@as(u64, 2), snapshot.reads);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.writes);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.deletes);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.read_errors);
+    try std.testing.expect(snapshot.total_read_latency_ns > 0);
+    try std.testing.expect(snapshot.total_write_latency_ns > 0);
+    try std.testing.expect(snapshot.total_delete_latency_ns > 0);
 
     try testCleanup();
 }
