@@ -2,10 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zimq = @import("zimq");
 const harness = @import("harness.zig");
+const server_config = @import("config.zig");
 
 const max_clients = 32;
 const max_total_requests = 2_000;
-const runtime_model = "multi-client-serialized-req-rep";
 const whole_harness_timeout_ms: i64 = 60_000;
 const startup_timeout_ms: i64 = 5_000;
 const shutdown_timeout_ms: i64 = 5_000;
@@ -20,6 +20,8 @@ const LoadConfig = struct {
     db_path: ?[]const u8 = null,
     clients: usize = 2,
     requests: usize = 100,
+    runtime: server_config.RuntimeMode = .serialized,
+    workers: usize = 1,
     output_format: OutputFormat = .human,
 };
 
@@ -57,6 +59,7 @@ const LoadSummary = struct {
     requests_per_client: usize,
     total_requests: usize,
     runtime_model: []const u8,
+    worker_count: usize,
     backend_status: []const u8,
     elapsed_ns: u64,
     requests_per_second: f64,
@@ -70,6 +73,8 @@ const LoadSummary = struct {
 const SummaryInput = struct {
     clients: usize,
     requests_per_client: usize,
+    runtime: server_config.RuntimeMode,
+    workers: usize,
     elapsed_ns: u64,
     latencies_ns: []u64,
     command_counts: CommandCounts,
@@ -132,6 +137,9 @@ pub fn main() !void {
     defer allocator.free(endpoint);
     const port_arg = try std.fmt.allocPrint(allocator, "{}", .{port});
     defer allocator.free(port_arg);
+    const runtime_arg = server_config.runtimeModeName(config.runtime);
+    const worker_arg = try std.fmt.allocPrint(allocator, "{}", .{config.workers});
+    defer allocator.free(worker_arg);
 
     var child = std.process.Child.init(&.{
         server_exe,
@@ -141,6 +149,10 @@ pub fn main() !void {
         db_path,
         "--log-level",
         "info",
+        "--runtime",
+        runtime_arg,
+        "--workers",
+        worker_arg,
     }, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
@@ -171,19 +183,35 @@ pub fn main() !void {
     defer run_stats.deinit(allocator);
     const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start_ns);
 
-    const term = harness.terminateChildWithDeadline(&child, context, shutdown_timeout_ms) catch |err| {
-        if (err == error.HarnessDeadlineExceeded or err == error.AlreadyTerminated) {
-            child_running = false;
-            harness.closeChildStreams(&child);
-        }
-        return err;
+    const term = if (config.runtime == .concurrent) term: {
+        const shutdown_response = try request(allocator, endpoint, "__PHAGE_SHUTDOWN__", context, whole_deadline, true);
+        defer allocator.free(shutdown_response);
+        if (!std.mem.eql(u8, shutdown_response, "OK")) return error.UnexpectedResponse;
+        break :term harness.waitForChildExitWithDeadline(&child, context, shutdown_timeout_ms) catch |err| {
+            if (err == error.HarnessDeadlineExceeded or err == error.AlreadyTerminated) {
+                child_running = false;
+                harness.closeChildStreams(&child);
+            }
+            return err;
+        };
+    } else term: {
+        break :term harness.terminateChildWithDeadline(&child, context, shutdown_timeout_ms) catch |err| {
+            if (err == error.HarnessDeadlineExceeded or err == error.AlreadyTerminated) {
+                child_running = false;
+                harness.closeChildStreams(&child);
+            }
+            return err;
+        };
     };
     child_running = false;
     try child.collectOutput(allocator, &server_stdout, &server_stderr, 1024 * 1024);
     harness.closeChildStreams(&child);
     switch (term) {
         .Exited => |code| if (code != 0) return error.ServerShutdownFailed,
-        else => return error.ServerShutdownFailed,
+        else => {
+            std.debug.print("server shutdown returned unexpected term={any}; stdout='{s}' stderr='{s}'\n", .{ term, server_stdout.items, server_stderr.items });
+            return error.ServerShutdownFailed;
+        },
     }
 
     const shutdown_metrics_captured = try shutdownMetricsLogCaptured(server_stderr.items);
@@ -194,6 +222,8 @@ pub fn main() !void {
     var summary = try buildSummary(.{
         .clients = config.clients,
         .requests_per_client = config.requests,
+        .runtime = config.runtime,
+        .workers = config.workers,
         .elapsed_ns = elapsed_ns,
         .latencies_ns = run_stats.latencies_ns,
         .command_counts = run_stats.command_counts,
@@ -231,6 +261,14 @@ fn parseArgs(args: []const []const u8) !LoadConfig {
             i += 1;
             if (i >= args.len) return usageError("--requests requires a value");
             config.requests = std.fmt.parseInt(usize, args[i], 10) catch return usageError("--requests must be a positive integer");
+        } else if (std.mem.eql(u8, arg, "--runtime")) {
+            i += 1;
+            if (i >= args.len) return usageError("--runtime requires a value");
+            config.runtime = server_config.parseRuntimeMode(args[i]) catch return usageError("--runtime must be serialized or concurrent");
+        } else if (std.mem.eql(u8, arg, "--workers")) {
+            i += 1;
+            if (i >= args.len) return usageError("--workers requires a value");
+            config.workers = server_config.parseWorkerCount(args[i]) catch return usageError("--workers must be from 1 through 16");
         } else if (std.mem.eql(u8, arg, "--json")) {
             config.output_format = .json;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -260,13 +298,13 @@ fn usageError(message: []const u8) error{InvalidArgument} {
 
 fn writeUsage() !void {
     std.debug.print(
-        \\Usage: phage-server-load --server-exe PATH [--db-path /tmp/phage-server-load] [--clients N] [--requests N] [--json]
+        \\Usage: phage-server-load --server-exe PATH [--db-path /tmp/phage-server-load] [--clients N] [--requests N] [--runtime serialized|concurrent] [--workers N] [--json]
         \\
         \\Starts the given phage-server executable on an available localhost port,
         \\opens N ZeroMQ REQ clients, sends a bounded PING/SET/GET/DELETE mix,
-        \\and reports throughput plus p50/p95/p99 request latency for the current
-        \\runtime model: multiple client connections are accepted, but the single REP
-        \\loop serializes command execution.
+        \\and reports throughput plus p50/p95/p99 request latency for the selected
+        \\runtime model. The default runtime is serialized; concurrent mode is opt-in
+        \\and reports its bounded worker count separately.
         \\
         \\When --db-path is omitted, a unique /tmp/phage-server-load-* path is used.
         \\
@@ -394,7 +432,8 @@ fn buildSummary(input: SummaryInput) !LoadSummary {
         .clients = input.clients,
         .requests_per_client = input.requests_per_client,
         .total_requests = total_requests,
-        .runtime_model = runtime_model,
+        .runtime_model = server_config.runtimeModelName(input.runtime),
+        .worker_count = input.workers,
         .backend_status = backendStatusName(),
         .elapsed_ns = input.elapsed_ns,
         .requests_per_second = throughput(total_requests, input.elapsed_ns),
@@ -427,7 +466,7 @@ fn percentileNearestRank(sorted_samples: []const u64, percentile: usize) u64 {
 
 fn writeHumanSummary(summary: LoadSummary, endpoint: []const u8, db_path: []const u8, writer: *std.io.AnyWriter) !void {
     try writer.print("server load smoke passed endpoint={s} db_path={s}\n", .{ endpoint, db_path });
-    try writer.print("clients={} requests_per_client={} total_requests={} runtime_model={s}\n", .{ summary.clients, summary.requests_per_client, summary.total_requests, summary.runtime_model });
+    try writer.print("clients={} requests_per_client={} total_requests={} runtime_model={s} workers={}\n", .{ summary.clients, summary.requests_per_client, summary.total_requests, summary.runtime_model, summary.worker_count });
     try writer.print("backend_status={s} elapsed_ms={d:.2} throughput_requests_per_sec={d:.2}\n", .{ summary.backend_status, nsToMs(summary.elapsed_ns), summary.requests_per_second });
     try writer.print("command_counts ping={} set={} get={} delete={} errors={}\n", .{ summary.command_counts.ping, summary.command_counts.set, summary.command_counts.get, summary.command_counts.delete, summary.error_count });
     try writer.print("latency_us p50={d:.2} p95={d:.2} p99={d:.2}\n", .{ nsToUs(summary.latency.p50_ns), nsToUs(summary.latency.p95_ns), nsToUs(summary.latency.p99_ns) });
@@ -441,7 +480,7 @@ fn writeJsonSummary(summary: LoadSummary, writer: *std.io.AnyWriter) !void {
     try writer.print("\"ping\":{d},\"set\":{d},\"get\":{d},\"delete\":{d}", .{ summary.command_counts.ping, summary.command_counts.set, summary.command_counts.get, summary.command_counts.delete });
     try writer.writeAll("},\"runtime_model\":\"");
     try writer.writeAll(summary.runtime_model);
-    try writer.writeAll("\",\"backend_status\":\"");
+    try writer.print("\",\"workers\":{d},\"backend_status\":\"", .{summary.worker_count});
     try writer.writeAll(summary.backend_status);
     try writer.writeAll("\"");
     try writer.print(",\"elapsed_ns\":{d},\"elapsed_ms\":{d:.2}", .{ summary.elapsed_ns, nsToMs(summary.elapsed_ns) });
@@ -574,18 +613,22 @@ fn storeArtifactsClean(allocator: std.mem.Allocator, db_path: []const u8) !bool 
 }
 
 test "load args support bounded JSON measurements" {
-    const config = try parseArgs(&.{ "--server-exe", "zig-out/bin/phage-server", "--db-path", "/tmp/phage-load-test", "--clients", "2", "--requests", "100", "--json" });
+    const config = try parseArgs(&.{ "--server-exe", "zig-out/bin/phage-server", "--db-path", "/tmp/phage-load-test", "--clients", "2", "--requests", "100", "--runtime", "concurrent", "--workers", "2", "--json" });
 
     try std.testing.expectEqualStrings("zig-out/bin/phage-server", config.server_exe.?);
     try std.testing.expectEqualStrings("/tmp/phage-load-test", config.db_path.?);
     try std.testing.expectEqual(@as(usize, 2), config.clients);
     try std.testing.expectEqual(@as(usize, 100), config.requests);
+    try std.testing.expectEqual(server_config.RuntimeMode.concurrent, config.runtime);
+    try std.testing.expectEqual(@as(usize, 2), config.workers);
     try std.testing.expectEqual(OutputFormat.json, config.output_format);
 }
 
 test "load args reject unbounded request shapes" {
     try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "--clients", "33", "--requests", "1" }));
     try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "--clients", "2", "--requests", "1001" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "--runtime", "parallel" }));
+    try std.testing.expectError(error.InvalidArgument, parseArgs(&.{ "--workers", "0" }));
 }
 
 test "load db path validation rejects unsafe generated paths" {
@@ -601,6 +644,8 @@ test "load summary computes throughput percentiles and command counts" {
     const summary = try buildSummary(.{
         .clients = 2,
         .requests_per_client = 2,
+        .runtime = .concurrent,
+        .workers = 2,
         .elapsed_ns = 2 * std.time.ns_per_s,
         .latencies_ns = &latencies,
         .command_counts = command_counts,
@@ -615,6 +660,8 @@ test "load summary computes throughput percentiles and command counts" {
     try std.testing.expectEqual(@as(u64, 9_000), summary.latency.p99_ns);
     try std.testing.expectEqual(@as(f64, 2.0), summary.requests_per_second);
     try std.testing.expectEqual(@as(usize, 1), summary.command_counts.get);
+    try std.testing.expectEqualStrings("bounded-router-serialized-store", summary.runtime_model);
+    try std.testing.expectEqual(@as(usize, 2), summary.worker_count);
 }
 
 test "load JSON output is parseable and names measurement fields" {
@@ -623,6 +670,7 @@ test "load JSON output is parseable and names measurement fields" {
         .requests_per_client = 50,
         .total_requests = 100,
         .runtime_model = "multi-client-serialized-req-rep",
+        .worker_count = 1,
         .backend_status = "macos-posix-fallback-or-host-default",
         .elapsed_ns = 1_000_000_000,
         .requests_per_second = 100.0,
@@ -643,6 +691,7 @@ test "load JSON output is parseable and names measurement fields" {
     const root = parsed.value.object;
     try std.testing.expectEqual(@as(i64, 100), root.get("total_requests").?.integer);
     try std.testing.expectEqualStrings("multi-client-serialized-req-rep", root.get("runtime_model").?.string);
+    try std.testing.expectEqual(@as(i64, 1), root.get("workers").?.integer);
     try std.testing.expect(root.get("throughput").?.object.get("requests_per_second") != null);
     try std.testing.expect(root.get("latency_us").?.object.get("p95") != null);
     try std.testing.expectEqualStrings("clean", root.get("cleanup_status").?.string);

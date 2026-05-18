@@ -1,6 +1,7 @@
 const std = @import("std");
 const zimq = @import("zimq");
 const harness = @import("harness.zig");
+const server_config = @import("config.zig");
 
 const whole_harness_timeout_ms: i64 = 60_000;
 const startup_timeout_ms: i64 = 5_000;
@@ -12,6 +13,8 @@ const SustainedConfig = struct {
     db_path: ?[]const u8 = null,
     clients: usize = 2,
     requests: usize = 100,
+    runtime: server_config.RuntimeMode = .serialized,
+    workers: usize = 1,
 };
 
 const ClientWorker = struct {
@@ -59,6 +62,9 @@ pub fn main() !void {
     defer allocator.free(endpoint);
     const port_arg = try std.fmt.allocPrint(allocator, "{}", .{port});
     defer allocator.free(port_arg);
+    const runtime_arg = server_config.runtimeModeName(config.runtime);
+    const worker_arg = try std.fmt.allocPrint(allocator, "{}", .{config.workers});
+    defer allocator.free(worker_arg);
 
     var child = std.process.Child.init(&.{
         server_exe,
@@ -68,6 +74,10 @@ pub fn main() !void {
         db_path,
         "--log-level",
         "info",
+        "--runtime",
+        runtime_arg,
+        "--workers",
+        worker_arg,
     }, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
@@ -94,19 +104,35 @@ pub fn main() !void {
     try waitForServer(allocator, endpoint, context, whole_deadline);
     try runSustainedClients(allocator, endpoint, config.clients, config.requests, context, whole_deadline);
 
-    const term = harness.terminateChildWithDeadline(&child, context, shutdown_timeout_ms) catch |err| {
-        if (err == error.HarnessDeadlineExceeded or err == error.AlreadyTerminated) {
-            child_running = false;
-            harness.closeChildStreams(&child);
-        }
-        return err;
+    const term = if (config.runtime == .concurrent) term: {
+        const shutdown_response = try request(allocator, endpoint, "__PHAGE_SHUTDOWN__", context, whole_deadline, true);
+        defer allocator.free(shutdown_response);
+        if (!std.mem.eql(u8, shutdown_response, "OK")) return error.UnexpectedResponse;
+        break :term harness.waitForChildExitWithDeadline(&child, context, shutdown_timeout_ms) catch |err| {
+            if (err == error.HarnessDeadlineExceeded or err == error.AlreadyTerminated) {
+                child_running = false;
+                harness.closeChildStreams(&child);
+            }
+            return err;
+        };
+    } else term: {
+        break :term harness.terminateChildWithDeadline(&child, context, shutdown_timeout_ms) catch |err| {
+            if (err == error.HarnessDeadlineExceeded or err == error.AlreadyTerminated) {
+                child_running = false;
+                harness.closeChildStreams(&child);
+            }
+            return err;
+        };
     };
     child_running = false;
     try child.collectOutput(allocator, &server_stdout, &server_stderr, 1024 * 1024);
     harness.closeChildStreams(&child);
     switch (term) {
         .Exited => |code| if (code != 0) return error.ServerShutdownFailed,
-        else => return error.ServerShutdownFailed,
+        else => {
+            std.debug.print("server shutdown returned unexpected term={any}; stdout='{s}' stderr='{s}'\n", .{ term, server_stdout.items, server_stderr.items });
+            return error.ServerShutdownFailed;
+        },
     }
 
     try assertShutdownMetricsLog(server_stderr.items);
@@ -114,8 +140,8 @@ pub fn main() !void {
     try cleanupStoreFiles(db_path);
     const total_requests = config.clients * config.requests;
     std.debug.print(
-        "server sustained smoke passed endpoint={s} db_path={s} clients={} requests_per_client={} total_requests={} runtime_model=multi-client-serialized-req-rep shutdown_metrics_log_captured=true\n",
-        .{ endpoint, db_path, config.clients, config.requests, total_requests },
+        "server sustained smoke passed endpoint={s} db_path={s} clients={} requests_per_client={} total_requests={} runtime_model={s} workers={} shutdown_metrics_log_captured=true\n",
+        .{ endpoint, db_path, config.clients, config.requests, total_requests, server_config.runtimeModelName(config.runtime), config.workers },
     );
     writeShutdownLogSummary(server_stderr.items);
 }
@@ -141,6 +167,14 @@ fn parseArgs(args: []const []const u8) !SustainedConfig {
             i += 1;
             if (i >= args.len) return usageError("--requests requires a value");
             config.requests = std.fmt.parseInt(usize, args[i], 10) catch return usageError("--requests must be a positive integer");
+        } else if (std.mem.eql(u8, arg, "--runtime")) {
+            i += 1;
+            if (i >= args.len) return usageError("--runtime requires a value");
+            config.runtime = server_config.parseRuntimeMode(args[i]) catch return usageError("--runtime must be serialized or concurrent");
+        } else if (std.mem.eql(u8, arg, "--workers")) {
+            i += 1;
+            if (i >= args.len) return usageError("--workers requires a value");
+            config.workers = server_config.parseWorkerCount(args[i]) catch return usageError("--workers must be from 1 through 16");
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try writeUsage();
             std.process.exit(0);
@@ -165,12 +199,12 @@ fn usageError(message: []const u8) error{InvalidArgument} {
 
 fn writeUsage() !void {
     std.debug.print(
-        \\Usage: phage-server-sustained-smoke --server-exe PATH [--db-path /tmp/phage-server-sustained-smoke] [--clients N] [--requests N]
+        \\Usage: phage-server-sustained-smoke --server-exe PATH [--db-path /tmp/phage-server-sustained-smoke] [--clients N] [--requests N] [--runtime serialized|concurrent] [--workers N]
         \\
         \\Starts the given phage-server executable on an available localhost port,
         \\opens N ZeroMQ REQ clients, sends repeated checked commands from each client,
-        \\and verifies the current runtime model: multiple client connections are accepted,
-        \\but the single REP loop serializes command execution.
+        \\and verifies the selected bounded runtime model. The default runtime is
+        \\serialized; concurrent mode is opt-in and reports its worker count.
         \\
         \\When --db-path is omitted, a unique /tmp/phage-server-sustained-smoke-* path is used.
         \\

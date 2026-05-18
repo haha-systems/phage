@@ -99,6 +99,15 @@ pub fn terminateChildWithDeadline(child: *std.process.Child, context: Context, t
         else => return err,
     };
 
+    return waitForChildExitWithExistingDeadline(child, context, deadline);
+}
+
+pub fn waitForChildExitWithDeadline(child: *std.process.Child, context: Context, timeout_ms: i64) !std.process.Child.Term {
+    if (child.term) |term| return term;
+    return waitForChildExitWithExistingDeadline(child, context, Deadline.init(timeout_ms));
+}
+
+fn waitForChildExitWithExistingDeadline(child: *std.process.Child, context: Context, deadline: Deadline) !std.process.Child.Term {
     while (true) {
         const wait_result = std.posix.waitpid(child.id, std.posix.W.NOHANG);
         if (wait_result.pid == child.id) return recordChildTerm(child, wait_result.status);

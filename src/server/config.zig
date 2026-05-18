@@ -86,6 +86,13 @@ pub fn parseWorkerCount(value: []const u8) ParseError!usize {
     return parsed;
 }
 
+pub fn runtimeModeName(mode: RuntimeMode) []const u8 {
+    return switch (mode) {
+        .serialized => "serialized",
+        .concurrent => "concurrent",
+    };
+}
+
 pub fn runtimeModelName(mode: RuntimeMode) []const u8 {
     return switch (mode) {
         .serialized => "multi-client-serialized-req-rep",
