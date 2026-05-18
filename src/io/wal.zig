@@ -76,22 +76,20 @@ pub const Wal = struct {
     };
 
     pub fn recover(store: *Phage) !void {
-        // If we enounter an error recovering the WAL, make sure we kill the store correctly
-        errdefer store.deinit();
-
         // check the wal file size again as it may have changed
         // since the last time we checked
         const wal_file_stat = try std.posix.fstat(store.wal_fd);
-        store.wal_file_size.store(@intCast(wal_file_stat.size), .release);
+        const wal_size: usize = @intCast(wal_file_stat.size);
+        store.wal_file_size.store(wal_size, .release);
 
         // check if the wal file is empty with the new size
-        if (store.wal_file_size.load(.acquire) == 0) {
+        if (wal_size == 0) {
             //log(.info, .phage, "WAL file is empty, nothing to recover", .{});
             return;
         }
 
         var offset: usize = 0;
-        while (offset < store.wal_file_size.load(.acquire)) {
+        while (offset < wal_size) {
             //log(.debug, .phage, "Reading WAL entry at offset: {d}", .{offset});
 
             var header_buf: [@sizeOf(WalEntryHeader)]u8 = undefined;
@@ -99,6 +97,8 @@ pub const Wal = struct {
             if (header_read < @sizeOf(WalEntryHeader)) break;
 
             const header: WalEntryHeader = @bitCast(header_buf);
+            const entry_len = std.math.add(usize, @sizeOf(WalEntryHeader), header.key_len) catch break;
+            if (entry_len > wal_size - offset) break;
 
             const key_buf = try store.allocator.alloc(u8, header.key_len);
             defer store.allocator.free(key_buf);
@@ -113,7 +113,7 @@ pub const Wal = struct {
                 //log(.err, .phage, "Expected checksum: {d}, computed checksum: {d}", .{ header.checksum, calculateChecksum(header.op_type, @intCast(header.key_len), @intCast(header.val_len), header.offset, key_buf) });
                 //log(.err, .phage, "Key: {s}", .{key_buf});
                 //log(.err, .phage, "Header: {s}", .{header_buf});
-                return error.ChecksumMismatch;
+                break;
             }
 
             //log(.debug, .phage, "Checksum verified for offset: {d}", .{offset});
@@ -150,11 +150,13 @@ pub const Wal = struct {
             offset += @sizeOf(WalEntryHeader) + header.key_len;
         }
 
+        try clear(store);
+    }
+
+    pub fn clear(store: *Phage) !void {
         try std.posix.ftruncate(store.wal_fd, 0);
         try std.posix.lseek_SET(store.wal_fd, 0);
         try std.posix.fsync(store.wal_fd);
-
-        //log(.info, .phage, "Truncated WAL file to offset: {d}", .{seek});
 
         // Make sure we reset the atomic file size to zero
         store.wal_file_size.store(0, .release);
@@ -273,6 +275,207 @@ test "write_ahead_log:recover_with_provisional_entries" {
 fn testCleanup() !void {
     std.posix.unlink("test.db") catch {};
     std.posix.unlink("test.db.wal") catch {};
+}
+
+test "write_ahead_log:recover_committed_put_entry_reads_value" {
+    const allocator = std.testing.allocator;
+    const path = "test_wal_recover_committed.db";
+    const wal_path = "test_wal_recover_committed.db.wal";
+
+    cleanupFiles(path, wal_path);
+    defer cleanupFiles(path, wal_path);
+
+    var store = try Phage.init(allocator, path);
+    defer store.deinit();
+
+    const key = "recover-put";
+    const value = "committed-value";
+    const data_offset: usize = 0;
+    _ = try writeDataEntry(store.fd, key, value, data_offset);
+    const wal_len = try writeWalEntry(store.wal_fd, .put, key, value.len, data_offset, 0, null);
+    store.wal_file_size.store(wal_len, .release);
+
+    try Wal.recover(&store);
+
+    const recovered = try store.get(key);
+    defer allocator.free(recovered);
+    try std.testing.expectEqualStrings(value, recovered);
+    try expectWalCleared(&store);
+}
+
+test "write_ahead_log:recover_skips_provisional_put_and_applies_final_put_at_zero_offset" {
+    const allocator = std.testing.allocator;
+    const path = "test_wal_recover_provisional.db";
+    const wal_path = "test_wal_recover_provisional.db.wal";
+
+    cleanupFiles(path, wal_path);
+    defer cleanupFiles(path, wal_path);
+
+    var store = try Phage.init(allocator, path);
+    defer store.deinit();
+
+    const key = "crash-key";
+    const value = "durable-at-zero";
+    const data_offset: usize = 0;
+    _ = try writeDataEntry(store.fd, key, value, data_offset);
+
+    var wal_offset: usize = 0;
+    wal_offset += try writeWalEntry(store.wal_fd, .put, key, 0, 0, wal_offset, null);
+    wal_offset += try writeWalEntry(store.wal_fd, .put, key, value.len, data_offset, wal_offset, null);
+    store.wal_file_size.store(wal_offset, .release);
+
+    try Wal.recover(&store);
+
+    const recovered = try store.get(key);
+    defer allocator.free(recovered);
+    try std.testing.expectEqualStrings(value, recovered);
+    try expectWalCleared(&store);
+}
+
+test "write_ahead_log:recover_replays_delete_after_restore_index" {
+    const allocator = std.testing.allocator;
+    const path = "test_wal_recover_delete.db";
+    const wal_path = "test_wal_recover_delete.db.wal";
+
+    cleanupFiles(path, wal_path);
+    defer cleanupFiles(path, wal_path);
+
+    {
+        var store = try Phage.init(allocator, path);
+        defer store.deinit();
+
+        try store.put("deleted-key", "old-value");
+        try std.testing.expect(try store.delete("deleted-key"));
+    }
+
+    var recovered_store = try Phage.init(allocator, path);
+    defer recovered_store.deinit();
+
+    try std.testing.expectError(error.KeyNotFound, recovered_store.get("deleted-key"));
+    try expectWalCleared(&recovered_store);
+}
+
+test "write_ahead_log:recover_preserves_valid_prefix_before_corrupt_tail" {
+    const allocator = std.testing.allocator;
+    const path = "test_wal_recover_corrupt_tail.db";
+    const wal_path = "test_wal_recover_corrupt_tail.db.wal";
+
+    cleanupFiles(path, wal_path);
+    defer cleanupFiles(path, wal_path);
+
+    var store = try Phage.init(allocator, path);
+    defer store.deinit();
+
+    const good_key = "safe-key";
+    const good_value = "safe-value";
+    const good_offset: usize = 0;
+    _ = try writeDataEntry(store.fd, good_key, good_value, good_offset);
+
+    var wal_offset: usize = 0;
+    wal_offset += try writeWalEntry(store.wal_fd, .put, good_key, good_value.len, good_offset, wal_offset, null);
+    wal_offset += try writeWalEntry(store.wal_fd, .put, "corrupt-key", 99, 4096, wal_offset, 0);
+    store.wal_file_size.store(wal_offset, .release);
+
+    try Wal.recover(&store);
+
+    const recovered = try store.get(good_key);
+    defer allocator.free(recovered);
+    try std.testing.expectEqualStrings(good_value, recovered);
+    try std.testing.expectError(error.KeyNotFound, store.get("corrupt-key"));
+    try expectWalCleared(&store);
+}
+
+test "write_ahead_log:recover_preserves_valid_prefix_before_truncated_tail" {
+    const allocator = std.testing.allocator;
+    const path = "test_wal_recover_truncated_tail.db";
+    const wal_path = "test_wal_recover_truncated_tail.db.wal";
+
+    cleanupFiles(path, wal_path);
+    defer cleanupFiles(path, wal_path);
+
+    var store = try Phage.init(allocator, path);
+    defer store.deinit();
+
+    const good_key = "prefix-key";
+    const good_value = "prefix-value";
+    const good_offset: usize = 0;
+    _ = try writeDataEntry(store.fd, good_key, good_value, good_offset);
+
+    var wal_offset: usize = 0;
+    wal_offset += try writeWalEntry(store.wal_fd, .put, good_key, good_value.len, good_offset, wal_offset, null);
+
+    const truncated_header = Wal.WalEntryHeader{
+        .op_type = .put,
+        .key_len = 16,
+        .val_len = 5,
+        .offset = 128,
+        .checksum = 12345,
+        .padding = 0,
+    };
+    const partial_header = std.mem.asBytes(&truncated_header)[0 .. @sizeOf(Wal.WalEntryHeader) - 3];
+    try expectFullWrite(partial_header.len, try std.posix.pwrite(store.wal_fd, partial_header, wal_offset));
+    wal_offset += partial_header.len;
+    store.wal_file_size.store(wal_offset, .release);
+
+    try Wal.recover(&store);
+
+    const recovered = try store.get(good_key);
+    defer allocator.free(recovered);
+    try std.testing.expectEqualStrings(good_value, recovered);
+    try expectWalCleared(&store);
+}
+
+fn writeDataEntry(fd: std.posix.fd_t, key: []const u8, value: []const u8, offset: usize) !usize {
+    const header = EntryHeader{
+        .key_len = @intCast(key.len),
+        .val_len = @intCast(value.len),
+    };
+    var cursor = offset;
+    try expectFullWrite(@sizeOf(EntryHeader), try std.posix.pwrite(fd, std.mem.asBytes(&header), cursor));
+    cursor += @sizeOf(EntryHeader);
+    try expectFullWrite(key.len, try std.posix.pwrite(fd, key, cursor));
+    cursor += key.len;
+    try expectFullWrite(value.len, try std.posix.pwrite(fd, value, cursor));
+    return @sizeOf(EntryHeader) + key.len + value.len;
+}
+
+fn writeWalEntry(
+    fd: std.posix.fd_t,
+    op_type: Wal.WalOperation,
+    key: []const u8,
+    val_len: usize,
+    data_offset: usize,
+    wal_offset: usize,
+    checksum_override: ?u32,
+) !usize {
+    const header = Wal.WalEntryHeader{
+        .op_type = op_type,
+        .key_len = key.len,
+        .val_len = val_len,
+        .offset = data_offset,
+        .checksum = checksum_override orelse Wal.calculateChecksum(op_type, @intCast(key.len), @intCast(val_len), data_offset, key),
+        .padding = 0,
+    };
+    var cursor = wal_offset;
+    try expectFullWrite(@sizeOf(Wal.WalEntryHeader), try std.posix.pwrite(fd, std.mem.asBytes(&header), cursor));
+    cursor += @sizeOf(Wal.WalEntryHeader);
+    try expectFullWrite(key.len, try std.posix.pwrite(fd, key, cursor));
+    return @sizeOf(Wal.WalEntryHeader) + key.len;
+}
+
+fn expectFullWrite(expected: usize, actual: usize) !void {
+    try std.testing.expectEqual(expected, actual);
+}
+
+fn expectWalCleared(store: *Phage) !void {
+    const wal_stat = try std.posix.fstat(store.wal_fd);
+    try std.testing.expectEqual(@as(i64, 0), wal_stat.size);
+    try std.testing.expectEqual(@as(u64, 0), store.wal_file_size.load(.acquire));
+}
+
+fn cleanupFiles(path: []const u8, wal_path: []const u8) void {
+    std.posix.unlink(path) catch {};
+    std.posix.unlink(wal_path) catch {};
 }
 
 fn expectNotNull(value: anytype) !void {
