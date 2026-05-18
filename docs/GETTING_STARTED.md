@@ -9,7 +9,7 @@ Phage is a Zig key/value store with:
 - Allocation-owning and caller-buffer read APIs (`get` and `getInto`).
 - Basic in-process metrics for storage operation counts, errors, and total latency.
 - A native benchmark runner for local performance checks.
-- Protocol and ZeroMQ server source code under `src/protocol/` and `src/zserver.zig`.
+- Protocol and a supported ZeroMQ server workflow under `src/protocol/` and `src/zserver.zig`.
 - Linux `io_uring` as the intended high-performance backend, with a POSIX fallback that lets tests and memory/persisted benchmark smokes run on macOS.
 
 ## Prerequisites
@@ -30,10 +30,8 @@ Current `build.zig` steps are:
 
 ```sh
 zig build --help
-# Steps include: install, uninstall, benchmark, test
+# Steps include: install, uninstall, benchmark, test, phage-server, run-server, server-smoke, server-sustained-smoke
 ```
-
-There is currently no supported `zig build run` server step in the default build graph.
 
 ## Run local benchmarks
 
@@ -77,13 +75,28 @@ The protocol `BENCHMARK` command is separate from this native benchmark runner. 
 
 ## Server/protocol status
 
-`src/zserver.zig` contains a ZeroMQ REP server implementation with command-line options for port, database path, and requested log level. It is not currently installed by the default build graph, so the examples below document the protocol behavior rather than a copy-paste-ready server launch workflow.
+`src/zserver.zig` contains a ZeroMQ REP server implementation with command-line options for port, database path, and requested log level. Use explicit `/tmp/...` database paths for smoke runs so generated store/WAL files stay disposable.
+
+```sh
+# Build the server executable
+zig build phage-server
+
+# Print server help without opening a socket or database
+zig build run-server -- --help
+
+# Live MVP command smoke over ZeroMQ
+zig build server-smoke -- --db-path /tmp/phage-server-smoke
+
+# Bounded repeated multi-client smoke over ZeroMQ
+zig build server-sustained-smoke -- --db-path /tmp/phage-server-sustained-smoke --clients 2 --requests 100
+```
 
 Runtime readiness notes:
 
-- `src/server/runtime.zig` provides the server shutdown state used by `src/zserver.zig` for SIGINT/SIGTERM handling. The server loop checks this state and logs shutdown metrics before resources deinitialize, but a live server smoke still depends on a future build-graph/ZeroMQ wiring slice.
+- `src/server/runtime.zig` provides the server shutdown state used by `src/zserver.zig` for SIGINT/SIGTERM handling. The sustained server smoke sends SIGTERM after repeated checked requests and asserts that the shutdown log includes read/write/delete and error counters.
 - Lifecycle logs use structured key/value-style messages for server start, bind, receive errors, and shutdown.
 - Core storage exposes `store.metrics.snapshot()` with read/write/delete operation counts, error counts, and accumulated latency nanoseconds. `putBatch` records one write per key/value pair.
+- Verified client model: multiple ZeroMQ REQ clients can connect and complete repeated request/reply commands, but the server uses a single REP loop that serializes receive/execute/send handling. The current smoke does not claim parallel command execution or throughput scaling with client count.
 
 The parser accepts these commands:
 
@@ -106,7 +119,7 @@ Protocol notes:
 - Other `KEYS` patterns use regex-style matching; use `user:.*` rather than shell-glob syntax when matching prefixes.
 - `BENCHMARK operations` accepts operation counts from `1` to `1_000_000` and mutates the active store.
 
-Example command transcript for a server/client once the server executable is wired:
+Example command transcript for a server/client:
 
 ```text
 PING
@@ -127,19 +140,18 @@ DELETE greeting
 
 ## Sustained smoke/readiness checks
 
-Use the full test suite plus a disposable in-memory sustained benchmark smoke before making runtime-readiness claims:
+Use the full test suite plus the bounded live sustained server smoke before making server runtime-readiness claims:
 
 ```sh
 zig build test
-zig build -Doptimize=ReleaseFast benchmark -- 5000 --mode memory --value-size 16 --batch-size 64
+zig build server-sustained-smoke -- --db-path /tmp/phage-server-sustained-smoke --clients 2 --requests 100
 ```
 
-The benchmark command above avoids local database/WAL artifacts. It is a cheap leak/FD sanity smoke for the supported core benchmark path; it is not a substitute for a future live multi-client ZeroMQ server smoke once the server is restored to the build graph.
+The sustained server smoke starts the built server, opens multiple REQ clients, sends repeated checked commands from each client, captures the shutdown metrics log line, and removes `/tmp` store/WAL artifacts. It verifies serialized multi-client REQ/REP behavior, not parallel command execution.
 
 ## Current limitations
 
-- The ZeroMQ server is source-present but not exposed as a default `zig build` run/install artifact.
-- Live multi-client server behavior still needs runtime verification after server build support is restored.
+- Server command execution is serialized through a single ZeroMQ REP loop; multi-client smokes verify request/reply interoperability across multiple client connections, not concurrent in-process store access.
 - The old external Demon client examples are not part of this repository and are not required for the supported test/benchmark workflow.
 - Server log-level configuration is parsed and printed, but Zig log filtering is still compile-time constrained.
 
@@ -147,7 +159,7 @@ The benchmark command above avoids local database/WAL artifacts. It is a cheap l
 
 ### `zig build run` fails
 
-This is expected right now: the default build graph has no `run` step. Use `zig build test` for correctness and `zig build ... benchmark` for benchmark smokes.
+The server workflow uses explicit build steps rather than the default `run` step. Use `zig build run-server -- --help` for server help, `zig build server-smoke -- --db-path /tmp/phage-server-smoke` for MVP command smoke, and `zig build server-sustained-smoke -- --db-path /tmp/phage-server-sustained-smoke --clients 2 --requests 100` for repeated multi-client smoke.
 
 ### Benchmark artifacts appear locally
 
