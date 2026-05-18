@@ -16,8 +16,8 @@ The ZeroMQ server source in `src/zserver.zig` contains structured lifecycle logg
 - Core storage API supports `put`, `putBatch`, `get`, `getInto`, `delete`, WAL recovery, compaction coverage, and batch writes.
 - WAL/recovery hardening covers committed WAL entries, corrupt tails, invalid operation tags, delete replay, and WAL-only/data-missing crash states.
 - `zig build test` is the standard correctness gate and includes storage, protocol command, compaction, benchmark, metrics, and server-runtime unit tests.
-- `zig build -Doptimize=ReleaseFast benchmark -- ...` is the supported local one-shot benchmark path, with human or JSON output, memory or persisted modes, configurable value/batch sizes, and `get` vs `getInto` read-path selection.
-- `bench/benchmark-matrix.sh` runs repeatable quick/full benchmark profiles and emits JSON Lines rows plus a compact summary with git, Zig, OS/platform, profile, timestamp, and backend-status metadata.
+- `zig build -Doptimize=ReleaseFast benchmark -- ...` is the supported local one-shot benchmark path, with human or JSON output, memory or persisted modes, configurable value/batch sizes, `get` vs `getInto` read-path selection, and a persisted `--profile compaction` smoke for update-heavy compaction evidence.
+- `bench/benchmark-matrix.sh` runs repeatable quick/full/compaction benchmark profiles and emits JSON Lines rows plus a compact summary with git, Zig, OS/platform, profile, timestamp, and backend-status metadata.
 - macOS POSIX fallback remains useful for development and tests while Linux `io_uring` remains the intended high-performance backend; the 2026-05-18 quick-profile fallback baseline is recorded under `docs/benchmarks/`.
 
 ### Protocol/server status
@@ -46,6 +46,7 @@ The ZeroMQ server source in `src/zserver.zig` contains structured lifecycle logg
 | Benchmark matrix workflow | Active / implemented for review | `bench/benchmark-matrix.sh --quick --output /tmp/phage-benchmark-matrix.jsonl` emits row-level JSON Lines and `/tmp/phage-benchmark-matrix-summary.json`; `--profile full` covers memory/persisted, batch sizes `1/16/64`, value sizes `16/256`, and `get`/`get-into` read APIs. Current macOS fallback quick baseline: memory `11.90M` total ops/sec, persisted `1.16M` total ops/sec; see [macOS POSIX-fallback benchmark baseline](benchmarks/2026-05-18-macos-fallback-baseline.md). |
 | WAL write-path optimization evidence | Active / macOS and Linux evidence documented | The S3 evidence note records S1/S2 before/after persisted write rows for macOS POSIX fallback, with roughly 14–15% higher write throughput across batch sizes `1/16/64`; S4 now records post-optimization Linux `io_uring` correctness and cheap persisted rows. See [WAL write-path optimization evidence](benchmarks/2026-05-18-wal-write-path-optimization.md). |
 | Benchmark output/reporting | Active / reviewed | Human output remains default for one-shot runs; `--json` emits machine-readable mode/count/value/batch/latency/throughput fields, and matrix summaries add reproducibility metadata without replacing one-shot JSON. |
+| Compaction benchmark/status evidence | Active / macOS POSIX fallback documented | `--profile compaction` creates persisted update-heavy waste and reports live keys, update rounds, trigger count/status, waste ratio before/after, file-size reduction, latency, and throughput fields. S2 hardens failed inline compaction cleanup and clarifies that threshold compaction is inline rather than background. Current curated evidence is macOS POSIX-fallback only; Linux `io_uring` compaction verification remains a separate S4 gate. See [compaction benchmark and status evidence](benchmarks/2026-05-18-compaction-performance.md). |
 | Linux io_uring verification | Verified after remediation | OrbStack NixOS 25.11 arm64 passed Linux `zig build test` after `bc23f18` and the WAL clear optimization, including the prior `write_ahead_log:recover_committed_empty_put_at_zero_offset` failure. S4 quick/profile summaries record `metadata.backend_status=linux-io-uring-intended`, `row_count=2` quick, and `row_count=24` with `--profile linux-io-uring --ops 1000`; representative persisted rows are recorded in [Linux io_uring benchmark verification](benchmarks/2026-05-18-linux-io-uring-verification.md). |
 
 ### Phase 2: Protocol and server MVP
@@ -93,9 +94,16 @@ zig build -Doptimize=ReleaseFast benchmark -- 1000 --value-size 16 --batch-size 
 # macOS/Linux: machine-readable one-shot output for automation
 zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16 --batch-size 16 --read-api get-into --json
 
+# macOS/Linux: persisted update-heavy compaction smoke with machine-readable output
+zig build -Doptimize=ReleaseFast benchmark -- 64 --profile compaction --mode persisted --value-size 64 --update-rounds 2 --read-api get-into --json --db-path /tmp/phage-mvp-roadmap-compaction
+
 # macOS/Linux: cheap comparable matrix output for audits/reviews
 bench/benchmark-matrix.sh --quick --output /tmp/phage-benchmark-matrix.jsonl
 python3 -m json.tool /tmp/phage-benchmark-matrix-summary.json >/dev/null
+
+# macOS/Linux: cheap compaction-profile matrix row for compaction audits
+bench/benchmark-matrix.sh --profile compaction --output /tmp/phage-compaction-profile.jsonl
+python3 -m json.tool /tmp/phage-compaction-profile-summary.json >/dev/null
 
 # Fuller comparable matrix profile; keep raw outputs in /tmp unless a ticket
 # explicitly approves committing a small curated summary.
@@ -103,7 +111,7 @@ bench/benchmark-matrix.sh --profile full --output /tmp/phage-benchmark-matrix-fu
 python3 -m json.tool /tmp/phage-benchmark-matrix-full-summary.json >/dev/null
 ```
 
-Backend note: macOS runs the POSIX fallback path. Linux is the target platform for `io_uring` fast-path performance. OrbStack NixOS now provides post-remediation Linux correctness and matrix evidence for the optimized WAL write path: Linux `zig build test` passes after `bc23f18`, and the quick/profile summaries report `metadata.backend_status=linux-io-uring-intended`; see [Linux io_uring benchmark verification](benchmarks/2026-05-18-linux-io-uring-verification.md) for representative rows, required commands, and artifact hygiene. The current macOS quick-profile fallback baseline is recorded in [macOS POSIX-fallback benchmark baseline](benchmarks/2026-05-18-macos-fallback-baseline.md).
+Backend note: macOS runs the POSIX fallback path. Linux is the target platform for `io_uring` fast-path performance. OrbStack NixOS now provides post-remediation Linux correctness and matrix evidence for the optimized WAL write path: Linux `zig build test` passes after `bc23f18`, and the quick/profile summaries report `metadata.backend_status=linux-io-uring-intended`; see [Linux io_uring benchmark verification](benchmarks/2026-05-18-linux-io-uring-verification.md) for representative rows, required commands, and artifact hygiene. The current macOS quick-profile fallback baseline is recorded in [macOS POSIX-fallback benchmark baseline](benchmarks/2026-05-18-macos-fallback-baseline.md). The current compaction evidence note records only macOS POSIX-fallback compaction rows and leaves Linux `io_uring` compaction status to the separate S4 verification gate; see [compaction benchmark and status evidence](benchmarks/2026-05-18-compaction-performance.md).
 
 Server status check:
 
@@ -131,4 +139,5 @@ zig build run-server -- --help
 - [Getting Started](GETTING_STARTED.md)
 - [API Reference](API_REFERENCE.md)
 - [WAL write-path optimization evidence](benchmarks/2026-05-18-wal-write-path-optimization.md)
+- [Compaction benchmark and status evidence](benchmarks/2026-05-18-compaction-performance.md)
 - [Linux io_uring benchmark verification runbook](benchmarks/2026-05-18-linux-io-uring-verification.md)

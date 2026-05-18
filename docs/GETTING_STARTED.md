@@ -51,9 +51,16 @@ zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 25
 # Machine-readable one-shot output for automation
 zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16 --batch-size 16 --read-api get-into --json
 
+# Persisted update-heavy compaction smoke; records trigger/waste/file-size fields
+zig build -Doptimize=ReleaseFast benchmark -- 64 --profile compaction --mode persisted --value-size 64 --update-rounds 2 --read-api get-into --json --db-path /tmp/phage-getting-started-compaction
+
 # Cheap benchmark matrix smoke: writes JSON Lines rows and a compact summary JSON
 bench/benchmark-matrix.sh --quick --output /tmp/phage-benchmark-matrix.jsonl
 python3 -m json.tool /tmp/phage-benchmark-matrix-summary.json >/dev/null
+
+# Cheap compaction matrix smoke: one persisted update-heavy row plus summary JSON
+bench/benchmark-matrix.sh --profile compaction --output /tmp/phage-compaction-profile.jsonl
+python3 -m json.tool /tmp/phage-compaction-profile-summary.json >/dev/null
 
 # Fuller comparable matrix profile; keep raw outputs in /tmp unless a ticket
 # explicitly approves committing a small curated summary.
@@ -65,11 +72,13 @@ Benchmark options currently include:
 
 | Option | Meaning |
 |--------|---------|
-| positional `OPS` | Number of write/read operations; default is `10000`. |
+| positional `OPS` | Number of write/read operations for the standard profile; live-key count for `--profile compaction`; default is `10000`. |
 | `--mode persisted|memory` | `persisted` uses Phage storage; `memory` uses a HashMap baseline without filesystem or WAL I/O. Default is `persisted`. |
+| `--profile standard|compaction` | `standard` runs ordinary put/read operations; `compaction` runs a persisted update-heavy workload and reports compaction trigger, waste-ratio, file-size, latency, and throughput fields. Default is `standard`. |
 | `--value-size BYTES` | Value payload size; default is `16`. |
 | `--batch-size N` | Number of writes to group before waiting; default is `1`. |
 | `--read-api get|get-into` | Selects allocating `get` or caller-buffer `getInto` for reads. Default is `get`. |
+| `--update-rounds N` | Number of update passes after the initial live-key load for `--profile compaction`; default is `2`. |
 | `--buffered-reads` | Alias for `--read-api get-into`. |
 | `--db-path PATH` | Database path for persisted mode; default is `phage_benchmark_store`. Prefer `/tmp/...` in docs/smokes. |
 | `--reuse` | Reuse an existing persisted database instead of deleting it first. |
@@ -94,11 +103,11 @@ bench/benchmark-matrix.sh --profile full --output /tmp/phage-benchmark-matrix-fu
 bench/benchmark-matrix.sh --profile linux-io-uring --output /tmp/phage-linux-io-uring-matrix.jsonl
 ```
 
-Matrix row JSON Lines include stable automation fields from the one-shot benchmark (`mode`, `operation_count`, `value_size`, `batch_size`, `read_api`, `throughput`, and `latency_us`) plus `type`, `row_index`, `profile`, `backend_status`, `git_revision`, `os_platform`, `zig_version`, and `timestamp`. The companion `*-summary.json` records the same run metadata, row count, row counts by mode, and the row with the best `total_ops_per_sec`. Treat `command` and the raw platform string as informational metadata because they can vary by shell or machine.
+Matrix row JSON Lines include stable automation fields from the one-shot benchmark (`mode`, `operation_count`, `value_size`, `batch_size`, `read_api`, `throughput`, and `latency_us`) plus `type`, `row_index`, `profile`, `backend_status`, `git_revision`, `os_platform`, `zig_version`, and `timestamp`. Compaction-profile rows additionally include `workload_profile=compaction`, `live_key_count`, `update_rounds`, and a `compaction` object with trigger, waste-ratio, and file-size fields. The companion `*-summary.json` records the same run metadata, row count, row counts by mode, and the row with the best `total_ops_per_sec` when total throughput exists. Treat `command` and the raw platform string as informational metadata because they can vary by shell or machine.
 
 ### Platform notes
 
-- macOS uses the POSIX fallback backend. It is suitable for correctness tests and local smoke checks, including persisted smokes with an explicit `/tmp/...` path. The current quick-profile fallback baseline is recorded in [macOS POSIX-fallback benchmark baseline](benchmarks/2026-05-18-macos-fallback-baseline.md). Do not treat macOS POSIX-fallback rows as Linux `io_uring` evidence.
+- macOS uses the POSIX fallback backend. It is suitable for correctness tests and local smoke checks, including persisted smokes with an explicit `/tmp/...` path. The current quick-profile fallback baseline is recorded in [macOS POSIX-fallback benchmark baseline](benchmarks/2026-05-18-macos-fallback-baseline.md). The current compaction-profile evidence is recorded in [compaction benchmark and status evidence](benchmarks/2026-05-18-compaction-performance.md) and remains macOS POSIX-fallback evidence until the separate Linux compaction verification gate completes. Do not treat macOS POSIX-fallback rows as Linux `io_uring` evidence.
 - Linux is the intended high-performance target for the `io_uring` backend. The current Linux verification note records OrbStack Linux evidence after remediation: Kanban card `t_c54e96cd` and commit `bc23f18` fixed the WAL empty-read path, and the S4 rerun verified Linux `zig build test`, quick matrix evidence, and a cheap `linux-io-uring --ops 1000` profile with `metadata.backend_status=linux-io-uring-intended`; see the [Linux io_uring benchmark verification note](benchmarks/2026-05-18-linux-io-uring-verification.md) for commands, representative rows, and reproduction guidance.
 - Memory-mode benchmark examples are portable and avoid generated database/WAL artifacts.
 
@@ -212,4 +221,5 @@ Use `KEYS *` for all keys. For prefixes, prefer regex-style patterns such as `KE
 
 - [API Reference](API_REFERENCE.md)
 - [MVP Roadmap](MVP_ROADMAP.md)
+- [Compaction benchmark and status evidence](benchmarks/2026-05-18-compaction-performance.md)
 - [Linux io_uring benchmark verification runbook](benchmarks/2026-05-18-linux-io-uring-verification.md)
