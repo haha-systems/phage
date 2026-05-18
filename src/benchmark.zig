@@ -10,6 +10,11 @@ const BenchmarkMode = enum {
     memory,
 };
 
+const OutputFormat = enum {
+    human,
+    json,
+};
+
 const Config = struct {
     ops: u32 = 10_000,
     value_size: usize = 16,
@@ -18,6 +23,7 @@ const Config = struct {
     owned_db_path: ?[]u8 = null,
     fresh: bool = true,
     mode: BenchmarkMode = .persisted,
+    output_format: OutputFormat = .human,
 
     fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         if (self.owned_db_path) |db_path| {
@@ -107,7 +113,7 @@ const MemoryBenchmarkStore = struct {
 
 fn usage(program_name: []const u8) void {
     std.debug.print(
-        \\Usage: {s} [OPS] [--mode persisted|memory] [--value-size BYTES] [--batch-size N] [--db-path PATH] [--reuse]
+        \\Usage: {s} [OPS] [--mode persisted|memory] [--value-size BYTES] [--batch-size N] [--db-path PATH] [--reuse] [--json]
         \\
         \\Runs the built-in BENCHMARK command locally without requiring the ZMQ server.
         \\
@@ -119,6 +125,7 @@ fn usage(program_name: []const u8) void {
         \\  --batch-size N              Number of writes to group before waiting (default: 1)
         \\  --db-path PATH              Database path for persisted mode (default: phage_benchmark_store)
         \\  --reuse                     Reuse an existing database instead of deleting it first
+        \\  --json                      Emit machine-readable JSON instead of human text
         \\  -h, --help                  Show this help
         \\
     , .{program_name});
@@ -164,6 +171,8 @@ fn parseArgSlice(allocator: std.mem.Allocator, args: []const []const u8) !Config
             if (config.batch_size == 0) return error.InvalidBatchSize;
         } else if (std.mem.eql(u8, arg, "--reuse")) {
             config.fresh = false;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            config.output_format = .json;
         } else if (!saw_ops) {
             config.ops = try std.fmt.parseInt(u32, arg, 10);
             saw_ops = true;
@@ -285,6 +294,43 @@ fn nsToUs(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1000.0;
 }
 
+fn benchmarkModeName(mode: BenchmarkMode) []const u8 {
+    return switch (mode) {
+        .persisted => "persisted",
+        .memory => "memory",
+    };
+}
+
+fn printBenchmarkJson(config: Config, stats: BenchmarkStats, writer: *std.io.AnyWriter) !void {
+    try writer.writeAll("{\"mode\":\"");
+    try writer.writeAll(benchmarkModeName(config.mode));
+    try writer.writeAll("\"");
+    try writer.print(",\"operation_count\":{d},\"value_size\":{d},\"batch_size\":{d}", .{
+        config.ops,
+        config.value_size,
+        config.batch_size,
+    });
+    try writer.writeAll(",\"throughput\":{");
+    try writer.print("\"write_ops_per_sec\":{d:.2},\"read_ops_per_sec\":{d:.2},\"total_ops_per_sec\":{d:.2}", .{
+        stats.writeOpsPerSec(),
+        stats.readOpsPerSec(),
+        stats.totalOpsPerSec(),
+    });
+    try writer.writeAll("},\"latency_us\":{\"write\":{");
+    try writer.print("\"p50\":{d:.2},\"p95\":{d:.2},\"p99\":{d:.2}", .{
+        nsToUs(stats.write_latency.p50_ns),
+        nsToUs(stats.write_latency.p95_ns),
+        nsToUs(stats.write_latency.p99_ns),
+    });
+    try writer.writeAll("},\"read\":{");
+    try writer.print("\"p50\":{d:.2},\"p95\":{d:.2},\"p99\":{d:.2}", .{
+        nsToUs(stats.read_latency.p50_ns),
+        nsToUs(stats.read_latency.p95_ns),
+        nsToUs(stats.read_latency.p99_ns),
+    });
+    try writer.writeAll("}}}\n");
+}
+
 fn printBenchmarkStats(stats: BenchmarkStats, writer: *std.io.AnyWriter) !void {
     try writer.print("Write time: {d} ms\n", .{stats.write_time_ns / 1_000_000});
     try writer.print("Read time: {d} ms\n", .{stats.read_time_ns / 1_000_000});
@@ -298,10 +344,12 @@ fn printBenchmarkStats(stats: BenchmarkStats, writer: *std.io.AnyWriter) !void {
 
 fn runPersistedBenchmark(allocator: std.mem.Allocator, config: Config) !void {
     var stdout = std.fs.File.stdout().deprecatedWriter().any();
-    try stdout.print("Benchmarking...\n", .{});
-    try stdout.print("Mode: persisted\n", .{});
-    try stdout.print("Value size: {d} bytes\n", .{config.value_size});
-    try stdout.print("Batch size: {d}\n", .{config.batch_size});
+    if (config.output_format == .human) {
+        try stdout.print("Benchmarking...\n", .{});
+        try stdout.print("Mode: persisted\n", .{});
+        try stdout.print("Value size: {d} bytes\n", .{config.value_size});
+        try stdout.print("Batch size: {d}\n", .{config.batch_size});
+    }
 
     if (config.fresh) {
         removeIfExists(config.db_path);
@@ -314,23 +362,35 @@ fn runPersistedBenchmark(allocator: std.mem.Allocator, config: Config) !void {
     defer store.deinit();
 
     const stats = try runBenchmark(&store, .{ .ops = config.ops, .value_size = config.value_size, .batch_size = config.batch_size });
-    try printBenchmarkStats(stats, &stdout);
-    try stdout.print("Benchmark completed.\n", .{});
+    switch (config.output_format) {
+        .human => {
+            try printBenchmarkStats(stats, &stdout);
+            try stdout.print("Benchmark completed.\n", .{});
+        },
+        .json => try printBenchmarkJson(config, stats, &stdout),
+    }
 }
 
 fn runMemoryBenchmark(allocator: std.mem.Allocator, config: Config) !void {
     var stdout = std.fs.File.stdout().deprecatedWriter().any();
-    try stdout.print("Benchmarking...\n", .{});
-    try stdout.print("Mode: memory\n", .{});
-    try stdout.print("Value size: {d} bytes\n", .{config.value_size});
-    try stdout.print("Batch size: {d}\n", .{config.batch_size});
+    if (config.output_format == .human) {
+        try stdout.print("Benchmarking...\n", .{});
+        try stdout.print("Mode: memory\n", .{});
+        try stdout.print("Value size: {d} bytes\n", .{config.value_size});
+        try stdout.print("Batch size: {d}\n", .{config.batch_size});
+    }
 
     var store = MemoryBenchmarkStore.init(allocator);
     defer store.deinit();
 
     const stats = try runBenchmark(&store, .{ .ops = config.ops, .value_size = config.value_size, .batch_size = config.batch_size });
-    try printBenchmarkStats(stats, &stdout);
-    try stdout.print("Benchmark completed.\n", .{});
+    switch (config.output_format) {
+        .human => {
+            try printBenchmarkStats(stats, &stdout);
+            try stdout.print("Benchmark completed.\n", .{});
+        },
+        .json => try printBenchmarkJson(config, stats, &stdout),
+    }
 }
 
 pub fn main() !void {
@@ -470,4 +530,51 @@ test "benchmark output includes write and read latency percentiles" {
 
     try std.testing.expect(std.mem.indexOf(u8, output.items, "Write latency p50/p95/p99") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items, "Read latency p50/p95/p99") != null);
+}
+
+test "benchmark args support json output" {
+    var config = try parseArgSlice(std.testing.allocator, &.{ "phage-benchmark", "7", "--json" });
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(OutputFormat.json, config.output_format);
+}
+
+test "benchmark json output is parseable and includes reproducibility fields" {
+    const stats = BenchmarkStats{
+        .num_ops = 3,
+        .write_time_ns = 3000,
+        .read_time_ns = 6000,
+        .total_time_ns = 9000,
+        .write_latency = .{ .p50_ns = 1000, .p95_ns = 2000, .p99_ns = 3000 },
+        .read_latency = .{ .p50_ns = 4000, .p95_ns = 5000, .p99_ns = 6000 },
+    };
+    const config = Config{
+        .ops = 3,
+        .value_size = 16,
+        .batch_size = 2,
+        .mode = .memory,
+        .output_format = .json,
+    };
+
+    var output = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer output.deinit();
+    var writer = output.writer().any();
+
+    try printBenchmarkJson(config, stats, &writer);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.items, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    try std.testing.expectEqualStrings("memory", root.get("mode").?.string);
+    try std.testing.expectEqual(@as(i64, 3), root.get("operation_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 16), root.get("value_size").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), root.get("batch_size").?.integer);
+    try std.testing.expect(root.get("throughput").?.object.get("total_ops_per_sec") != null);
+    try std.testing.expect(root.get("latency_us").?.object.get("write").?.object.get("p50") != null);
+    try std.testing.expect(root.get("latency_us").?.object.get("write").?.object.get("p95") != null);
+    try std.testing.expect(root.get("latency_us").?.object.get("write").?.object.get("p99") != null);
+    try std.testing.expect(root.get("latency_us").?.object.get("read").?.object.get("p50") != null);
+    try std.testing.expect(root.get("latency_us").?.object.get("read").?.object.get("p95") != null);
+    try std.testing.expect(root.get("latency_us").?.object.get("read").?.object.get("p99") != null);
 }
