@@ -8,7 +8,7 @@ Phage is a Zig key/value store with:
 - A sharded in-memory index.
 - Allocation-owning and caller-buffer read APIs (`get` and `getInto`).
 - Basic in-process metrics for storage operation counts, errors, and total latency.
-- A native benchmark runner for local performance checks.
+- A native benchmark runner for local performance checks, plus a repository-local matrix runner for comparable JSONL/summary artifacts.
 - Protocol and a supported ZeroMQ server workflow under `src/protocol/` and `src/zserver.zig`.
 - Linux `io_uring` as the intended high-performance backend, with a POSIX fallback that lets tests and memory/persisted benchmark smokes run on macOS.
 
@@ -48,8 +48,12 @@ zig build -Doptimize=ReleaseFast benchmark -- 1000 --value-size 16 --batch-size 
 # Buffered read-path smoke using getInto instead of allocating get
 zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 256 --batch-size 64 --read-api get-into
 
-# Machine-readable output for automation
+# Machine-readable one-shot output for automation
 zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16 --batch-size 16 --read-api get-into --json
+
+# Cheap benchmark matrix smoke: writes JSON Lines rows and a compact summary JSON
+bench/benchmark-matrix.sh --quick --output /tmp/phage-benchmark-matrix.jsonl
+python3 -m json.tool /tmp/phage-benchmark-matrix-summary.json >/dev/null
 ```
 
 Benchmark options currently include:
@@ -67,6 +71,25 @@ Benchmark options currently include:
 | `--json` | Emit machine-readable JSON instead of human text. |
 
 The protocol `BENCHMARK` command is separate from this native benchmark runner. It runs through the server command path and writes benchmark keys into the active store; use the native benchmark command above for reproducible local checks.
+
+### Benchmark matrix workflow
+
+Use `bench/benchmark-matrix.sh` when you need comparable row-level results across a small matrix. The quick profile is intended for reviewer and final-audit smoke checks; it runs one memory row and one persisted row with `--read-api get-into`, value size `16`, batch size `16`, and 1,000 operations per row. Persisted rows use unique temporary database paths and the runner removes generated store/WAL files after each row.
+
+```sh
+# Cheap local matrix smoke
+bench/benchmark-matrix.sh --quick --output /tmp/phage-benchmark-matrix.jsonl
+python3 -m json.tool /tmp/phage-benchmark-matrix-summary.json >/dev/null
+
+# Fuller profile covering memory/persisted, batch sizes 1/16/64,
+# value sizes 16/256, and get/get-into read APIs.
+bench/benchmark-matrix.sh --profile full --output /tmp/phage-benchmark-matrix-full.jsonl
+
+# Linux runbook profile: run only on a Linux host when collecting io_uring evidence.
+bench/benchmark-matrix.sh --profile linux-io-uring --output /tmp/phage-linux-io-uring-matrix.jsonl
+```
+
+Matrix row JSON Lines include stable automation fields from the one-shot benchmark (`mode`, `operation_count`, `value_size`, `batch_size`, `read_api`, `throughput`, and `latency_us`) plus `type`, `row_index`, `profile`, `backend_status`, `git_revision`, `os_platform`, `zig_version`, and `timestamp`. The companion `*-summary.json` records the same run metadata, row count, row counts by mode, and the row with the best `total_ops_per_sec`. Treat `command` and the raw platform string as informational metadata because they can vary by shell or machine.
 
 ### Platform notes
 

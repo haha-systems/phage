@@ -1,7 +1,7 @@
 # Phage MVP Roadmap
 
 **Last Updated**: 2026-05-18
-**Status**: Core storage, recovery, benchmark, protocol-command, server build/run, live command smoke, serialized multi-client server smoke, and server workflow docs are implemented for review
+**Status**: Core storage, recovery, benchmark, benchmark matrix, protocol-command, server build/run, live command smoke, serialized multi-client server smoke, and server workflow docs are implemented for review
 
 ## Executive Summary
 
@@ -16,7 +16,8 @@ The ZeroMQ server source in `src/zserver.zig` contains structured lifecycle logg
 - Core storage API supports `put`, `putBatch`, `get`, `getInto`, `delete`, WAL recovery, compaction coverage, and batch writes.
 - WAL/recovery hardening covers committed WAL entries, corrupt tails, invalid operation tags, delete replay, and WAL-only/data-missing crash states.
 - `zig build test` is the standard correctness gate and includes storage, protocol command, compaction, benchmark, metrics, and server-runtime unit tests.
-- `zig build -Doptimize=ReleaseFast benchmark -- ...` is the supported local benchmark path, with human or JSON output, memory or persisted modes, configurable value/batch sizes, and `get` vs `getInto` read-path selection.
+- `zig build -Doptimize=ReleaseFast benchmark -- ...` is the supported local one-shot benchmark path, with human or JSON output, memory or persisted modes, configurable value/batch sizes, and `get` vs `getInto` read-path selection.
+- `bench/benchmark-matrix.sh` runs repeatable quick/full benchmark profiles and emits JSON Lines rows plus a compact summary with git, Zig, OS/platform, profile, timestamp, and backend-status metadata.
 - macOS POSIX fallback remains useful for development and tests while Linux `io_uring` remains the intended high-performance backend.
 
 ### Protocol/server status
@@ -41,8 +42,9 @@ The ZeroMQ server source in `src/zserver.zig` contains structured lifecycle logg
 | Core storage tests | Active / reviewed | Run with `zig build test`. |
 | WAL path ownership and test artifact isolation | Complete for current slice | Store-owned WAL path lifetime and ignored test artifact paths were reviewed in S1. |
 | WAL/recovery hardening | Complete for current slice | Empty values at data offset 0, invalid op tags, delete replay, helper-based WAL clearing, and missing-data WAL replay are covered. |
-| Native benchmark runner | Active | Supports cheap memory and persisted smoke runs through the `benchmark` build step. |
-| Benchmark output/reporting | Active / reviewed | Human output remains default; `--json` emits machine-readable mode/count/value/batch/latency/throughput fields. |
+| Native benchmark runner | Active | Supports cheap memory and persisted one-shot smoke runs through the `benchmark` build step. |
+| Benchmark matrix workflow | Active / implemented for review | `bench/benchmark-matrix.sh --quick --output /tmp/phage-benchmark-matrix.jsonl` emits row-level JSON Lines and `/tmp/phage-benchmark-matrix-summary.json`; `--profile full` covers memory/persisted, batch sizes `1/16/64`, value sizes `16/256`, and `get`/`get-into` read APIs. |
+| Benchmark output/reporting | Active / reviewed | Human output remains default for one-shot runs; `--json` emits machine-readable mode/count/value/batch/latency/throughput fields, and matrix summaries add reproducibility metadata without replacing one-shot JSON. |
 
 ### Phase 2: Protocol and server MVP
 
@@ -86,8 +88,12 @@ zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16
 # macOS/Linux: persisted path smoke through the POSIX fallback on macOS and native backend selection on Linux
 zig build -Doptimize=ReleaseFast benchmark -- 1000 --value-size 16 --batch-size 16 --db-path /tmp/phage-mvp-roadmap-bench
 
-# macOS/Linux: machine-readable output for automation
+# macOS/Linux: machine-readable one-shot output for automation
 zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16 --batch-size 16 --read-api get-into --json
+
+# macOS/Linux: cheap comparable matrix output for audits/reviews
+bench/benchmark-matrix.sh --quick --output /tmp/phage-benchmark-matrix.jsonl
+python3 -m json.tool /tmp/phage-benchmark-matrix-summary.json >/dev/null
 ```
 
 Backend note: macOS runs the POSIX fallback path. Linux is the target platform for `io_uring` fast-path performance and should be used for final Linux backend benchmarking.
