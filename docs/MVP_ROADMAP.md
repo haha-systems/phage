@@ -129,7 +129,7 @@ zig build run-server -- --help
 ## Documentation rules for MVP claims
 
 - Use explicit server workflow names: `phage-server`, `run-server`, `server-smoke`, `server-sustained-smoke`, and `server-load`; do not imply that the default `zig build run` step launches the server.
-- State that server build/run/smoke steps require the pinned `zimq` package and a working ZeroMQ/libzmq environment, while core tests and native benchmark smokes do not start a live network server.
+- State that server build/run/smoke/load steps require the pinned `zimq` package and a working ZeroMQ/libzmq environment, while core tests and native benchmark smokes do not start a live network server.
 - Describe the verified server runtime model as serialized multi-client REQ/REP handling, not parallel command execution or throughput scaling with client count.
 - Link server performance claims to [server throughput baseline evidence](benchmarks/2026-05-18-server-throughput.md), and keep macOS POSIX-fallback rows separate from Linux `io_uring` rows.
 - Do not require the external Demon client for repository-local workflows.

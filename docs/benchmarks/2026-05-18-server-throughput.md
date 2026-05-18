@@ -24,7 +24,7 @@ The `server-load` harness starts the local `phage-server`, drives bounded ZeroMQ
 - Backend status reported by harness: `macos-posix-fallback`.
 - Runtime model reported by harness: `multi-client-serialized-req-rep`.
 
-Important interpretation: every row in this note was collected locally on macOS and exercises Phage's POSIX fallback storage path. These rows are not Linux `io_uring` evidence and must not be relabeled as Linux server performance.
+Important S2 interpretation: the S2 macOS baseline rows in this note were collected locally on macOS and exercise Phage's POSIX fallback storage path. These S2 rows are not Linux `io_uring` evidence and must not be relabeled as Linux server performance; Linux `server-load` evidence is recorded separately in the S4 section below.
 
 ## Commands run
 
