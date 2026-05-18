@@ -274,6 +274,48 @@ test "write_ahead_log:recover" {
     try testCleanup();
 }
 
+test "write_ahead_log:clear_truncates_and_resets_size_without_rewinding_fd_cursor" {
+    const allocator = std.testing.allocator;
+    const path = "test_wal_clear_cursor.db";
+    const wal_path = "test_wal_clear_cursor.db.wal";
+
+    cleanupFiles(path, wal_path);
+    defer cleanupFiles(path, wal_path);
+
+    var store = try Phage.init(allocator, path);
+    defer store.deinit();
+
+    const wal_bytes = "pending-wal-entry";
+    try expectFullWrite(wal_bytes.len, try std.posix.pwrite(store.wal_fd, wal_bytes, 0));
+    store.wal_file_size.store(wal_bytes.len, .release);
+    try std.posix.lseek_SET(store.wal_fd, 5);
+
+    try Wal.clear(&store);
+
+    try expectWalCleared(&store);
+    try std.testing.expectEqual(@as(u64, 5), try std.posix.lseek_CUR_get(store.wal_fd));
+}
+
+test "write_ahead_log:clear_skips_empty_tracked_wal_without_rewinding_fd_cursor" {
+    const allocator = std.testing.allocator;
+    const path = "test_wal_clear_empty_cursor.db";
+    const wal_path = "test_wal_clear_empty_cursor.db.wal";
+
+    cleanupFiles(path, wal_path);
+    defer cleanupFiles(path, wal_path);
+
+    var store = try Phage.init(allocator, path);
+    defer store.deinit();
+
+    try std.posix.lseek_SET(store.wal_fd, 4);
+    store.wal_file_size.store(0, .release);
+
+    try Wal.clear(&store);
+
+    try expectWalCleared(&store);
+    try std.testing.expectEqual(@as(u64, 4), try std.posix.lseek_CUR_get(store.wal_fd));
+}
+
 test "write_ahead_log:recover_with_provisional_entries" {
     const allocator = std.testing.allocator;
     const path = "test.db";
