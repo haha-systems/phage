@@ -21,6 +21,8 @@ const BufferPool = data_structures.BufferPool;
 const Trie = data_structures.Trie;
 
 pub const Phage = struct {
+    pub const BatchPair = struct { key: []const u8, value: []const u8 };
+
     allocator: Allocator,
     backend: Backend,
     fd: posix.fd_t,
@@ -187,7 +189,7 @@ pub const Phage = struct {
 
     /// Optimized batch PUT operation for better performance
     /// Batches multiple key-value pairs and minimizes I/O waits
-    pub fn putBatch(self: *Phage, pairs: []const struct { key: []const u8, value: []const u8 }) !void {
+    pub fn putBatch(self: *Phage, pairs: []const BatchPair) !void {
         if (pairs.len == 0) return;
 
         // Prepare all data entries first

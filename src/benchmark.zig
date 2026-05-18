@@ -13,6 +13,7 @@ const BenchmarkMode = enum {
 const Config = struct {
     ops: u32 = 10_000,
     value_size: usize = 16,
+    batch_size: usize = 1,
     db_path: []const u8 = "phage_benchmark_store",
     owned_db_path: ?[]u8 = null,
     fresh: bool = true,
@@ -29,6 +30,7 @@ const Config = struct {
 const BenchmarkRunOptions = struct {
     ops: u32,
     value_size: usize = 16,
+    batch_size: usize = 1,
 };
 
 const LatencySummary = struct {
@@ -91,6 +93,12 @@ const MemoryBenchmarkStore = struct {
         try self.map.putNoClobber(owned_key, owned_value);
     }
 
+    fn putBatch(self: *MemoryBenchmarkStore, pairs: []const phage.Phage.BatchPair) !void {
+        for (pairs) |pair| {
+            try self.put(pair.key, pair.value);
+        }
+    }
+
     fn get(self: *MemoryBenchmarkStore, key: []const u8) ![]u8 {
         const value = self.map.get(key) orelse return error.KeyNotFound;
         return try self.allocator.dupe(u8, value);
@@ -99,7 +107,7 @@ const MemoryBenchmarkStore = struct {
 
 fn usage(program_name: []const u8) void {
     std.debug.print(
-        \\Usage: {s} [OPS] [--mode persisted|memory] [--value-size BYTES] [--db-path PATH] [--reuse]
+        \\Usage: {s} [OPS] [--mode persisted|memory] [--value-size BYTES] [--batch-size N] [--db-path PATH] [--reuse]
         \\
         \\Runs the built-in BENCHMARK command locally without requiring the ZMQ server.
         \\
@@ -108,6 +116,7 @@ fn usage(program_name: []const u8) void {
         \\  --mode persisted|memory     persisted uses Phage storage; memory uses a HashMap baseline
         \\                              without filesystem or WAL I/O (default: persisted)
         \\  --value-size BYTES          Value payload size to write for each operation (default: 16)
+        \\  --batch-size N              Number of writes to group before waiting (default: 1)
         \\  --db-path PATH              Database path for persisted mode (default: phage_benchmark_store)
         \\  --reuse                     Reuse an existing database instead of deleting it first
         \\  -h, --help                  Show this help
@@ -148,6 +157,11 @@ fn parseArgSlice(allocator: std.mem.Allocator, args: []const []const u8) !Config
             if (i >= args.len) return error.MissingValueSize;
             config.value_size = try std.fmt.parseInt(usize, args[i], 10);
             if (config.value_size == 0) return error.InvalidValueSize;
+        } else if (std.mem.eql(u8, arg, "--batch-size")) {
+            i += 1;
+            if (i >= args.len) return error.MissingBatchSize;
+            config.batch_size = try std.fmt.parseInt(usize, args[i], 10);
+            if (config.batch_size == 0) return error.InvalidBatchSize;
         } else if (std.mem.eql(u8, arg, "--reuse")) {
             config.fresh = false;
         } else if (!saw_ops) {
@@ -180,6 +194,13 @@ fn makeValue(allocator: std.mem.Allocator, value_size: usize) ![]u8 {
     return value;
 }
 
+fn freeBatch(allocator: std.mem.Allocator, pairs: []const phage.Phage.BatchPair) void {
+    for (pairs) |pair| {
+        allocator.free(pair.key);
+        allocator.free(pair.value);
+    }
+}
+
 fn nearestRank(sorted_samples: []const u64, percentile: u8) u64 {
     if (sorted_samples.len == 0) return 0;
     const rank = (@as(usize, percentile) * sorted_samples.len + 99) / 100;
@@ -202,18 +223,35 @@ fn runBenchmark(store: anytype, options: BenchmarkRunOptions) !BenchmarkStats {
     const read_latencies = try store.allocator.alloc(u64, options.ops);
     defer store.allocator.free(read_latencies);
 
-    const write_start = std.time.nanoTimestamp();
-    for (0..options.ops) |i| {
-        const key = try std.fmt.allocPrint(store.allocator, "key{d}", .{i});
-        defer store.allocator.free(key);
+    const batch_size = @max(@as(usize, 1), options.batch_size);
+    const batch_capacity = @min(batch_size, @as(usize, options.ops));
+    const pairs = try store.allocator.alloc(phage.Phage.BatchPair, batch_capacity);
+    defer store.allocator.free(pairs);
 
-        const value = try makeValue(store.allocator, options.value_size);
-        defer store.allocator.free(value);
+    const write_start = std.time.nanoTimestamp();
+    var write_index: usize = 0;
+    while (write_index < options.ops) {
+        const batch_len = @min(batch_capacity, @as(usize, options.ops) - write_index);
+        for (pairs[0..batch_len], 0..) |*pair, batch_index| {
+            const op_index = write_index + batch_index;
+            pair.* = .{
+                .key = try std.fmt.allocPrint(store.allocator, "key{d}", .{op_index}),
+                .value = try makeValue(store.allocator, options.value_size),
+            };
+        }
 
         const op_start = std.time.nanoTimestamp();
-        try store.put(key, value);
+        if (batch_len == 1 and batch_size == 1) {
+            try store.put(pairs[0].key, pairs[0].value);
+        } else {
+            try store.putBatch(pairs[0..batch_len]);
+        }
         const op_end = std.time.nanoTimestamp();
-        write_latencies[i] = @intCast(op_end - op_start);
+        const per_item_ns = @max(@as(u64, 1), @as(u64, @intCast(op_end - op_start)) / @as(u64, @intCast(batch_len)));
+        @memset(write_latencies[write_index .. write_index + batch_len], per_item_ns);
+        freeBatch(store.allocator, pairs[0..batch_len]);
+
+        write_index += batch_len;
     }
     const write_end = std.time.nanoTimestamp();
 
@@ -263,6 +301,7 @@ fn runPersistedBenchmark(allocator: std.mem.Allocator, config: Config) !void {
     try stdout.print("Benchmarking...\n", .{});
     try stdout.print("Mode: persisted\n", .{});
     try stdout.print("Value size: {d} bytes\n", .{config.value_size});
+    try stdout.print("Batch size: {d}\n", .{config.batch_size});
 
     if (config.fresh) {
         removeIfExists(config.db_path);
@@ -274,7 +313,7 @@ fn runPersistedBenchmark(allocator: std.mem.Allocator, config: Config) !void {
     var store = try phage.Phage.init(allocator, config.db_path);
     defer store.deinit();
 
-    const stats = try runBenchmark(&store, .{ .ops = config.ops, .value_size = config.value_size });
+    const stats = try runBenchmark(&store, .{ .ops = config.ops, .value_size = config.value_size, .batch_size = config.batch_size });
     try printBenchmarkStats(stats, &stdout);
     try stdout.print("Benchmark completed.\n", .{});
 }
@@ -284,11 +323,12 @@ fn runMemoryBenchmark(allocator: std.mem.Allocator, config: Config) !void {
     try stdout.print("Benchmarking...\n", .{});
     try stdout.print("Mode: memory\n", .{});
     try stdout.print("Value size: {d} bytes\n", .{config.value_size});
+    try stdout.print("Batch size: {d}\n", .{config.batch_size});
 
     var store = MemoryBenchmarkStore.init(allocator);
     defer store.deinit();
 
-    const stats = try runBenchmark(&store, .{ .ops = config.ops, .value_size = config.value_size });
+    const stats = try runBenchmark(&store, .{ .ops = config.ops, .value_size = config.value_size, .batch_size = config.batch_size });
     try printBenchmarkStats(stats, &stdout);
     try stdout.print("Benchmark completed.\n", .{});
 }
@@ -328,6 +368,14 @@ test "benchmark args support configurable payload size" {
     try std.testing.expectEqual(@as(usize, 128), config.value_size);
 }
 
+test "benchmark args support configurable batch size" {
+    var config = try parseArgSlice(std.testing.allocator, &.{ "phage-benchmark", "7", "--batch-size", "4" });
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 7), config.ops);
+    try std.testing.expectEqual(@as(usize, 4), config.batch_size);
+}
+
 test "benchmark runner writes configured payload bytes" {
     const FakeStore = struct {
         allocator: std.mem.Allocator,
@@ -338,6 +386,12 @@ test "benchmark runner writes configured payload bytes" {
             _ = key;
             try std.testing.expectEqual(self.expected_value_size, value.len);
             self.puts += 1;
+        }
+
+        fn putBatch(self: *@This(), pairs: []const phage.Phage.BatchPair) !void {
+            for (pairs) |pair| {
+                try self.put(pair.key, pair.value);
+            }
         }
 
         fn get(self: *@This(), key: []const u8) ![]u8 {
@@ -351,6 +405,42 @@ test "benchmark runner writes configured payload bytes" {
 
     try std.testing.expectEqual(@as(usize, 3), store.puts);
     try std.testing.expectEqual(@as(u32, 3), stats.num_ops);
+}
+
+test "benchmark runner groups writes by configured batch size" {
+    const FakeStore = struct {
+        allocator: std.mem.Allocator,
+        batch_calls: usize = 0,
+        put_calls: usize = 0,
+        total_pairs: usize = 0,
+        max_batch_len: usize = 0,
+
+        fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            _ = key;
+            _ = value;
+            self.put_calls += 1;
+        }
+
+        fn putBatch(self: *@This(), pairs: []const phage.Phage.BatchPair) !void {
+            self.batch_calls += 1;
+            self.total_pairs += pairs.len;
+            self.max_batch_len = @max(self.max_batch_len, pairs.len);
+        }
+
+        fn get(self: *@This(), key: []const u8) ![]u8 {
+            _ = key;
+            return try self.allocator.dupe(u8, "value");
+        }
+    };
+
+    var store = FakeStore{ .allocator = std.testing.allocator };
+    const stats = try runBenchmark(&store, .{ .ops = 5, .value_size = 16, .batch_size = 2 });
+
+    try std.testing.expectEqual(@as(u32, 5), stats.num_ops);
+    try std.testing.expectEqual(@as(usize, 0), store.put_calls);
+    try std.testing.expectEqual(@as(usize, 3), store.batch_calls);
+    try std.testing.expectEqual(@as(usize, 5), store.total_pairs);
+    try std.testing.expectEqual(@as(usize, 2), store.max_batch_len);
 }
 
 test "benchmark latency summary uses nearest-rank percentiles" {
