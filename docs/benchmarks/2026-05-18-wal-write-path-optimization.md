@@ -91,15 +91,15 @@ Interpretation:
 
 ## Linux `io_uring` status
 
-Post-optimization Linux `io_uring` evidence is deferred to S4, not inferred from the macOS rows above.
+Post-optimization Linux `io_uring` evidence is now verified by S4 rather than inferred from macOS rows.
 
 Current dependency status:
 
-- Existing Linux remediation `t_c54e96cd` is blocked after committing `bc23f18 fix(io): handle io_uring empty-value recovery reads`; OrbStack was stopped and `phage-linux` start/info timed out before Linux `zig build test` and a quick Linux matrix rerun could verify the fix.
-- S4 follow-up `t_701f3017` is queued to run after `t_c54e96cd` and S2 review. It owns post-optimization Linux `zig build test`, quick matrix smoke, and cheap `linux-io-uring` profile evidence.
-- Historical Linux matrix evidence is recorded in [Linux io_uring benchmark verification](2026-05-18-linux-io-uring-verification.md), but that evidence predates the final S2 WAL clear optimization and is not a post-optimization before/after table.
+- Existing Linux remediation `t_c54e96cd` is complete. Commit `bc23f18` fixes zero-length `io_uring` reads by returning an already-completed no-op for empty buffers, and the Linux rerun confirmed the prior WAL empty-value recovery failure now passes.
+- S4 follow-up `t_701f3017` reran on OrbStack NixOS 25.11 arm64 at `c979895847d7136bce83811e53314c3356fb5048`, which includes `bc23f18`, `ddc8c91`, `2be5330`, and this docs evidence commit's parent.
+- Historical Linux matrix evidence remains recorded in [Linux io_uring benchmark verification](2026-05-18-linux-io-uring-verification.md); that document now also records the post-remediation WAL write-path verification table.
 
-When Linux is available, S4 should record at minimum:
+S4 Linux commands:
 
 ```sh
 git status --short --untracked-files=all
@@ -112,13 +112,30 @@ bench/benchmark-matrix.sh --profile linux-io-uring --ops 1000 --output /tmp/phag
 python3 -m json.tool /tmp/phage-linux-wal-write-matrix-ops1000-summary.json >/dev/null
 ```
 
-The expected Linux summary backend status is `linux-io-uring-intended`; any Linux blocker should be recorded with the exact host/tool error.
+S4 Linux summary:
+
+- Host: `Linux phage-nixos 7.0.5-orbstack-00330-ge3df4e19b0a0-dirty ... aarch64 GNU/Linux`
+- Zig version: `0.15.2`
+- `zig build test`: passed on Linux `io_uring`; the previous `write_ahead_log:recover_committed_empty_put_at_zero_offset` failure passed.
+- Quick matrix: `metadata.backend_status=linux-io-uring-intended`, `row_count=2`, `rows_by_mode.memory=1`, `rows_by_mode.persisted=1`, summary JSON validated.
+- `linux-io-uring --ops 1000` profile: `metadata.backend_status=linux-io-uring-intended`, `row_count=24`, `rows_by_mode.memory=12`, `rows_by_mode.persisted=12`, summary JSON validated.
+
+Representative post-optimization Linux persisted rows:
+
+| Source | Ops | Value bytes | Batch | Read API | Write ops/sec | Total ops/sec | Write p50/p95/p99 (us) |
+| --- | ---: | ---: | ---: | --- | ---: | ---: | --- |
+| S4 quick row 1 | 1,000 | 16 | 16 | `getInto` | 2,132,196.16 | 728,874.13 | 0.32 / 0.63 / 1.94 |
+| S4 profile row 12 | 1,000 | 16 | 1 | `get` | 107,366.22 | 108,844.53 | 4.88 / 22.50 / 27.63 |
+| S4 profile row 15 | 1,000 | 16 | 16 | `getInto` | 751,667.76 | 439,842.42 | 1.18 / 1.84 / 1.91 |
+| S4 profile row 23 | 1,000 | 256 | 64 | `getInto` | 870,164.50 | 122,802.35 | 0.65 / 6.70 / 6.70 |
+
+The S4 run confirms Linux correctness and `metadata.backend_status=linux-io-uring-intended` for the optimized WAL write path. The cheap 1,000-op Linux rows are useful status evidence but should not be read as a definitive throughput win/loss claim versus the earlier Ubuntu run.
 
 ## Verification and artifact hygiene
 
 - S2 implementation verified `zig fmt src build.zig` and `zig build test` on macOS.
 - S2 review reran `zig build test`, quick matrix smoke, JSON validation, and diff checks.
-- Raw artifacts remain local only: `/tmp/phage-wal-write-optimized-quick.jsonl`, `/tmp/phage-wal-write-optimized-quick-summary.json`, `/tmp/phage-wal-s2-review-quick.jsonl`, `/tmp/phage-wal-s2-review-quick-summary.json`, and `/tmp/phage-wal-opt-b{1,16,64}-2be5330.json` are not committed.
+- Raw artifacts remain local only: `/tmp/phage-wal-write-optimized-quick.jsonl`, `/tmp/phage-wal-write-optimized-quick-summary.json`, `/tmp/phage-wal-s2-review-quick.jsonl`, `/tmp/phage-wal-s2-review-quick-summary.json`, `/tmp/phage-wal-opt-b{1,16,64}-2be5330.json`, `/tmp/phage-linux-wal-write-quick.jsonl`, `/tmp/phage-linux-wal-write-quick-summary.json`, `/tmp/phage-linux-wal-write-matrix-ops1000.jsonl`, and `/tmp/phage-linux-wal-write-matrix-ops1000-summary.json` are not committed.
 - Repository-root `matrix.json-summary.json` was already present as an untracked generated-looking file before this S3 docs commit and remains unstaged.
 
 ## Related documents

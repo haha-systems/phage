@@ -1,16 +1,16 @@
 # Linux io_uring benchmark verification
 
 Date: 2026-05-18
-Status: Linux benchmark evidence collected via OrbStack; final all-green Linux correctness gate deferred to remediation card `t_c54e96cd`
+Status: Linux `io_uring` correctness and post-optimization WAL write-path evidence verified on OrbStack NixOS after remediation
 PRD slice: S4 Linux io_uring verification path
 
 ## Status summary
 
 The original S4 worker ran on macOS and correctly refused to treat POSIX-fallback numbers as Linux `io_uring` evidence. A follow-up approved Linux execution path became available through OrbStack, and the Linux benchmark matrix workflow completed both the quick smoke and a fuller `linux-io-uring` profile on an Ubuntu 24.04 arm64 machine.
 
-Linux status for this slice: `deferred with a remediation card`.
+Linux status for this slice: `verified after remediation`.
 
-Why deferred instead of fully green: the Linux matrix benchmark evidence exists and reports `metadata.backend_status=linux-io-uring-intended`, but `zig build test` on the same Linux/OrbStack environment exposed an `io_uring` backend failure in WAL empty-value recovery. That correctness gap is tracked by Kanban remediation card `t_c54e96cd`.
+The first Linux correctness run exposed an `io_uring` backend failure in WAL empty-value recovery. Remediation card `t_c54e96cd` fixed that path in `bc23f18` by treating zero-length `io_uring` reads as completed no-ops. The WAL write-path optimization PRD S4 rerun then verified current HEAD `c979895847d7136bce83811e53314c3356fb5048` on OrbStack NixOS: Linux `zig build test` passed, the quick matrix summary validated with `metadata.backend_status=linux-io-uring-intended`, and the cheap `linux-io-uring` profile validated with 24 rows.
 
 ## Worker and backend capability checks
 
@@ -119,9 +119,72 @@ Representative rows from the fuller profile:
 
 Persisted `db_path` and `.wal` artifacts for representative rows were cleaned up under `/tmp/phage-benchmark-matrix-*`.
 
-## Correctness blocker discovered on Linux
+### Post-remediation WAL write-path S4 rerun
 
-The Linux host resolved the missing-host blocker, but `zig build test` did not pass on the Linux `io_uring` backend path. The failing test was:
+Result: passed on OrbStack NixOS 25.11 arm64 after `bc23f18` and after the WAL clear optimization commits `ddc8c91`/`2be5330`.
+
+Host and tool evidence:
+
+```text
+$ uname -a
+Linux phage-nixos 7.0.5-orbstack-00330-ge3df4e19b0a0-dirty #1 SMP PREEMPT Sun May 10 11:47:42 UTC 2026 aarch64 GNU/Linux
+
+$ zig version
+0.15.2
+
+$ git rev-parse HEAD
+c979895847d7136bce83811e53314c3356fb5048
+```
+
+Verification commands:
+
+```sh
+zig build test
+bench/benchmark-matrix.sh --quick --output /tmp/phage-linux-wal-write-quick.jsonl
+python3 -m json.tool /tmp/phage-linux-wal-write-quick-summary.json >/dev/null
+bench/benchmark-matrix.sh --profile linux-io-uring --ops 1000 --output /tmp/phage-linux-wal-write-matrix-ops1000.jsonl
+python3 -m json.tool /tmp/phage-linux-wal-write-matrix-ops1000-summary.json >/dev/null
+```
+
+Linux `zig build test` passed on the `io_uring` path. The previously failing `write_ahead_log:recover_committed_empty_put_at_zero_offset` regression passed, as did the backend regression `linux read treats empty buffers as completed no-ops`; the final Zig test-runner groups reported 54/54 and 52/52 passed.
+
+S4 quick matrix summary:
+
+- `metadata.profile=quick`
+- `metadata.git_revision=c979895847d7136bce83811e53314c3356fb5048`
+- `metadata.os_platform=Linux-7.0.5-orbstack-00330-ge3df4e19b0a0-dirty-aarch64-with-glibc2.40`
+- `metadata.zig_version=0.15.2`
+- `metadata.backend_status=linux-io-uring-intended`
+- `row_count=2`
+- `rows_by_mode.memory=1`
+- `rows_by_mode.persisted=1`
+
+S4 `linux-io-uring --ops 1000` summary:
+
+- `metadata.profile=linux-io-uring`
+- `metadata.git_revision=c979895847d7136bce83811e53314c3356fb5048`
+- `metadata.backend_status=linux-io-uring-intended`
+- `row_count=24`
+- `rows_by_mode.memory=12`
+- `rows_by_mode.persisted=12`
+- Summary JSON validated with `python3 -m json.tool`.
+
+Representative post-remediation rows:
+
+| Source | Mode | Ops | Value size | Batch size | Read API | Total ops/sec | Write ops/sec | Read ops/sec | Write p50/p95/p99 (us) | Read p50/p95/p99 (us) |
+| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | --- | --- |
+| S4 quick row 1 | persisted | 1,000 | 16 | 16 | `getInto` | 728,874.13 | 2,132,196.16 | 439,584.59 | 0.32 / 0.63 / 1.94 | 2.21 / 2.50 / 3.00 |
+| S4 profile row 12 | persisted | 1,000 | 16 | 1 | `get` | 108,844.53 | 107,366.22 | 110,364.62 | 4.88 / 22.50 / 27.63 | 2.25 / 41.00 / 49.79 |
+| S4 profile row 15 | persisted | 1,000 | 16 | 16 | `getInto` | 439,842.42 | 751,667.76 | 310,876.83 | 1.18 / 1.84 / 1.91 | 2.25 / 3.13 / 37.29 |
+| S4 profile row 23 | persisted | 1,000 | 256 | 64 | `getInto` | 122,802.35 | 870,164.50 | 66,069.65 | 0.65 / 6.70 / 6.70 | 2.33 / 43.83 / 51.42 |
+
+The S4 run confirms the optimized WAL write path is correct on Linux `io_uring`, but the cheap 1,000-op persisted throughput rows are noisy and lower than the earlier Ubuntu profile in some rows. Treat this as correctness and backend-status evidence for the optimization PRD, not a definitive Linux performance win/loss claim.
+
+Persisted S4 `db_path` values and matching `.wal` files under `/tmp/phage-benchmark-matrix-*` were absent after the runner completed. Raw JSONL and summary JSON artifacts stayed under `/tmp` and were not committed.
+
+## Correctness blocker remediated on Linux
+
+The initial Linux host resolved the missing-host blocker, but `zig build test` did not pass on the Linux `io_uring` backend path. The failing test was:
 
 ```text
 write_ahead_log:recover_committed_empty_put_at_zero_offset
@@ -131,9 +194,9 @@ Observed failure path:
 
 - `src/io/wal.zig:397` calls `store.get(key)` after WAL recovery of an empty value at data offset `0`.
 - The read path reaches `src/root.zig` `readDataInto` / `getInto`.
-- The Linux backend returns `IOUringError` from `src/io/backend.zig` `waitWithRing` after an `io_uring` completion reports a negative result.
+- The Linux backend returned `IOUringError` from `src/io/backend.zig` `waitWithRing` after an `io_uring` completion reported a negative result.
 
-This is tracked separately as remediation card `t_c54e96cd`: fix the Linux `io_uring` WAL empty-value recovery test failure. Until that card is resolved, Linux benchmark numbers should be treated as useful performance evidence for the matrix workflow, not as proof that the full Linux correctness gate is green.
+Remediation card `t_c54e96cd` fixed the issue in `bc23f18` by returning an already-completed no-op for empty `io_uring` reads. The post-remediation S4 rerun above confirms the full Linux correctness gate is now green for current HEAD `c979895847d7136bce83811e53314c3356fb5048`.
 
 ## Reproduction runbook for future Linux verification
 
@@ -187,9 +250,9 @@ The summary JSON should include:
 
 Persisted row `db_path` values should be unique `/tmp/phage-benchmark-matrix-*` paths, and the runner should remove each store and `.wal` file after the row completes.
 
-## Suggested final handoff summary
+## Future rerun handoff checklist
 
-When the Linux correctness remediation is fixed, the final handoff should record:
+For future Linux verification reruns, record:
 
 1. `git_revision`, `uname -a`, `zig version`, and `metadata.backend_status`.
 2. The exact quick and fuller profile commands, including any `--ops` override.
