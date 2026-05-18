@@ -228,6 +228,18 @@ pub fn build(b: *std.Build) void {
     });
     const run_server_runtime_tests = b.addRunArtifact(server_runtime_tests);
 
+    const server_handler_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/server/handler.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_handler_tests_mod.addImport("phage", lib_mod);
+    const server_handler_tests = b.addTest(.{
+        .root_module = server_handler_tests_mod,
+        .test_runner = .{ .mode = .simple, .path = b.path("src/test_runner.zig") },
+    });
+    const run_server_handler_tests = b.addRunArtifact(server_handler_tests);
+
     const server_load_tests_mod = b.createModule(.{
         .root_source_file = b.path("src/server/load_smoke.zig"),
         .target = target,
@@ -248,6 +260,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_protocol_command_tests.step);
     test_step.dependOn(&run_server_config_tests.step);
     test_step.dependOn(&run_server_runtime_tests.step);
+    test_step.dependOn(&run_server_handler_tests.step);
     test_step.dependOn(&run_server_load_tests.step);
 }
 
