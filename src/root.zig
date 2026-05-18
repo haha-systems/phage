@@ -247,7 +247,11 @@ pub const Phage = struct {
             });
         }
 
-        // Step 5: Check compaction only once for the entire batch
+        // Step 5: Truncate the WAL file now that all batch entries are complete
+        try std.posix.ftruncate(self.wal_fd, 0);
+        self.wal_file_size.store(0, .monotonic);
+
+        // Step 6: Check compaction only once for the entire batch
         self.checkAndScheduleCompaction() catch |err| {
             std.log.warn("Failed to schedule compaction: {s}", .{@errorName(err)});
         };
@@ -808,6 +812,35 @@ test "root:put_and_get_key_value" {
 
     // cleanup test db
     try testCleanup();
+}
+
+test "root:put_batch_gets_values_and_clears_wal" {
+    const allocator = std.testing.allocator;
+    const file_path = "test_batch.db";
+    std.posix.unlink(file_path) catch {};
+    std.posix.unlink("test_batch.db.wal") catch {};
+
+    var store = try Phage.init(allocator, file_path);
+    defer store.deinit();
+    defer std.posix.unlink(file_path) catch {};
+    defer std.posix.unlink("test_batch.db.wal") catch {};
+
+    const pairs = [_]Phage.BatchPair{
+        .{ .key = "batch-key1", .value = "batch-value1" },
+        .{ .key = "batch-key2", .value = "batch-value2" },
+    };
+    try store.putBatch(&pairs);
+
+    const val1 = try store.get("batch-key1");
+    defer allocator.free(val1);
+    try std.testing.expectEqualStrings("batch-value1", val1);
+
+    const val2 = try store.get("batch-key2");
+    defer allocator.free(val2);
+    try std.testing.expectEqualStrings("batch-value2", val2);
+
+    const wal_stat = try std.posix.fstat(store.wal_fd);
+    try std.testing.expectEqual(@as(i64, 0), wal_stat.size);
 }
 
 test "root:delete_key" {
