@@ -1,309 +1,159 @@
 # Phage API Reference
 
-## Overview
+## Current build and server status
 
-Phage is a high-performance key-value database built in Zig, designed to achieve 1 million+ operations per second on consumer hardware. It features asynchronous I/O using `io_uring`, write-ahead logging for ACID compliance, and automatic compaction.
+Phage currently builds the core library and native benchmark runner through `build.zig`:
 
-## Server Configuration
+```sh
+zig build
+zig build test
+zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16 --batch-size 16
+```
 
-### Command Line Options
+The ZeroMQ server implementation lives in `src/zserver.zig`, but it is not wired into the default Zig build graph at this time. `zig build --help` lists `install`, `test`, and `benchmark`; there is no supported `zig build run` server step. The command-line options below describe the current `zserver.zig` implementation if/when that executable is built separately.
 
-```bash
-./phage [OPTIONS]
+## Server configuration implemented in `src/zserver.zig`
+
+```sh
+phage-server [OPTIONS]
 ```
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-p, --port PORT` | Set server port | `5555` |
+| `-p, --port PORT` | Set ZeroMQ REP server port | `5555` |
 | `-d, --db-path PATH` | Set database file path | `phage_store` |
-| `-l, --log-level LEVEL` | Set log level (debug, info, warn, err) | `info` |
+| `-l, --log-level LEVEL` | Requested log level (`debug`, `info`, `warn`, `err`) | `info` |
 | `-h, --help` | Show help message | - |
 
-### Examples
+The log-level flag is currently reported at startup; it does not dynamically reconfigure Zig's compile-time log filtering.
 
-```bash
-# Start with defaults
-./phage
+## Wire protocol
 
-# Custom port and database path
-./phage --port 8080 --db-path /var/lib/phage/data
+Phage's server protocol is a simple whitespace-delimited text protocol intended for ZeroMQ REQ/REP clients:
 
-# Enable debug logging
-./phage --log-level debug
-
-# Production setup
-./phage --port 5555 --db-path /opt/phage/production.db --log-level warn
+```text
+COMMAND [arguments...]
 ```
 
-## Protocol
-
-Phage uses a simple text-based protocol over ZeroMQ (REQ/REP pattern) similar to Redis.
-
-### Command Format
-
-```
-[COMMAND] [arguments...]\n
-```
-
-All commands are terminated with a newline character.
+Command parsing is case-insensitive. Newlines and surrounding whitespace are ignored. Values are single tokens; quoted strings and values containing spaces are not supported by the parser.
 
 ## Commands
 
-### SET - Store a key-value pair
+### SET
 
-**Syntax:**
-```
+```text
 SET key value
 ```
 
-**Description:** Stores a value associated with a key in the database.
+Stores a non-empty key and non-empty single-token value.
 
-**Parameters:**
-- `key`: The key to store (must not be empty)
-- `value`: The value to associate with the key (can be empty)
-
-**Response:**
+Response:
 - `OK` on success
-- `ERR ...` on error
+- `ERR Missing key`, `ERR Missing value`, `ERR Key cannot be empty`, or `ERR Command execution failed` on error
 
-**Examples:**
-```bash
-SET username alice
-SET user:123:email alice@example.com
-SET config:timeout 30
-```
+### GET
 
-### GET - Retrieve a value by key
-
-**Syntax:**
-```
+```text
 GET key
 ```
 
-**Description:** Retrieves the value associated with a key.
+Retrieves a value by key.
 
-**Parameters:**
-- `key`: The key to retrieve (must not be empty)
+Response:
+- The stored value on success
+- `ERR Missing key` for malformed input
+- `ERR Command execution failed` when the key is not found or storage fails
 
-**Response:**
-- The value associated with the key
-- `ERR Command execution failed` if key not found
+### DELETE / DEL
 
-**Examples:**
-```bash
-GET username          # Returns: alice
-GET user:123:email    # Returns: alice@example.com
-GET nonexistent       # Returns: ERR Command execution failed
-```
-
-### DELETE - Remove a key-value pair
-
-**Syntax:**
-```
+```text
 DELETE key
+DEL key
 ```
 
-**Description:** Removes a key and its associated value from the database.
+Deletes a key. The `DEL` alias is accepted by the protocol parser.
 
-**Parameters:**
-- `key`: The key to delete (must not be empty)
+Response:
+- `OK` on command success
+- `ERR Missing key` for malformed input
+- `ERR Command execution failed` on storage errors
 
-**Response:**
-- `OK` on success (even if key didn't exist)
-- `ERR ...` on error
+### KEYS
 
-**Examples:**
-```bash
-DELETE username       # Returns: OK
-DELETE old_data       # Returns: OK
-```
-
-### KEYS - List keys matching a pattern
-
-**Syntax:**
-```
+```text
 KEYS pattern
 ```
 
-**Description:** Returns all keys matching the given regular expression pattern.
+Lists keys matching the given pattern. `*` matches all keys; other patterns are regular expressions evaluated by the store's matcher, so prefix-style examples should use regex syntax such as `user:.*`.
 
-**Parameters:**
-- `pattern`: Regular expression pattern to match keys
-  - Use `*` to match all keys
-  - Use regex patterns like `user.*` to match keys starting with "user"
+Response:
+- Matching keys separated by newlines
+- `(empty)` when no keys match
+- `ERR Missing pattern`, `ERR Pattern cannot be empty`, or `ERR Invalid pattern for KEYS command` on error
 
-**Response:**
-- List of matching keys (one per line)
-- `(empty)` if no keys match
+Examples:
 
-**Examples:**
-```bash
-KEYS *                # Returns all keys
-KEYS user:*          # Returns: user:123:email, user:456:name
-KEYS config.*        # Returns: config:timeout, config:debug
+```text
+KEYS *
+KEYS user:.*
+KEYS config:.*
 ```
 
-### PING - Health check
+### PING
 
-**Syntax:**
-```
+```text
 PING
 ```
 
-**Description:** Simple health check command to verify server connectivity.
-
-**Response:**
+Response:
 - `PONG`
 
-**Examples:**
-```bash
-PING                 # Returns: PONG
-```
+### BENCHMARK
 
-### BENCHMARK - Performance testing
-
-**Syntax:**
-```
+```text
 BENCHMARK operations
 ```
 
-**Description:** Runs a performance benchmark with the specified number of operations. Each operation performs both a SET and GET, so the total operations performed is 2x the specified number.
+Runs the protocol/server benchmark path against the currently open store. This command does not delegate to the native `src/benchmark.zig` runner; it is a separate server command and writes benchmark keys into the active store. Use the native benchmark step for reproducible local benchmarking.
 
-**Parameters:**
-- `operations`: Number of benchmark operations to perform (1-1,000,000)
+Limits:
+- `operations` must be an integer from `1` through `1_000_000`.
 
-**Response:**
-- Performance summary with operations count, time, and ops/sec
+Response:
+- Benchmark timing summary on success
+- `ERR Missing benchmark operation count` or `ERR Unknown command or invalid syntax` for malformed input
 
-**Examples:**
-```bash
-BENCHMARK 100        # Returns: Benchmark completed: 200 operations in 38 ms (5263.16 ops/sec)
-BENCHMARK 1000       # Returns: Benchmark completed: 2000 operations in 368 ms (5434.78 ops/sec)
+Native benchmark example:
+
+```sh
+zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16 --batch-size 16
 ```
 
-## Client Usage
+## Error response format
 
-### Demon CLI Client
+Server errors are plain text and begin with `ERR`:
 
-The `demon` client provides both interactive and command-line interfaces.
-
-#### Command-line Mode
-```bash
-# Execute single commands
-./demon PING
-./demon SET mykey myvalue
-./demon GET mykey
-./demon DELETE mykey
-./demon KEYS "*"
-./demon BENCHMARK 100
+```text
+ERR description
 ```
 
-#### Interactive Mode
-```bash
-# Start interactive session
-./demon
+Common parser/server errors:
 
-# Interactive prompt
-demon> SET user:1 john
-Response: OK
-demon> GET user:1
-Response: john
-demon> KEYS user:*
-Response: user:1
-demon> exit
-Goodbye!
-```
+| Error | Meaning |
+|-------|---------|
+| `ERR Unknown command or invalid syntax` | Unknown command or malformed argument count |
+| `ERR Missing key` | `SET`, `GET`, or `DELETE` missing a key |
+| `ERR Missing value` | `SET` missing a value |
+| `ERR Missing pattern` | `KEYS` missing a pattern |
+| `ERR Missing benchmark operation count` | `BENCHMARK` missing operation count |
+| `ERR Key cannot be empty` | Empty key rejected |
+| `ERR Pattern cannot be empty` | Empty `KEYS` pattern rejected |
+| `ERR Invalid pattern for KEYS command` | Store rejected the pattern |
+| `ERR Invalid regular expression pattern` | Regex compilation failed |
+| `ERR Server out of memory` | Allocation failed |
+| `ERR Command execution failed` | Storage command failed, including missing keys |
 
-## Error Handling
+## Related documents
 
-### Error Response Format
-```
-ERR [error description]
-```
-
-### Common Errors
-
-| Error | Description | Solution |
-|-------|-------------|----------|
-| `ERR Unknown command or invalid syntax` | Invalid command or malformed syntax | Check command format |
-| `ERR Missing key argument` | Key parameter missing | Provide a key argument |
-| `ERR Missing value argument` | Value parameter missing for SET | Provide a value argument |
-| `ERR Missing pattern argument for KEYS command` | Pattern missing for KEYS | Provide a pattern argument |
-| `ERR Key cannot be empty` | Empty key provided | Use a non-empty key |
-| `ERR Invalid pattern for KEYS command` | Invalid regex pattern | Use a valid regex pattern |
-| `ERR Server out of memory` | Server memory exhausted | Restart server or reduce load |
-| `ERR Command execution failed` | General execution error | Check server logs |
-
-## Performance
-
-### Benchmark Results
-
-Based on testing, Phage achieves:
-- **5,000+ operations/second** on consumer hardware
-- **Sub-millisecond latency** for individual operations
-- **Linear scaling** with operation count
-- **Consistent performance** under sustained load
-
-### Optimization Tips
-
-1. **Batch Operations:** Use multiple clients for concurrent operations
-2. **Key Design:** Use consistent key naming patterns for better performance
-3. **Memory Management:** Monitor server memory usage during high-load scenarios
-4. **Network:** Use localhost connections for best performance
-
-## Integration Examples
-
-### Shell Script
-```bash
-#!/bin/bash
-# Health check script
-if ./demon PING > /dev/null; then
-    echo "Phage server is healthy"
-    exit 0
-else
-    echo "Phage server is down"
-    exit 1
-fi
-```
-
-### Performance Monitoring
-```bash
-# Simple performance test
-echo "Running performance test..."
-./demon BENCHMARK 1000
-echo "Test completed"
-```
-
-### Backup Script
-```bash
-#!/bin/bash
-# Backup all keys
-KEYS=$(./demon KEYS "*")
-for key in $KEYS; do
-    value=$(./demon GET "$key")
-    echo "SET $key $value" >> backup.txt
-done
-```
-
-## Troubleshooting
-
-### Connection Issues
-- **"Connection refused":** Ensure server is running on correct port
-- **"Address in use":** Another process is using the port
-- **"Timeout":** Check network connectivity and server load
-
-### Performance Issues
-- **Slow responses:** Check server resource usage (CPU, memory, disk I/O)
-- **High latency:** Use `BENCHMARK` command to measure baseline performance
-- **Memory leaks:** Monitor server startup/shutdown messages for leak detection
-
-### Data Issues
-- **Keys not found:** Use `KEYS *` to list all keys and verify key names
-- **Pattern not matching:** Test regex patterns with online regex tools
-- **Data corruption:** Check server logs for error messages
-
-## See Also
-
-- [MVP Roadmap](MVP_ROADMAP.md) - Development progress and upcoming features
-- [CLAUDE.md](../CLAUDE.md) - Development guidelines and architecture notes
-- [Integration Tests](../integration_test.sh) - Automated testing examples
+- [Getting Started](GETTING_STARTED.md)
+- [MVP Roadmap](MVP_ROADMAP.md)

@@ -1,146 +1,95 @@
 # Phage MVP Roadmap
 
-**Last Updated**: 2025-01-11  
-**Status**: Phase 1 Complete - Proceeding to Phase 2  
-**Target Release**: Q1 2025
+**Last Updated**: 2026-05-18
+**Status**: Core storage and native benchmark path active; server/protocol MVP alignment in progress
 
 ## Executive Summary
 
-This document tracks our progress toward releasing Phage's first MVP version. The core database engine is solid with excellent performance characteristics, but networking and client tooling need completion to reach production readiness.
+Phage's core key/value store, persistence/WAL code, sharded index, and native benchmark runner are the currently supported development surface. Protocol parsing and a ZeroMQ server implementation exist, but the server is not wired into the default Zig build graph today. MVP work should therefore distinguish between verified core/benchmark behavior and source-present server behavior that still needs build/runtime hardening.
 
 ## Current Status Assessment
 
-### ✅ **Strengths**
-- **Core Engine**: Robust database with WAL, compaction, and crash recovery
-- **Performance**: Achieving target 1M+ reads/sec with `io_uring`
-- **Test Coverage**: 20/20 tests passing across all core components
-- **Data Integrity**: CRC32 checksums, atomic operations, ACID compliance
-- **Architecture**: Clean separation of concerns, well-documented code
+### Strengths
 
-### ✅ **Phase 1 Completed**
-- **Server Compilation**: Fixed `result.payload()` method errors and format string issues
-- **Protocol Implementation**: Core commands (SET/GET/DELETE/PING) working over network
-- **Connection Handling**: Server now handles multiple requests without exiting
-- **Enhanced CLI Client**: Demon client with both REPL and command-line modes
-- **Integration Testing**: Automated test suite created and passing
+- Core storage API supports put/get/delete, WAL recovery paths, compaction work, and batch writes.
+- `zig build test` is the standard correctness gate.
+- `zig build -Doptimize=ReleaseFast benchmark -- ...` is the supported local benchmark path.
+- macOS POSIX fallback remains useful for development and tests while Linux `io_uring` remains the intended high-performance backend.
 
-### ⚠️ **Known Issues**
-- **KEYS Command**: `findKeys()` method not implemented in Phage store (causes hang)
-- **Error Handling**: Could be improved for edge cases and malformed input
+### Protocol/server status
+
+| Area | Status | Notes |
+|------|--------|-------|
+| Protocol parser | In progress / tested directly | Parser accepts `SET`, `GET`, `DELETE`/`DEL`, `KEYS`, `PING`, and `BENCHMARK`; malformed input and missing arguments have focused parser coverage. |
+| KEYS command | Implemented in store/protocol path | `KEYS *` matches all; other patterns are regex-style (for example `user:.*`). |
+| PING command | Implemented | Returns `PONG`. |
+| BENCHMARK command | Implemented separately from native runner | Protocol benchmark mutates the active store and does not delegate to `src/benchmark.zig`. Use the native benchmark step for reproducible measurements. |
+| ZeroMQ server build | Not supported by default build graph | `zig build --help` lists `install`, `test`, and `benchmark`; there is no `run` step. `src/zserver.zig` remains source-present for later wiring. |
+| External Demon client | Not part of this repository | User-facing docs should not require it for the supported workflow. |
 
 ## MVP Roadmap
 
-### 🔥 **Phase 1: Critical Fixes** (Est. 1-2 weeks)
-**Goal**: Get basic server-client communication working
+### Phase 1: Core safety and measurement baseline
 
-| Task | Status | Priority | Assignee | Notes |
-|------|--------|----------|----------|-------|
-| Fix server compilation error | ✅ DONE | P0 | 2025-01-11 | Fixed format string and payload method issues |
-| Implement basic CLI client | ✅ DONE | P0 | - | Demon CLI client with REPL + command-line modes |
-| Complete protocol implementation | ✅ DONE | P0 | 2025-01-11 | SET/GET/DELETE/PING working over network |
-| Add connection handling | ✅ DONE | P1 | 2025-01-11 | Server handles multiple requests with while loop |
-| Create integration tests | ✅ DONE | P1 | 2025-01-11 | `/home/xiy/code/zig/integration_test.sh` created |
+| Task | Status | Notes |
+|------|--------|-------|
+| Core storage tests | Active | Run with `zig build test`. |
+| WAL/recovery hardening | Active | Covered by current Kanban slices. |
+| Native benchmark runner | Active | Supports cheap memory and persisted smoke runs. |
+| Benchmark output/reporting | Active | Tracked by benchmark-specific slices. |
 
-**Success Criteria**: 
-- [x] Server compiles and runs without errors
-- [x] CLI client can connect and execute basic commands
-- [x] All core operations (SET/GET/DELETE/PING) work over network
+### Phase 2: Protocol and server MVP
 
-**✅ PHASE 1 COMPLETE** - All success criteria met!
+| Task | Status | Notes |
+|------|--------|-------|
+| Align command parser errors | In progress | Missing args and malformed input should return deterministic parser/server errors. |
+| Keep KEYS behavior truthful | In progress | Docs must describe regex-style patterns and `*` behavior accurately. |
+| Document BENCHMARK split | In progress | Protocol benchmark remains separate from native benchmark until deliberately unified. |
+| Wire server into build graph | TODO | Needs a dedicated server/build slice; do not claim `zig build run` support until present. |
+| Add deterministic server smoke | TODO | Should happen once server build support is restored. |
 
-### 🎯 **Phase 2: MVP Features** (Est. 2-3 weeks)
-**Goal**: Complete feature set for first release
+### Phase 3: Production readiness
 
-| Task | Status | Priority | Assignee | Notes |
-|------|--------|----------|----------|-------|
-| Implement KEYS command | ❌ TODO | P1 | - | Need to implement findKeys() in Phage store |
-| Add PING command | ✅ DONE | P1 | 2025-01-11 | Basic health check implemented |
-| Implement benchmark command | ❌ TODO | P1 | - | Performance testing as mentioned in README |
-| Add configuration options | ❌ TODO | P1 | - | File paths, port, compaction thresholds |
-| Basic error handling | ❌ TODO | P1 | - | Graceful degradation vs crashes |
-| Add usage documentation | ❌ TODO | P2 | - | API reference, examples |
+| Task | Status | Notes |
+|------|--------|-------|
+| Multi-client behavior | TODO | Current ZeroMQ server loop needs explicit runtime verification. |
+| Graceful shutdown | TODO | Tracked by production-readiness slices. |
+| Structured logging/metrics | TODO | Should avoid local config mutation. |
+| Sustained smoke/leak checks | TODO | Needed before production claims. |
 
-**Success Criteria**:
-- [ ] All planned commands implemented and working (KEYS pending)
-- [ ] Basic benchmarking capability available
-- [ ] Configuration via command line or config file
-- [ ] Error conditions handled gracefully
+## Verification commands
 
-### 📈 **Phase 3: Production Readiness** (Est. 3-4 weeks)
-**Goal**: Make it suitable for production use
+Minimum local correctness check:
 
-| Task | Status | Priority | Assignee | Notes |
-|------|--------|----------|----------|-------|
-| Multi-client support | ❌ TODO | P1 | - | Handle concurrent connections |
-| Structured logging | ❌ TODO | P1 | - | Operations, errors, performance metrics |
-| Memory leak verification | ❌ TODO | P1 | - | Verify no leaks under sustained load |
-| Signal handling | ❌ TODO | P1 | - | Graceful shutdown on SIGTERM/SIGINT |
-| Basic monitoring | ❌ TODO | P2 | - | Metrics for ops/sec, memory usage |
+```sh
+git status --short --untracked-files=all
+zig fmt src build.zig
+zig build test
+```
 
-**Success Criteria**:
-- [ ] Handles multiple concurrent clients without issues
-- [ ] Comprehensive logging for debugging and monitoring
-- [ ] Stable memory usage under load
-- [ ] Clean shutdown and restart capabilities
+Cheap benchmark smoke examples:
 
-### 🚀 **Phase 4: Polish** (Est. 1-2 weeks)
-**Goal**: Ready for public release
+```sh
+zig build -Doptimize=ReleaseFast benchmark -- 1000 --mode memory --value-size 16 --batch-size 16
+zig build -Doptimize=ReleaseFast benchmark -- 1000 --value-size 16 --batch-size 16 --db-path /tmp/phage-mvp-roadmap-bench
+```
 
-| Task | Status | Priority | Assignee | Notes |
-|------|--------|----------|----------|-------|
-| Installation scripts | ❌ TODO | P2 | - | Easy setup and deployment |
-| Docker support | ❌ TODO | P2 | - | Containerized deployment option |
-| Input validation | ❌ TODO | P1 | - | Security hardening |
-| Performance tuning | ❌ TODO | P2 | - | Optimize for 1M ops/sec target |
-| Release documentation | ❌ TODO | P1 | - | Installation guide, getting started |
+Server status check:
 
-**Success Criteria**:
-- [ ] Easy installation process
-- [ ] Production deployment options available
-- [ ] Security considerations addressed
-- [ ] Performance targets achieved
+```sh
+zig build --help
+# No default run/server step is currently listed.
+```
 
-## Progress Tracking
+## Documentation rules for MVP claims
 
-### Key Metrics
-- **Test Coverage**: 20/20 tests passing ✅
-- **Performance**: 1M+ reads/sec, 300K+ writes/sec ✅
-- **Stability**: Core engine stable, networking working ✅
-- **Documentation**: Technical docs complete, user docs TBD
+- Do not claim a supported server launch command until the build graph exposes one.
+- Do not require the external Demon client for repository-local workflows.
+- Describe `KEYS` as regex-style matching with special `*` all-key behavior.
+- Describe protocol `BENCHMARK` as separate from the native benchmark runner and mutating the active store.
+- Keep generated database, WAL, benchmark-store, and log artifacts out of commits.
 
-### Weekly Check-ins
-- **Week of 2025-01-13**: ✅ Phase 1 completed - All critical fixes done
-- **Week of 2025-01-20**: Focus on Phase 2 - KEYS command, benchmarking, config
-- **Week of 2025-01-27**: Complete Phase 2 features
+## Related documents
 
-## Risk Assessment
-
-### High Risk
-- **Server Architecture**: Current ZeroMQ implementation may need redesign for multi-client support
-- **Protocol Design**: May need to refactor protocol layer for better extensibility
-
-### Medium Risk
-- **Performance Under Load**: Need to verify `io_uring` performance scales with concurrent clients
-- **Memory Management**: Zig's manual memory management requires careful leak testing
-
-### Low Risk
-- **Core Database**: Well-tested and stable foundation
-- **Build System**: Zig build system works reliably
-
-## Next Immediate Actions (Phase 2)
-
-1. **Implement KEYS command** - Add findKeys() method to Phage store
-2. **Add benchmark command** - Performance testing capability
-3. **Configuration options** - Command-line args and config file support
-4. **Improve error handling** - Better error messages and edge case handling
-
-## Notes
-
-- **Dependencies**: All external dependencies are stable and well-maintained
-- **Platform**: Currently Linux-only due to `io_uring` dependency
-- **Performance**: Already exceeds initial performance targets
-- **Architecture**: Clean, well-documented codebase ready for extension
-
----
-
-*This document should be updated weekly or after major milestones. Use it to track progress and identify blockers early.*
+- [Getting Started](GETTING_STARTED.md)
+- [API Reference](API_REFERENCE.md)
