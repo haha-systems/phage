@@ -14,6 +14,7 @@ pub const Backend = switch (default_kind) {
 };
 
 const RING_ENTRIES: u32 = 128;
+const backend_test_path = ".zig-cache/phage-tests/backend_io.db";
 
 const PosixBackend = struct {
     pub fn init() !PosixBackend {
@@ -106,7 +107,8 @@ test "default backend preserves io_uring on Linux and uses POSIX elsewhere" {
 }
 
 test "selected backend supports positioned read/write and wait" {
-    const path = "test_backend_io.db";
+    const path = backend_test_path;
+    try std.fs.cwd().makePath(".zig-cache/phage-tests");
     std.posix.unlink(path) catch {};
     defer std.posix.unlink(path) catch {};
 

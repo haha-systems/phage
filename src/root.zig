@@ -45,6 +45,7 @@ pub const Phage = struct {
     server_fd: posix.fd_t = 0,
     store_path: []const u8 = "phage_store", // Default path for the main database file
     wal_path: []const u8 = "phage_store.wal", // Default path for the Write-Ahead Log (WAL)
+    owns_wal_path: bool = false,
     compaction_threshold: f64 = 0.5, // Trigger compaction at 50% waste
     compaction_in_progress: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
@@ -70,11 +71,14 @@ pub const Phage = struct {
             std.log.err("Failed to open database file: {s}", .{file_path});
             return error.FileOpenError;
         }
+        var fd_owned_by_store = false;
+        errdefer if (!fd_owned_by_store) std.posix.close(fd);
 
         const wal_path = std.fmt.allocPrint(allocator, "{s}.wal", .{file_path}) catch |err| {
             return err;
         };
-        defer allocator.free(wal_path);
+        var wal_path_owned_by_store = false;
+        errdefer if (!wal_path_owned_by_store) allocator.free(wal_path);
 
         const wal_fd = try std.posix.open(
             wal_path,
@@ -89,6 +93,8 @@ pub const Phage = struct {
             std.log.err("Failed to open WAL file: {s}", .{wal_path});
             return error.FileOpenError;
         }
+        var wal_fd_owned_by_store = false;
+        errdefer if (!wal_fd_owned_by_store) std.posix.close(wal_fd);
 
         // stat the data files to get their current size
         const file_stat = try std.posix.fstat(fd);
@@ -111,9 +117,13 @@ pub const Phage = struct {
             .server_fd = 0,
             .store_path = file_path,
             .wal_path = wal_path,
+            .owns_wal_path = true,
             .compaction_threshold = 0.5, // Default compaction threshold
             .compaction_in_progress = std.atomic.Value(bool).init(false),
         };
+        fd_owned_by_store = true;
+        wal_fd_owned_by_store = true;
+        wal_path_owned_by_store = true;
 
         errdefer store.deinit();
 
@@ -141,6 +151,10 @@ pub const Phage = struct {
         posix.close(self.wal_fd);
         self.index.deinit(self.allocator);
         self.buffer_pool.deinit(self.allocator);
+        if (self.owns_wal_path) {
+            self.allocator.free(self.wal_path);
+            self.owns_wal_path = false;
+        }
     }
 
     /// Writes a key-value pair to the database.
@@ -830,18 +844,52 @@ pub const Phage = struct {
     }
 };
 
+const root_test_path = ".zig-cache/phage-tests/root.db";
+const root_batch_test_path = ".zig-cache/phage-tests/root_batch.db";
+const root_wal_lifetime_test_path = ".zig-cache/phage-tests/root_wal_path_lifetime.db";
+
+test "root tests:beforeAll" {
+    try std.fs.cwd().makePath(".zig-cache/phage-tests");
+    cleanupPath(root_test_path);
+    cleanupPath(root_batch_test_path);
+    cleanupPath(root_wal_lifetime_test_path);
+}
+
+test "root tests:afterAll" {
+    cleanupPath(root_test_path);
+    cleanupPath(root_batch_test_path);
+    cleanupPath(root_wal_lifetime_test_path);
+}
+
 test "root:init" {
     const allocator = std.testing.allocator;
-    const file_path = "test.db";
+    const file_path = root_test_path;
 
     var store = try Phage.init(allocator, file_path);
     defer store.deinit();
 }
 
+test "root:init retains WAL path for store lifetime" {
+    const allocator = std.testing.allocator;
+    const file_path = root_wal_lifetime_test_path;
+    defer cleanupPath(file_path);
+    cleanupPath(file_path);
+
+    var store = try Phage.init(allocator, file_path);
+    defer store.deinit();
+
+    const expected_wal_path = root_wal_lifetime_test_path ++ ".wal";
+    const overwrite = try allocator.alloc(u8, expected_wal_path.len);
+    defer allocator.free(overwrite);
+    @memset(overwrite, 'x');
+
+    try std.testing.expectEqualStrings(expected_wal_path, store.wal_path);
+}
+
 test "root:formatWalEntry" {
     const allocator = std.testing.allocator;
 
-    var store = try Phage.init(allocator, "test.db");
+    var store = try Phage.init(allocator, root_test_path);
     defer store.deinit();
 
     const buf = try store.formatWalEntry(.put, "test_key", "test_value", 0);
@@ -860,7 +908,7 @@ test "root:formatWalEntry" {
 test "root:formatBatchWalEntries coalesces WAL entries and reports offsets" {
     const allocator = std.testing.allocator;
 
-    var store = try Phage.init(allocator, "test.db");
+    var store = try Phage.init(allocator, root_test_path);
     defer store.deinit();
 
     const pairs = [_]Phage.BatchPair{
@@ -898,7 +946,7 @@ test "root:formatBatchWalEntries coalesces WAL entries and reports offsets" {
 test "root:formatDataEntry" {
     const allocator = std.testing.allocator;
 
-    var store = try Phage.init(allocator, "test.db");
+    var store = try Phage.init(allocator, root_test_path);
     defer store.deinit();
 
     const buf = try store.formatDataEntry("test_key", "test_value");
@@ -916,7 +964,7 @@ test "root:formatDataEntry" {
 test "root:formatBatchDataEntries coalesces entries and reports absolute offsets" {
     const allocator = std.testing.allocator;
 
-    var store = try Phage.init(allocator, "test.db");
+    var store = try Phage.init(allocator, root_test_path);
     defer store.deinit();
 
     const pairs = [_]Phage.BatchPair{
@@ -948,7 +996,7 @@ test "root:formatBatchDataEntries coalesces entries and reports absolute offsets
 
 test "root:put_and_get_key_value" {
     const allocator = std.testing.allocator;
-    var store = try Phage.init(allocator, "test.db");
+    var store = try Phage.init(allocator, root_test_path);
     defer store.deinit();
     errdefer testCleanup() catch unreachable;
 
@@ -969,14 +1017,12 @@ test "root:put_and_get_key_value" {
 
 test "root:put_batch_gets_values_and_clears_wal" {
     const allocator = std.testing.allocator;
-    const file_path = "test_batch.db";
-    std.posix.unlink(file_path) catch {};
-    std.posix.unlink("test_batch.db.wal") catch {};
+    const file_path = root_batch_test_path;
+    cleanupPath(file_path);
 
     var store = try Phage.init(allocator, file_path);
     defer store.deinit();
-    defer std.posix.unlink(file_path) catch {};
-    defer std.posix.unlink("test_batch.db.wal") catch {};
+    defer cleanupPath(file_path);
 
     const pairs = [_]Phage.BatchPair{
         .{ .key = "batch-key1", .value = "batch-value1" },
@@ -998,7 +1044,7 @@ test "root:put_batch_gets_values_and_clears_wal" {
 
 test "root:delete_key" {
     const allocator = std.testing.allocator;
-    var store = try Phage.init(allocator, "test.db");
+    var store = try Phage.init(allocator, root_test_path);
     defer store.deinit();
     errdefer testCleanup() catch unreachable;
 
@@ -1016,7 +1062,7 @@ test "root:delete_key" {
 
 test "root:findKeys" {
     const allocator = std.testing.allocator;
-    var store = try Phage.init(allocator, "test.db");
+    var store = try Phage.init(allocator, root_test_path);
     defer store.deinit();
     errdefer testCleanup() catch unreachable;
 
@@ -1034,6 +1080,17 @@ test "root:findKeys" {
 }
 
 fn testCleanup() !void {
-    std.posix.unlink("test.db") catch {};
-    std.posix.unlink("test.db.wal") catch {};
+    cleanupPath(root_test_path);
+}
+
+fn cleanupPath(path: []const u8) void {
+    std.posix.unlink(path) catch {};
+
+    var wal_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const wal_path = std.fmt.bufPrint(&wal_path_buf, "{s}.wal", .{path}) catch return;
+    std.posix.unlink(wal_path) catch {};
+
+    var compact_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const compact_path = std.fmt.bufPrint(&compact_path_buf, "{s}.compact.tmp", .{path}) catch return;
+    std.posix.unlink(compact_path) catch {};
 }
