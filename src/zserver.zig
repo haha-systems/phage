@@ -1,88 +1,9 @@
 const std = @import("std");
-const mem = @import("std").mem;
 
 const phage = @import("phage");
 const zimq = @import("zimq");
+const server_config = @import("server/config.zig");
 const server_runtime = @import("server/runtime.zig");
-
-const Config = struct {
-    port: u16 = 5555,
-    db_path: []const u8 = "phage_store",
-    log_level: std.log.Level = .info,
-    help: bool = false,
-};
-
-fn printUsage(program_name: []const u8) void {
-    std.debug.print("Usage: {s} [OPTIONS]\n", .{program_name});
-    std.debug.print("\nOptions:\n", .{});
-    std.debug.print("  -p, --port PORT       Set server port (default: 5555)\n", .{});
-    std.debug.print("  -d, --db-path PATH    Set database file path (default: phage_store)\n", .{});
-    std.debug.print("  -l, --log-level LEVEL Set log level: debug, info, warn, err (default: info)\n", .{});
-    std.debug.print("  -h, --help            Show this help message\n", .{});
-    std.debug.print("\nExamples:\n", .{});
-    std.debug.print("  {s}                           # Start with defaults\n", .{program_name});
-    std.debug.print("  {s} --port 8080               # Start on port 8080\n", .{program_name});
-    std.debug.print("  {s} --db-path /tmp/mydb       # Use custom database path\n", .{program_name});
-    std.debug.print("  {s} --log-level debug         # Enable debug logging\n", .{program_name});
-}
-
-fn parseLogLevel(level_str: []const u8) !std.log.Level {
-    if (std.mem.eql(u8, level_str, "debug")) return .debug;
-    if (std.mem.eql(u8, level_str, "info")) return .info;
-    if (std.mem.eql(u8, level_str, "warn")) return .warn;
-    if (std.mem.eql(u8, level_str, "err")) return .err;
-    return error.InvalidLogLevel;
-}
-
-fn parseArgs(allocator: std.mem.Allocator) !Config {
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
-    var config = Config{};
-
-    var i: usize = 1; // Skip program name
-    while (i < args.len) {
-        const arg = args[i];
-
-        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            config.help = true;
-            return config;
-        } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--port")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("Error: --port requires a value\n", .{});
-                return error.InvalidArgs;
-            }
-            config.port = std.fmt.parseInt(u16, args[i], 10) catch |err| {
-                std.debug.print("Error: Invalid port number '{s}': {}\n", .{ args[i], err });
-                return error.InvalidPort;
-            };
-        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--db-path")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("Error: --db-path requires a value\n", .{});
-                return error.InvalidArgs;
-            }
-            config.db_path = args[i];
-        } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--log-level")) {
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("Error: --log-level requires a value\n", .{});
-                return error.InvalidArgs;
-            }
-            config.log_level = parseLogLevel(args[i]) catch |err| {
-                std.debug.print("Error: Invalid log level '{s}': {}\n", .{ args[i], err });
-                return error.InvalidLogLevel;
-            };
-        } else {
-            std.debug.print("Error: Unknown argument '{s}'\n", .{arg});
-            return error.UnknownArg;
-        }
-        i += 1;
-    }
-
-    return config;
-}
 
 pub fn main() !void {
     var allocator = std.heap.GeneralPurposeAllocator(.{}){};
@@ -92,22 +13,21 @@ pub fn main() !void {
         const leaks = allocator.deinit();
         if (leaks == .leak) {
             std.debug.print("Memory leaks detected: {}\n", .{leaks});
-        } else {
-            std.debug.print("No memory leaks detected.\n", .{});
         }
     }
 
-    // Parse command line arguments
-    const config = parseArgs(allocator_ptr) catch |err| switch (err) {
-        error.InvalidArgs, error.InvalidPort, error.InvalidLogLevel, error.UnknownArg => {
-            printUsage("phage");
-            return;
-        },
-        else => return err,
+    var stderr = std.fs.File.stderr().deprecatedWriter().any();
+    const args = try std.process.argsAlloc(allocator_ptr);
+    defer std.process.argsFree(allocator_ptr, args);
+
+    const config = server_config.parseArgSlice(args) catch |err| {
+        try server_config.writeParseError(&stderr, err);
+        try server_config.writeUsage(&stderr, "phage-server");
+        return err;
     };
 
     if (config.help) {
-        printUsage("phage");
+        try server_config.writeUsage(&stderr, "phage-server");
         return;
     }
 

@@ -139,6 +139,17 @@ pub fn build(b: *std.Build) void {
     });
     const run_protocol_command_tests = b.addRunArtifact(protocol_command_tests);
 
+    const server_config_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/server/config.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const server_config_tests = b.addTest(.{
+        .root_module = server_config_tests_mod,
+        .test_runner = .{ .mode = .simple, .path = b.path("src/test_runner.zig") },
+    });
+    const run_server_config_tests = b.addRunArtifact(server_config_tests);
+
     const server_runtime_tests_mod = b.createModule(.{
         .root_source_file = b.path("src/server/runtime.zig"),
         .target = target,
@@ -155,6 +166,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_benchmark_unit_tests.step);
     test_step.dependOn(&run_compaction_unit_tests.step);
     test_step.dependOn(&run_protocol_command_tests.step);
+    test_step.dependOn(&run_server_config_tests.step);
     test_step.dependOn(&run_server_runtime_tests.step);
 }
 
