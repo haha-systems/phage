@@ -6,3 +6,4 @@ zig-out/
 .jj/phage_store*
 *.db
 *.wal
+/phage_benchmark_store*
